@@ -1,5 +1,5 @@
 import streamlit as st
-from chatbotBackend import chatbot
+from chatbotBackend import chatbot, unique_thread_pointer
 from langchain_core.messages import HumanMessage, AIMessage
 import uuid
 
@@ -38,7 +38,7 @@ if 'thread_id' not in st.session_state:
     st.session_state['thread_id'] = generate_thread_id()
 
 if 'chat_threads' not in st.session_state:
-    st.session_state['chat_threads'] = []
+    st.session_state['chat_threads'] = unique_thread_pointer()
 
 add_thread(st.session_state['thread_id'])
 
