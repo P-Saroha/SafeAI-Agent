@@ -2,7 +2,9 @@ import streamlit as st
 from chatbotBackend import chatbot, unique_thread_pointer
 from langchain_core.messages import HumanMessage, AIMessage
 import uuid
+import os 
 
+os.environ['LANGSMITH_PROJECT'] = 'ChatBot-Project'
 # **************************************** utility functions *************************
 
 def generate_thread_id():
