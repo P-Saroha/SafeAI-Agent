@@ -130,6 +130,24 @@ chatbot = builder.compile(checkpointer=checkpointer)
 
 
 # ==============================
+# CHAT TITLE GENERATION
+# ==============================
+def generate_chat_title(user_message: str) -> str:
+    """Generate a concise chat title from the first user message."""
+    try:
+        prompt = f"""Given this user message, generate a very short chat title (2-5 words max). 
+Only return the title, nothing else.
+
+User message: {user_message}
+
+Title:"""
+        title = llm.invoke(prompt).content.strip()
+        return title[:50]  # Limit to 50 chars
+    except Exception:
+        return user_message[:30] + "..." if len(user_message) > 30 else user_message
+
+
+# ==============================
 # THREAD UTIL
 # ==============================
 def unique_thread_pointer():

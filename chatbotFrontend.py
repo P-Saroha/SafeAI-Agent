@@ -1,5 +1,5 @@
 import streamlit as st
-from chatbotBackend import chatbot, unique_thread_pointer
+from chatbotBackend import chatbot, unique_thread_pointer, generate_chat_title
 from langchain_core.messages import HumanMessage, AIMessage
 import uuid
 import os
@@ -50,6 +50,9 @@ if 'thread_id' not in st.session_state:
 if 'chat_threads' not in st.session_state:
     st.session_state['chat_threads'] = unique_thread_pointer()
 
+if 'thread_titles' not in st.session_state:
+    st.session_state['thread_titles'] = {}
+
 add_thread(st.session_state['thread_id'])
 
 
@@ -66,8 +69,18 @@ st.sidebar.header('My Conversations')
 for thread_id in st.session_state['chat_threads'][::-1]:
     col1, col2 = st.sidebar.columns([4,1])
 
+    # Get or generate title
+    if thread_id not in st.session_state['thread_titles']:
+        messages = load_conversation(thread_id)
+        if messages and isinstance(messages[0], HumanMessage):
+            st.session_state['thread_titles'][thread_id] = generate_chat_title(messages[0].content)
+        else:
+            st.session_state['thread_titles'][thread_id] = "New Chat"
+    
+    title = st.session_state['thread_titles'][thread_id]
+
     with col1:
-        if st.button(str(thread_id), key=f"load_{thread_id}"):
+        if st.button(title, key=f"load_{thread_id}"):
             st.session_state['thread_id'] = thread_id
             messages = load_conversation(thread_id)
 
@@ -81,6 +94,8 @@ for thread_id in st.session_state['chat_threads'][::-1]:
     with col2:
         if st.button("🗑", key=f"delete_{thread_id}"):
             delete_thread(thread_id)
+            if thread_id in st.session_state['thread_titles']:
+                del st.session_state['thread_titles'][thread_id]
 
 
 # ==============================
@@ -132,3 +147,8 @@ if user_input:
     st.session_state['message_history'].append(
         {'role': 'assistant', 'content': ai_response}
     )
+    
+    # Generate title for new conversation if not already set
+    if st.session_state['thread_id'] not in st.session_state['thread_titles']:
+        st.session_state['thread_titles'][st.session_state['thread_id']] = generate_chat_title(user_input)
+        st.rerun()  # Refresh to show new title in sidebar
