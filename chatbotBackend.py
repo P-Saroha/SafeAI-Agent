@@ -13,6 +13,7 @@ from langchain_core.tools import tool
 from dotenv import load_dotenv, find_dotenv
 
 import sqlite3
+import os
 import math
 from ddgs import DDGS
 import yfinance as yf
@@ -101,8 +102,34 @@ Rules:
 # ==============================
 # DATABASE (MEMORY)
 # ==============================
-conn = sqlite3.connect("chatbot_db", check_same_thread=False)
-checkpointer = SqliteSaver(conn=conn)
+def init_checkpointer():
+    """Initialize checkpointer with automatic error recovery."""
+    db_path = "chatbot_db"
+    
+    try:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.execute("SELECT 1")  # Test connection
+        checkpointer = SqliteSaver(conn=conn)
+        return checkpointer, conn
+    except Exception as e:
+        print(f"Checkpoint error detected: {e}. Recovering...")
+        
+        # Backup corrupted database
+        if os.path.exists(db_path):
+            backup_path = f"{db_path}.backup_{os.getpid()}"
+            try:
+                os.rename(db_path, backup_path)
+                print(f"Backed up corrupted database to {backup_path}")
+            except Exception as backup_err:
+                print(f"Backup failed: {backup_err}")
+        
+        # Create fresh database
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        checkpointer = SqliteSaver(conn=conn)
+        print("Fresh checkpoint database created")
+        return checkpointer, conn
+
+checkpointer, conn = init_checkpointer()
 
 
 # ==============================
@@ -134,17 +161,35 @@ chatbot = builder.compile(checkpointer=checkpointer)
 # ==============================
 def generate_chat_title(user_message: str) -> str:
     """Generate a concise chat title from the first user message."""
+    if not user_message or not user_message.strip():
+        return "New Chat"
+    
+    msg = user_message.strip()[:200]  # Limit to first 200 chars
+    
     try:
-        prompt = f"""Given this user message, generate a very short chat title (2-5 words max). 
+        # Try LLM-based title generation
+        prompt = f"""Given this user message, generate a very short chat title (2-5 words max, no punctuation). 
 Only return the title, nothing else.
 
-User message: {user_message}
+User message: {msg}
 
 Title:"""
         title = llm.invoke(prompt).content.strip()
-        return title[:50]  # Limit to 50 chars
-    except Exception:
-        return user_message[:30] + "..." if len(user_message) > 30 else user_message
+        title = title.strip('"\'.!?,;:').strip()
+        if title and len(title) > 0:
+            return title[:50]
+    except Exception as e:
+        print(f"Title generation error (using fallback): {str(e)[:50]}")
+    
+    # Fallback: Use first 4-5 words from message
+    words = msg.split()
+    if len(words) > 0:
+        fallback_title = ' '.join(words[:5])
+        if len(fallback_title) > 50:
+            fallback_title = fallback_title[:47] + "..."
+        return fallback_title
+    
+    return "New Chat"
 
 
 # ==============================

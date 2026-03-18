@@ -72,8 +72,17 @@ for thread_id in st.session_state['chat_threads'][::-1]:
     # Get or generate title
     if thread_id not in st.session_state['thread_titles']:
         messages = load_conversation(thread_id)
-        if messages and isinstance(messages[0], HumanMessage):
-            st.session_state['thread_titles'][thread_id] = generate_chat_title(messages[0].content)
+        first_user_msg = None
+        
+        # Find first human message in conversation
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                first_user_msg = msg.content
+                break
+        
+        if first_user_msg:
+            generated_title = generate_chat_title(first_user_msg)
+            st.session_state['thread_titles'][thread_id] = generated_title
         else:
             st.session_state['thread_titles'][thread_id] = "New Chat"
     
@@ -150,5 +159,6 @@ if user_input:
     
     # Generate title for new conversation if not already set
     if st.session_state['thread_id'] not in st.session_state['thread_titles']:
-        st.session_state['thread_titles'][st.session_state['thread_id']] = generate_chat_title(user_input)
-        st.rerun()  # Refresh to show new title in sidebar
+        title = generate_chat_title(user_input)
+        st.session_state['thread_titles'][st.session_state['thread_id']] = title
+        st.rerun()
