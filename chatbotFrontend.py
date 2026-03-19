@@ -1,8 +1,9 @@
 import streamlit as st
-from chatbotBackend import chatbot, unique_thread_pointer, generate_chat_title
+from chatbotBackend import chatbot, unique_thread_pointer, generate_chat_title, rebuild_rag_index, RAG_DOCS_DIR
 from langchain_core.messages import HumanMessage, AIMessage
 import uuid
 import os
+from pathlib import Path
 
 os.environ['LANGSMITH_PROJECT'] = 'ChatBot-Project'
 
@@ -63,6 +64,41 @@ st.sidebar.title('LangGraph AI Agent')
 
 if st.sidebar.button('New Chat'):
     reset_chat()
+
+st.sidebar.header('RAG Controls')
+if st.sidebar.button('Rebuild RAG Index'):
+    with st.sidebar:
+        with st.spinner('Rebuilding RAG index...'):
+            status = rebuild_rag_index()
+    st.sidebar.success(status)
+
+st.sidebar.caption(f"RAG Document Folder: {RAG_DOCS_DIR}")
+st.sidebar.caption("Upload PDF, TXT, or MD files here to add chatbot knowledge.")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload RAG files",
+    type=["pdf", "txt", "md"],
+    accept_multiple_files=True,
+    help="Supported: PDF, TXT, MD"
+)
+
+if st.sidebar.button('Upload Files and Rebuild Index'):
+    if not uploaded_files:
+        st.sidebar.warning('Please select at least one file to upload.')
+    else:
+        Path(RAG_DOCS_DIR).mkdir(parents=True, exist_ok=True)
+        saved_count = 0
+
+        for uploaded in uploaded_files:
+            file_path = Path(RAG_DOCS_DIR) / uploaded.name
+            with open(file_path, 'wb') as f:
+                f.write(uploaded.getbuffer())
+            saved_count += 1
+
+        with st.sidebar:
+            with st.spinner('Rebuilding RAG index...'):
+                status = rebuild_rag_index()
+
+        st.sidebar.success(f'Saved {saved_count} file(s). {status}')
 
 st.sidebar.header('My Conversations')
 
