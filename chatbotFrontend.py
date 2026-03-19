@@ -66,6 +66,15 @@ if st.sidebar.button('New Chat'):
     reset_chat()
 
 st.sidebar.header('RAG Controls')
+knowledge_files = [
+    p for p in Path(RAG_DOCS_DIR).rglob('*')
+    if p.is_file() and p.suffix.lower() in {'.pdf', '.txt', '.md'}
+]
+auto_mode_label = 'Hybrid (RAG + Agent)' if knowledge_files else 'Agent Only (No RAG files found)'
+if knowledge_files:
+    auto_mode_label = 'Document Mode (RAG Only)'
+st.sidebar.caption(f'Auto Mode: {auto_mode_label}')
+
 if st.sidebar.button('Rebuild RAG Index'):
     with st.sidebar:
         with st.spinner('Rebuilding RAG index...'):
@@ -162,6 +171,7 @@ if user_input:
         st.markdown(user_input)
 
     CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
+    selected_mode = 'auto'
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
@@ -169,7 +179,7 @@ if user_input:
             def stream_response():
                 try:
                     for message_chunk, metadata in chatbot.stream(
-                        {"messages": [HumanMessage(content=user_input)]},
+                        {"messages": [HumanMessage(content=user_input)], "mode": selected_mode},
                         config=CONFIG,
                         stream_mode="messages"
                     ):

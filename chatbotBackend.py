@@ -53,6 +53,7 @@ llm = ChatGoogleGenerativeAI(
 # ==============================
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    mode: str
 
 
 # ==============================
@@ -354,20 +355,29 @@ def rag_search(question: str) -> str:
 
 
 tools = [search_tool, calculator, get_stock_price, rag_search]
+agent_tools = [search_tool, calculator, get_stock_price]
 
 
 # ==============================
 # LLM WITH TOOLS
 # ==============================
 llm_with_tools = llm.bind_tools(tools)
+llm_with_agent_tools = llm.bind_tools(agent_tools)
 
 
 # ==============================
 # CHAT NODE
 # ==============================
 def chat_node(state: ChatState):
+    mode = str(state.get("mode", "auto")).lower()
+    if mode not in {"auto", "hybrid", "agent_only", "rag_only"}:
+        mode = "auto"
+
+    if mode == "auto":
+        mode = "rag_only" if len(_collect_rag_files()) > 0 else "agent_only"
+
     latest_query = _latest_user_query(state["messages"])
-    rag_context = _rag_context_for_query(latest_query)
+    rag_context = _rag_context_for_query(latest_query) if mode in {"hybrid", "rag_only"} else ""
 
     rag_instructions = (
         f"RAG Context (highest priority if relevant):\n{rag_context}\n\n"
@@ -375,23 +385,30 @@ def chat_node(state: ChatState):
         "If context is not relevant, then use tools as needed."
     ) if rag_context else "No RAG context available for this query."
 
-    messages = [
-        SystemMessage(content="""
+    system_prompt = f"""
 You are a smart AI assistant.
 
 Rules:
-- Use calculator for math
-- Use search tool for latest info
-- Use stock tool for stock prices
-- Use rag_search when user asks about local knowledge base or project documents
-- If rag_search returns context, prioritize it and cite source snippets briefly
-- Avoid unnecessary tool usage
-""")
-        ,
-        SystemMessage(content=rag_instructions)
+- Current response mode: {mode}
+- If mode is rag_only: answer only from RAG context and clearly say when answer is not found in context
+- If mode is agent_only: use tools for web/stock/math and do not rely on RAG context
+- If mode is hybrid: prefer RAG context when relevant, otherwise use tools
+- Keep responses concise and useful
+
+{rag_instructions}
+"""
+
+    messages = [
+        SystemMessage(content=system_prompt)
     ] + state["messages"]
 
-    response = llm_with_tools.invoke(messages)
+    if mode == "rag_only":
+        response = llm.invoke(messages)
+    elif mode == "agent_only":
+        response = llm_with_agent_tools.invoke(messages)
+    else:
+        response = llm_with_tools.invoke(messages)
+
     return {"messages": [response]}
 
 
