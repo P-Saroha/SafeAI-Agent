@@ -31,6 +31,10 @@ import os
 import math
 import json
 import hashlib
+from datetime import datetime
+from contextvars import ContextVar
+import re
+import shutil
 import numpy as np
 from ddgs import DDGS
 import yfinance as yf
@@ -54,6 +58,7 @@ llm = ChatGoogleGenerativeAI(
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     mode: str
+    thread_id: str
 
 
 # ==============================
@@ -61,11 +66,39 @@ class ChatState(TypedDict):
 # ==============================
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-RAG_DOCS_DIR = BASE_DIR / "knowledge_base"
-RAG_INDEX_DIR = BASE_DIR / "faiss_index"
+RAG_DOCS_ROOT = BASE_DIR / "knowledge_base"
+RAG_INDEX_ROOT = BASE_DIR / "faiss_index"
 
-rag_retriever = None
-rag_status = "RAG not initialized"
+rag_retriever_cache = {}
+rag_status_cache = {}
+
+# Keep current thread context for tools that execute during an agent step.
+active_thread_id = ContextVar("active_thread_id", default="default")
+
+
+def _safe_thread_id(thread_id: str) -> str:
+    """Sanitize thread id for safe folder paths."""
+    value = str(thread_id or "default").strip()
+    value = re.sub(r"[^A-Za-z0-9._-]", "_", value)
+    return value or "default"
+
+
+def get_thread_rag_docs_dir(thread_id: str) -> Path:
+    """Return per-thread docs folder path."""
+    return RAG_DOCS_ROOT / _safe_thread_id(thread_id)
+
+
+def get_thread_rag_index_dir(thread_id: str) -> Path:
+    """Return per-thread FAISS index folder path."""
+    return RAG_INDEX_ROOT / _safe_thread_id(thread_id)
+
+
+def _get_rag_status(thread_id: str) -> str:
+    return rag_status_cache.get(_safe_thread_id(thread_id), "RAG not initialized")
+
+
+def _set_rag_status(thread_id: str, status: str) -> None:
+    rag_status_cache[_safe_thread_id(thread_id)] = status
 
 
 class HashEmbeddings(Embeddings):
@@ -110,17 +143,18 @@ def _embedding_from_backend(backend: str):
     return HashEmbeddings(dim=dim), {"backend": "hash", "dim": dim}
 
 
-def _save_rag_meta(meta: dict) -> None:
+def _save_rag_meta(meta: dict, thread_id: str) -> None:
+    index_dir = get_thread_rag_index_dir(thread_id)
     try:
-        RAG_INDEX_DIR.mkdir(parents=True, exist_ok=True)
-        with open(RAG_INDEX_DIR / "meta.json", "w", encoding="utf-8") as fp:
+        index_dir.mkdir(parents=True, exist_ok=True)
+        with open(index_dir / "meta.json", "w", encoding="utf-8") as fp:
             json.dump(meta, fp, indent=2)
     except Exception as err:
         print(f"RAG meta save warning: {err}")
 
 
-def _load_rag_meta() -> dict:
-    meta_path = RAG_INDEX_DIR / "meta.json"
+def _load_rag_meta(thread_id: str) -> dict:
+    meta_path = get_thread_rag_index_dir(thread_id) / "meta.json"
     if not meta_path.exists():
         return {}
     try:
@@ -130,22 +164,14 @@ def _load_rag_meta() -> dict:
         return {}
 
 
-def _collect_rag_files() -> list[Path]:
-    """Collect supported knowledge files for indexing."""
+def _collect_rag_files(thread_id: str) -> list[Path]:
+    """Collect supported knowledge files for indexing (thread-scoped)."""
     supported = {".txt", ".md", ".pdf"}
     files: list[Path] = []
 
-    if RAG_DOCS_DIR.exists():
-        files.extend([p for p in RAG_DOCS_DIR.rglob("*") if p.is_file() and p.suffix.lower() in supported])
-
-    default_candidates = [
-        BASE_DIR / "ChatResumeWorkFlow.txt",
-        PROJECT_ROOT / "README.md",
-    ]
-
-    for candidate in default_candidates:
-        if candidate.exists() and candidate.is_file() and candidate.suffix.lower() in supported:
-            files.append(candidate)
+    docs_dir = get_thread_rag_docs_dir(thread_id)
+    if docs_dir.exists():
+        files.extend([p for p in docs_dir.rglob("*") if p.is_file() and p.suffix.lower() in supported])
 
     # Deduplicate while preserving order
     unique_files = list(dict.fromkeys(files))
@@ -175,46 +201,48 @@ def _load_documents(paths: list[Path]) -> list[Document]:
     return documents
 
 
-def _build_rag_retriever(force_rebuild: bool = False):
+def _build_rag_retriever(thread_id: str, force_rebuild: bool = False):
     """Build or load FAISS retriever from local knowledge base files."""
-    global rag_status
+    thread_key = _safe_thread_id(thread_id)
+    index_dir = get_thread_rag_index_dir(thread_key)
+    docs_dir = get_thread_rag_docs_dir(thread_key)
 
     if FAISS is None:
-        rag_status = "RAG unavailable: install faiss-cpu and document loaders"
+        _set_rag_status(thread_key, "RAG unavailable: install faiss-cpu and document loaders")
         return None
 
-    files = _collect_rag_files()
+    files = _collect_rag_files(thread_key)
     if not files:
-        rag_status = "RAG knowledge base is empty"
+        _set_rag_status(thread_key, f"RAG knowledge base is empty for this chat ({docs_dir})")
         return None
 
     preferred_backend = os.getenv("RAG_EMBEDDING_BACKEND", "hash").lower()
 
     try:
-        if RAG_INDEX_DIR.exists() and not force_rebuild:
-            meta = _load_rag_meta()
+        if index_dir.exists() and not force_rebuild:
+            meta = _load_rag_meta(thread_key)
             load_backend = meta.get("backend", preferred_backend)
             embeddings, _ = _embedding_from_backend(load_backend)
             vectorstore = FAISS.load_local(
-                str(RAG_INDEX_DIR),
+                str(index_dir),
                 embeddings,
                 allow_dangerous_deserialization=True,
             )
-            rag_status = f"RAG ready (loaded index, {len(files)} files, backend={load_backend})"
+            _set_rag_status(thread_key, f"RAG ready (loaded index, {len(files)} files, backend={load_backend})")
             return vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
     except Exception as err:
         print(f"RAG index load warning, rebuilding: {err}")
 
     docs = _load_documents(files)
     if not docs:
-        rag_status = "RAG could not load readable documents"
+        _set_rag_status(thread_key, "RAG could not load readable documents")
         return None
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(docs)
 
     if not chunks:
-        rag_status = "RAG found no chunks after splitting"
+        _set_rag_status(thread_key, "RAG found no chunks after splitting")
         return None
 
     embeddings, meta = _embedding_from_backend(preferred_backend)
@@ -222,37 +250,39 @@ def _build_rag_retriever(force_rebuild: bool = False):
     try:
         vectorstore = FAISS.from_documents(chunks, embeddings)
     except Exception as err:
-        rag_status = f"RAG embedding/index build failed: {err}"
+        _set_rag_status(thread_key, f"RAG embedding/index build failed: {err}")
         return None
 
-    RAG_INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    vectorstore.save_local(str(RAG_INDEX_DIR))
+    index_dir.mkdir(parents=True, exist_ok=True)
+    vectorstore.save_local(str(index_dir))
     meta.update({"files_indexed": len(files), "chunks": len(chunks)})
-    _save_rag_meta(meta)
+    _save_rag_meta(meta, thread_key)
 
-    rag_status = (
+    status = (
         f"RAG ready (built index with {len(chunks)} chunks from {len(files)} files, "
         f"backend={meta.get('backend')})"
     )
+    _set_rag_status(thread_key, status)
     return vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
 
 
-def ensure_rag_ready(force_rebuild: bool = False):
+def ensure_rag_ready(thread_id: str, force_rebuild: bool = False):
     """Lazy initialize retriever so startup remains fast."""
-    global rag_retriever
+    thread_key = _safe_thread_id(thread_id)
 
-    if rag_retriever is None or force_rebuild:
-        rag_retriever = _build_rag_retriever(force_rebuild=force_rebuild)
+    if thread_key not in rag_retriever_cache or force_rebuild:
+        rag_retriever_cache[thread_key] = _build_rag_retriever(thread_key, force_rebuild=force_rebuild)
 
-    return rag_retriever
+    return rag_retriever_cache.get(thread_key)
 
 
-def rebuild_rag_index() -> str:
+def rebuild_rag_index(thread_id: str) -> str:
     """Rebuild FAISS index from files in Chatbot/knowledge_base."""
-    retriever = ensure_rag_ready(force_rebuild=True)
+    thread_key = _safe_thread_id(thread_id)
+    retriever = ensure_rag_ready(thread_key, force_rebuild=True)
     if retriever is None:
-        return f"RAG rebuild failed: {rag_status}"
-    return f"RAG rebuild successful: {rag_status}"
+        return f"RAG rebuild failed: {_get_rag_status(thread_key)}"
+    return f"RAG rebuild successful: {_get_rag_status(thread_key)}"
 
 
 def _latest_user_query(messages: list[BaseMessage]) -> str:
@@ -263,12 +293,12 @@ def _latest_user_query(messages: list[BaseMessage]) -> str:
     return ""
 
 
-def _rag_context_for_query(query: str, k: int = 4) -> str:
+def _rag_context_for_query(query: str, thread_id: str, k: int = 4) -> str:
     """Fetch compact RAG context for prompt grounding."""
     if not query.strip():
         return ""
 
-    retriever = ensure_rag_ready()
+    retriever = ensure_rag_ready(thread_id)
     if retriever is None:
         return ""
 
@@ -289,6 +319,19 @@ def _rag_context_for_query(query: str, k: int = 4) -> str:
         snippets.append(f"[{i}] {source}{page_info}: {chunk}")
 
     return "\n\n".join(snippets)
+
+
+def _is_document_intent(query: str) -> bool:
+    """Detect whether user is explicitly asking about uploaded/local documents."""
+    q = query.lower().strip()
+    if not q:
+        return False
+
+    doc_markers = [
+        "pdf", "document", "doc", "file", "upload", "resume", "letter", "in this",
+        "from this", "according to", "provided", "page",
+    ]
+    return any(marker in q for marker in doc_markers)
 
 
 # ==============================
@@ -324,15 +367,24 @@ def get_stock_price(symbol: str) -> str:
 
 
 @tool
+def get_current_date_time() -> str:
+    """Get current local date and time."""
+    now = datetime.now()
+    return now.strftime("%A, %d %B %Y, %I:%M %p")
+
+
+@tool
 def rag_search(question: str) -> str:
     """Search local knowledge base documents for RAG context."""
-    retriever = ensure_rag_ready()
+    thread_id = active_thread_id.get()
+    docs_dir = get_thread_rag_docs_dir(thread_id)
+    retriever = ensure_rag_ready(thread_id)
 
     if retriever is None:
         return (
             "RAG is not ready. "
-            f"{rag_status}. "
-            f"Add .txt/.md/.pdf files in {RAG_DOCS_DIR} and rebuild index."
+            f"{_get_rag_status(thread_id)}. "
+            f"Add .txt/.md/.pdf files in {docs_dir} and rebuild index."
         )
 
     try:
@@ -354,8 +406,8 @@ def rag_search(question: str) -> str:
     return "\n\n".join(contexts)
 
 
-tools = [search_tool, calculator, get_stock_price, rag_search]
-agent_tools = [search_tool, calculator, get_stock_price]
+tools = [search_tool, calculator, get_stock_price, get_current_date_time, rag_search]
+agent_tools = [search_tool, calculator, get_stock_price, get_current_date_time]
 
 
 # ==============================
@@ -369,15 +421,21 @@ llm_with_agent_tools = llm.bind_tools(agent_tools)
 # CHAT NODE
 # ==============================
 def chat_node(state: ChatState):
+    latest_query = _latest_user_query(state["messages"])
+    thread_id = _safe_thread_id(state.get("thread_id", "default"))
+
     mode = str(state.get("mode", "auto")).lower()
     if mode not in {"auto", "hybrid", "agent_only", "rag_only"}:
         mode = "auto"
 
     if mode == "auto":
-        mode = "rag_only" if len(_collect_rag_files()) > 0 else "agent_only"
+        has_knowledge_files = len(_collect_rag_files(thread_id)) > 0
+        if not has_knowledge_files:
+            mode = "agent_only"
+        else:
+            mode = "rag_only" if _is_document_intent(latest_query) else "hybrid"
 
-    latest_query = _latest_user_query(state["messages"])
-    rag_context = _rag_context_for_query(latest_query) if mode in {"hybrid", "rag_only"} else ""
+    rag_context = _rag_context_for_query(latest_query, thread_id) if mode in {"hybrid", "rag_only"} else ""
 
     rag_instructions = (
         f"RAG Context (highest priority if relevant):\n{rag_context}\n\n"
@@ -390,6 +448,7 @@ You are a smart AI assistant.
 
 Rules:
 - Current response mode: {mode}
+- Use get_current_date_time for date/time questions
 - If mode is rag_only: answer only from RAG context and clearly say when answer is not found in context
 - If mode is agent_only: use tools for web/stock/math and do not rely on RAG context
 - If mode is hybrid: prefer RAG context when relevant, otherwise use tools
@@ -402,12 +461,16 @@ Rules:
         SystemMessage(content=system_prompt)
     ] + state["messages"]
 
-    if mode == "rag_only":
-        response = llm.invoke(messages)
-    elif mode == "agent_only":
-        response = llm_with_agent_tools.invoke(messages)
-    else:
-        response = llm_with_tools.invoke(messages)
+    token = active_thread_id.set(thread_id)
+    try:
+        if mode == "rag_only":
+            response = llm.invoke(messages)
+        elif mode == "agent_only":
+            response = llm_with_agent_tools.invoke(messages)
+        else:
+            response = llm_with_tools.invoke(messages)
+    finally:
+        active_thread_id.reset(token)
 
     return {"messages": [response]}
 
@@ -443,6 +506,53 @@ def init_checkpointer():
         return checkpointer, conn
 
 checkpointer, conn = init_checkpointer()
+
+
+def delete_thread_history(thread_id: str) -> str:
+    """Permanently delete a thread from all checkpoint tables containing thread_id."""
+    if not thread_id or not thread_id.strip():
+        return "Delete failed: invalid thread id."
+
+    thread_key = _safe_thread_id(thread_id)
+
+    try:
+        cur = conn.cursor()
+        tables = [
+            row[0]
+            for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        ]
+
+        total_deleted = 0
+        for table in tables:
+            # Only delete from tables that actually contain thread_id column
+            columns = [r[1] for r in cur.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            if "thread_id" not in columns:
+                continue
+
+            cur.execute(f'DELETE FROM "{table}" WHERE thread_id = ?', (thread_key,))
+            if cur.rowcount and cur.rowcount > 0:
+                total_deleted += cur.rowcount
+
+        conn.commit()
+
+        # Remove thread-scoped RAG docs/index and in-memory cache.
+        for folder in [get_thread_rag_docs_dir(thread_key), get_thread_rag_index_dir(thread_key)]:
+            if folder.exists():
+                shutil.rmtree(folder, ignore_errors=True)
+
+        rag_retriever_cache.pop(thread_key, None)
+        rag_status_cache.pop(thread_key, None)
+
+        if total_deleted == 0:
+            return "Chat deleted permanently (no checkpoints found, local docs/index removed)."
+
+        return f"Chat deleted permanently ({total_deleted} checkpoint rows removed)."
+    except Exception as err:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return f"Delete failed: {err}"
 
 
 # ==============================

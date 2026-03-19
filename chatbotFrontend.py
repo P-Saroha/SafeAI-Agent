@@ -1,5 +1,12 @@
 import streamlit as st
-from chatbotBackend import chatbot, unique_thread_pointer, generate_chat_title, rebuild_rag_index, RAG_DOCS_DIR
+from chatbotBackend import (
+    chatbot,
+    unique_thread_pointer,
+    generate_chat_title,
+    rebuild_rag_index,
+    delete_thread_history,
+    get_thread_rag_docs_dir,
+)
 from langchain_core.messages import HumanMessage, AIMessage
 import uuid
 import os
@@ -28,15 +35,61 @@ def add_thread(thread_id):
 
 
 def delete_thread(thread_id):
+    delete_status = delete_thread_history(thread_id)
+
     if thread_id in st.session_state['chat_threads']:
         st.session_state['chat_threads'].remove(thread_id)
         if st.session_state['thread_id'] == thread_id:
             reset_chat()
 
+    if thread_id in st.session_state.get('thread_titles', {}):
+        del st.session_state['thread_titles'][thread_id]
+
+    return delete_status
+
 
 def load_conversation(thread_id):
     state = chatbot.get_state(config={'configurable': {'thread_id': thread_id}})
     return state.values.get('messages', [])
+
+
+def save_uploaded_docs(uploaded_files, thread_id):
+    """Save uploaded docs to knowledge folder and rebuild index."""
+    if not uploaded_files:
+        return 0, ""
+
+    docs_dir = get_thread_rag_docs_dir(thread_id)
+    Path(docs_dir).mkdir(parents=True, exist_ok=True)
+    saved_count = 0
+
+    for uploaded in uploaded_files:
+        file_path = Path(docs_dir) / uploaded.name
+        with open(file_path, 'wb') as f:
+            f.write(uploaded.getbuffer())
+        saved_count += 1
+
+    status = rebuild_rag_index(thread_id)
+    return saved_count, status
+
+
+def extract_tool_names(message_chunk):
+    """Extract tool names from model/tool message chunks."""
+    tool_names = set()
+
+    # AI tool calls (common for function-calling models)
+    tool_calls = getattr(message_chunk, 'tool_calls', None)
+    if tool_calls:
+        for call in tool_calls:
+            name = call.get('name') if isinstance(call, dict) else None
+            if name:
+                tool_names.add(name)
+
+    # Tool message may carry tool name directly
+    name = getattr(message_chunk, 'name', None)
+    if isinstance(name, str) and name:
+        tool_names.add(name)
+
+    return tool_names
 
 
 # ==============================
@@ -66,48 +119,23 @@ if st.sidebar.button('New Chat'):
     reset_chat()
 
 st.sidebar.header('RAG Controls')
+current_docs_dir = get_thread_rag_docs_dir(st.session_state['thread_id'])
 knowledge_files = [
-    p for p in Path(RAG_DOCS_DIR).rglob('*')
+    p for p in Path(current_docs_dir).rglob('*')
     if p.is_file() and p.suffix.lower() in {'.pdf', '.txt', '.md'}
 ]
-auto_mode_label = 'Hybrid (RAG + Agent)' if knowledge_files else 'Agent Only (No RAG files found)'
-if knowledge_files:
-    auto_mode_label = 'Document Mode (RAG Only)'
+auto_mode_label = 'Smart Auto (Documents + Tools)' if knowledge_files else 'Agent Only (No RAG files found)'
 st.sidebar.caption(f'Auto Mode: {auto_mode_label}')
+st.sidebar.caption(f'Current chat documents: {len(knowledge_files)}')
 
 if st.sidebar.button('Rebuild RAG Index'):
     with st.sidebar:
         with st.spinner('Rebuilding RAG index...'):
-            status = rebuild_rag_index()
+            status = rebuild_rag_index(st.session_state['thread_id'])
     st.sidebar.success(status)
 
-st.sidebar.caption(f"RAG Document Folder: {RAG_DOCS_DIR}")
 st.sidebar.caption("Upload PDF, TXT, or MD files here to add chatbot knowledge.")
-uploaded_files = st.sidebar.file_uploader(
-    "Upload RAG files",
-    type=["pdf", "txt", "md"],
-    accept_multiple_files=True,
-    help="Supported: PDF, TXT, MD"
-)
-
-if st.sidebar.button('Upload Files and Rebuild Index'):
-    if not uploaded_files:
-        st.sidebar.warning('Please select at least one file to upload.')
-    else:
-        Path(RAG_DOCS_DIR).mkdir(parents=True, exist_ok=True)
-        saved_count = 0
-
-        for uploaded in uploaded_files:
-            file_path = Path(RAG_DOCS_DIR) / uploaded.name
-            with open(file_path, 'wb') as f:
-                f.write(uploaded.getbuffer())
-            saved_count += 1
-
-        with st.sidebar:
-            with st.spinner('Rebuilding RAG index...'):
-                status = rebuild_rag_index()
-
-        st.sidebar.success(f'Saved {saved_count} file(s). {status}')
+st.sidebar.caption('Attach files directly from chat input (paperclip) for GPT-like flow.')
 
 st.sidebar.header('My Conversations')
 
@@ -147,46 +175,88 @@ for thread_id in st.session_state['chat_threads'][::-1]:
 
     with col2:
         if st.button("🗑", key=f"delete_{thread_id}"):
-            delete_thread(thread_id)
-            if thread_id in st.session_state['thread_titles']:
-                del st.session_state['thread_titles'][thread_id]
+            status = delete_thread(thread_id)
+            if status.lower().startswith('delete failed'):
+                st.sidebar.warning(status)
+            else:
+                st.sidebar.success(status)
 
 
 # ==============================
 # MAIN CHAT UI
 # ==============================
 st.title(" AI Agent Chatbot")
+st.caption('Attach PDF/TXT/MD with the chat input paperclip. Uploaded docs are indexed automatically.')
 
 for message in st.session_state['message_history']:
     with st.chat_message(message['role']):
         st.markdown(message['content'])
 
 
-user_input = st.chat_input("Type your message...")
+chat_payload = st.chat_input(
+    "Type your message...",
+    accept_file='multiple',
+    file_type=['pdf', 'txt', 'md'],
+    max_upload_size=200,
+)
 
-if user_input:
+user_input = None
+uploaded_files = []
+
+if chat_payload is not None:
+    if isinstance(chat_payload, str):
+        user_input = chat_payload
+    else:
+        user_input = getattr(chat_payload, 'text', None) or getattr(chat_payload, 'message', None) or ""
+        uploaded_files = list(getattr(chat_payload, 'files', []) or [])
+
+if user_input or uploaded_files:
+    saved_count = 0
+    upload_status = ""
+    if uploaded_files:
+        with st.spinner('Saving files and rebuilding RAG index...'):
+            saved_count, upload_status = save_uploaded_docs(uploaded_files, st.session_state['thread_id'])
+
+        if saved_count > 0:
+            st.success(f'Uploaded {saved_count} file(s). {upload_status}')
+
+    if not user_input:
+        user_input = 'I uploaded files. Please confirm what was indexed and how to query them.'
+
     st.session_state['message_history'].append({'role': 'user', 'content': user_input})
 
     with st.chat_message('user'):
         st.markdown(user_input)
+        if uploaded_files:
+            file_names = ', '.join(f.name for f in uploaded_files)
+            st.caption(f'Attached files: {file_names}')
 
     CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
     selected_mode = 'auto'
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
+            used_tools = set()
+            tool_trace = st.empty()
 
             def stream_response():
                 try:
                     for message_chunk, metadata in chatbot.stream(
-                        {"messages": [HumanMessage(content=user_input)], "mode": selected_mode},
+                        {
+                            "messages": [HumanMessage(content=user_input)],
+                            "mode": selected_mode,
+                            "thread_id": st.session_state['thread_id'],
+                        },
                         config=CONFIG,
                         stream_mode="messages"
                     ):
+                        detected_tools = extract_tool_names(message_chunk)
+                        if detected_tools:
+                            used_tools.update(detected_tools)
+                            tool_trace.info(f"Tools used: {', '.join(sorted(used_tools))}")
 
-                        # Show tool usage
-                        if metadata.get("langgraph_node") == "tools":
-                            st.info(" Using tool...")
+                        if metadata.get("langgraph_node") == "tools" and not used_tools:
+                            tool_trace.info("Using tool...")
 
                         if isinstance(message_chunk, AIMessage) and message_chunk.content:
                             yield message_chunk.content
@@ -198,6 +268,11 @@ if user_input:
                         yield f" Error: {str(e)}"
 
             ai_response = st.write_stream(stream_response())
+
+            if used_tools:
+                tool_trace.success(f"Final tools used: {', '.join(sorted(used_tools))}")
+            else:
+                tool_trace.caption("No external tool was needed for this response.")
 
     st.session_state['message_history'].append(
         {'role': 'assistant', 'content': ai_response}
