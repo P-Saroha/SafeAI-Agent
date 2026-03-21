@@ -45,12 +45,29 @@ def delete_thread(thread_id):
     if thread_id in st.session_state.get('thread_titles', {}):
         del st.session_state['thread_titles'][thread_id]
 
+    if st.session_state.get('thread_id') == thread_id:
+        st.session_state['pending_approval'] = None
+
     return delete_status
 
 
 def load_conversation(thread_id):
     state = chatbot.get_state(config={'configurable': {'thread_id': thread_id}})
     return state.values.get('messages', [])
+
+
+def refresh_pending_approval(thread_id):
+    """Load HITL pending request from graph state for the active thread."""
+    state = chatbot.get_state(config={'configurable': {'thread_id': thread_id}})
+    values = state.values or {}
+
+    if values.get('awaiting_approval'):
+        st.session_state['pending_approval'] = {
+            'request': values.get('approval_request', 'Approval required.'),
+            'type': values.get('approval_type', ''),
+        }
+    else:
+        st.session_state['pending_approval'] = None
 
 
 def save_uploaded_docs(uploaded_files, thread_id):
@@ -107,7 +124,11 @@ if 'chat_threads' not in st.session_state:
 if 'thread_titles' not in st.session_state:
     st.session_state['thread_titles'] = {}
 
+if 'pending_approval' not in st.session_state:
+    st.session_state['pending_approval'] = None
+
 add_thread(st.session_state['thread_id'])
+refresh_pending_approval(st.session_state['thread_id'])
 
 
 # ==============================
@@ -172,6 +193,7 @@ for thread_id in st.session_state['chat_threads'][::-1]:
                 temp_messages.append({'role': role, 'content': msg.content})
 
             st.session_state['message_history'] = temp_messages
+            refresh_pending_approval(thread_id)
 
     with col2:
         if st.button("🗑", key=f"delete_{thread_id}"):
@@ -193,6 +215,68 @@ for message in st.session_state['message_history']:
         st.markdown(message['content'])
 
 
+pending = st.session_state.get('pending_approval')
+if pending:
+    st.warning(f"HITL: {pending['request']}")
+    col_a, col_b = st.columns(2)
+
+    if col_a.button('Approve', key=f"approve_{st.session_state['thread_id']}"):
+        CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
+        with st.chat_message('user'):
+            st.markdown('[HITL] Approve')
+
+        with st.chat_message('assistant'):
+            with st.spinner('Resuming after approval...'):
+                ai_response = st.write_stream(
+                    (
+                        chunk.content
+                        for chunk, _ in chatbot.stream(
+                            {
+                                'messages': [],
+                                'mode': 'auto',
+                                'thread_id': st.session_state['thread_id'],
+                                'approval_decision': 'approve',
+                            },
+                            config=CONFIG,
+                            stream_mode='messages',
+                        )
+                        if isinstance(chunk, AIMessage) and chunk.content
+                    )
+                )
+
+        st.session_state['message_history'].append({'role': 'assistant', 'content': ai_response})
+        refresh_pending_approval(st.session_state['thread_id'])
+        st.rerun()
+
+    if col_b.button('Regenerate', key=f"regen_{st.session_state['thread_id']}"):
+        CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
+        with st.chat_message('user'):
+            st.markdown('[HITL] Regenerate')
+
+        with st.chat_message('assistant'):
+            with st.spinner('Regenerating...'):
+                ai_response = st.write_stream(
+                    (
+                        chunk.content
+                        for chunk, _ in chatbot.stream(
+                            {
+                                'messages': [],
+                                'mode': 'auto',
+                                'thread_id': st.session_state['thread_id'],
+                                'approval_decision': 'regenerate',
+                            },
+                            config=CONFIG,
+                            stream_mode='messages',
+                        )
+                        if isinstance(chunk, AIMessage) and chunk.content
+                    )
+                )
+
+        st.session_state['message_history'].append({'role': 'assistant', 'content': ai_response})
+        refresh_pending_approval(st.session_state['thread_id'])
+        st.rerun()
+
+
 chat_payload = st.chat_input(
     "Type your message...",
     accept_file='multiple',
@@ -211,6 +295,10 @@ if chat_payload is not None:
         uploaded_files = list(getattr(chat_payload, 'files', []) or [])
 
 if user_input or uploaded_files:
+    if st.session_state.get('pending_approval'):
+        st.warning('Resolve pending HITL request first using Approve or Regenerate.')
+        st.stop()
+
     saved_count = 0
     upload_status = ""
     if uploaded_files:
@@ -273,6 +361,8 @@ if user_input or uploaded_files:
                 tool_trace.success(f"Final tools used: {', '.join(sorted(used_tools))}")
             else:
                 tool_trace.caption("No external tool was needed for this response.")
+
+    refresh_pending_approval(st.session_state['thread_id'])
 
     st.session_state['message_history'].append(
         {'role': 'assistant', 'content': ai_response}

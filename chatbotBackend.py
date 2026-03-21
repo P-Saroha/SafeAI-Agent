@@ -3,7 +3,7 @@
 # ==============================
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
@@ -55,10 +55,15 @@ llm = ChatGoogleGenerativeAI(
 # ==============================
 # STATE
 # ==============================
-class ChatState(TypedDict):
+class ChatState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     mode: str
     thread_id: str
+    awaiting_approval: bool
+    approval_request: str
+    approval_type: str
+    approval_tool_calls: list[dict]
+    approval_decision: str
 
 
 # ==============================
@@ -74,6 +79,10 @@ rag_status_cache = {}
 
 # Keep current thread context for tools that execute during an agent step.
 active_thread_id = ContextVar("active_thread_id", default="default")
+
+# HITL settings for first implementation
+APPROVAL_REQUIRED_TOOLS = {"search_tool", "get_stock_price"}
+LOW_CONFIDENCE_RAG_MIN_CHARS = 220
 
 
 def _safe_thread_id(thread_id: str) -> str:
@@ -334,6 +343,68 @@ def _is_document_intent(query: str) -> bool:
     return any(marker in q for marker in doc_markers)
 
 
+def _approval_reset_state() -> dict:
+    """Clear HITL approval state after a decision is handled."""
+    return {
+        "awaiting_approval": False,
+        "approval_request": "",
+        "approval_type": "",
+        "approval_tool_calls": [],
+        "approval_decision": "",
+    }
+
+
+def _resolve_hitl_decision(state: ChatState, latest_query: str, rag_context: str) -> dict | None:
+    """Resume flow after human approval decision."""
+    decision = str(state.get("approval_decision", "")).lower().strip()
+    if not decision:
+        return None
+
+    approval_type = str(state.get("approval_type", ""))
+
+    if approval_type == "tool_calls":
+        if decision == "approve":
+            tool_calls = state.get("approval_tool_calls", []) or []
+            if tool_calls:
+                # Return an AI message with approved tool calls so graph routes to ToolNode.
+                return {
+                    **_approval_reset_state(),
+                    "messages": [AIMessage(content="Approved. Running selected tools.", tool_calls=tool_calls)],
+                }
+
+        # regenerate/reject path: provide a direct answer without tool execution.
+        regen_prompt = [
+            SystemMessage(content=(
+                "Human rejected tool execution. Answer without calling tools. "
+                "If live data is required, ask user for explicit approval or clarification."
+            )),
+            HumanMessage(content=latest_query or "Please continue without tools."),
+        ]
+        regen_answer = llm.invoke(regen_prompt)
+        return {**_approval_reset_state(), "messages": [regen_answer]}
+
+    if approval_type == "low_confidence_rag":
+        if decision == "approve":
+            forced_prompt = [
+                SystemMessage(content=(
+                    "Human approved answering from weak document context. "
+                    "Answer only from the provided context and cite sources like [1], [2]."
+                )),
+                HumanMessage(content=f"Question: {latest_query}\n\nContext:\n{rag_context}"),
+            ]
+            forced_answer = llm.invoke(forced_prompt)
+            return {**_approval_reset_state(), "messages": [forced_answer]}
+
+        # regenerate/reject path for low confidence context.
+        clarify = AIMessage(content=(
+            "I need a little more direction before answering. "
+            "Please refine your question or upload a clearer/more relevant document."
+        ))
+        return {**_approval_reset_state(), "messages": [clarify]}
+
+    return _approval_reset_state()
+
+
 # ==============================
 # TOOLS
 # ==============================
@@ -424,6 +495,11 @@ def chat_node(state: ChatState):
     latest_query = _latest_user_query(state["messages"])
     thread_id = _safe_thread_id(state.get("thread_id", "default"))
 
+    # If waiting for human decision and none provided, keep asking for approval.
+    if state.get("awaiting_approval") and not state.get("approval_decision"):
+        pending_request = state.get("approval_request", "Approval required. Please choose Approve or Regenerate.")
+        return {"messages": [AIMessage(content=pending_request)]}
+
     mode = str(state.get("mode", "auto")).lower()
     if mode not in {"auto", "hybrid", "agent_only", "rag_only"}:
         mode = "auto"
@@ -436,6 +512,27 @@ def chat_node(state: ChatState):
             mode = "rag_only" if _is_document_intent(latest_query) else "hybrid"
 
     rag_context = _rag_context_for_query(latest_query, thread_id) if mode in {"hybrid", "rag_only"} else ""
+
+    # Handle explicit HITL decision and resume graph execution.
+    decision_result = _resolve_hitl_decision(state, latest_query, rag_context)
+    if decision_result is not None:
+        return decision_result
+
+    # HITL gate for low-confidence document answers.
+    if mode in {"hybrid", "rag_only"} and _is_document_intent(latest_query):
+        if not rag_context or len(rag_context) < LOW_CONFIDENCE_RAG_MIN_CHARS:
+            request = (
+                "HITL approval needed: document context confidence is low. "
+                "Choose Approve to answer from available context or Regenerate to refine the request."
+            )
+            return {
+                "awaiting_approval": True,
+                "approval_request": request,
+                "approval_type": "low_confidence_rag",
+                "approval_tool_calls": [],
+                "approval_decision": "",
+                "messages": [AIMessage(content=request)],
+            }
 
     rag_instructions = (
         f"RAG Context (highest priority if relevant):\n{rag_context}\n\n"
@@ -472,7 +569,41 @@ Rules:
     finally:
         active_thread_id.reset(token)
 
+    # HITL gate for selected external tools.
+    pending_calls = []
+    tool_calls = getattr(response, "tool_calls", None) or []
+    for call in tool_calls:
+        name = call.get("name") if isinstance(call, dict) else None
+        if name in APPROVAL_REQUIRED_TOOLS:
+            pending_calls.append(call)
+
+    if pending_calls:
+        tool_names = ", ".join(sorted({c.get("name", "unknown") for c in pending_calls}))
+        request = (
+            f"HITL approval needed: agent wants to run tool(s): {tool_names}. "
+            "Choose Approve to execute or Regenerate to answer without these tools."
+        )
+        return {
+            "awaiting_approval": True,
+            "approval_request": request,
+            "approval_type": "tool_calls",
+            "approval_tool_calls": pending_calls,
+            "approval_decision": "",
+            "messages": [AIMessage(content=request)],
+        }
+
     return {"messages": [response]}
+
+
+def route_after_chat(state: ChatState):
+    """Route to tools, end, or wait for human based on state and latest message."""
+    if state.get("awaiting_approval"):
+        return "wait_for_human"
+
+    decision = tools_condition(state)
+    if decision == "tools":
+        return "tools"
+    return "__end__"
 
 
 # ==============================
@@ -567,10 +698,11 @@ builder.add_edge(START, "chat_node")
 
 builder.add_conditional_edges(
     "chat_node",
-    tools_condition,
+    route_after_chat,
     {
         "tools": "tools",
-        "__end__": END
+        "wait_for_human": END,
+        "__end__": END,
     }
 )
 
