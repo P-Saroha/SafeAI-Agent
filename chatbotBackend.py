@@ -80,8 +80,7 @@ rag_status_cache = {}
 # Keep current thread context for tools that execute during an agent step.
 active_thread_id = ContextVar("active_thread_id", default="default")
 
-# HITL settings for first implementation
-APPROVAL_REQUIRED_TOOLS = {"search_tool", "get_stock_price"}
+# HITL settings: keep only low-confidence RAG approval.
 LOW_CONFIDENCE_RAG_MIN_CHARS = 220
 
 
@@ -362,27 +361,6 @@ def _resolve_hitl_decision(state: ChatState, latest_query: str, rag_context: str
 
     approval_type = str(state.get("approval_type", ""))
 
-    if approval_type == "tool_calls":
-        if decision == "approve":
-            tool_calls = state.get("approval_tool_calls", []) or []
-            if tool_calls:
-                # Return an AI message with approved tool calls so graph routes to ToolNode.
-                return {
-                    **_approval_reset_state(),
-                    "messages": [AIMessage(content="Approved. Running selected tools.", tool_calls=tool_calls)],
-                }
-
-        # regenerate/reject path: provide a direct answer without tool execution.
-        regen_prompt = [
-            SystemMessage(content=(
-                "Human rejected tool execution. Answer without calling tools. "
-                "If live data is required, ask user for explicit approval or clarification."
-            )),
-            HumanMessage(content=latest_query or "Please continue without tools."),
-        ]
-        regen_answer = llm.invoke(regen_prompt)
-        return {**_approval_reset_state(), "messages": [regen_answer]}
-
     if approval_type == "low_confidence_rag":
         if decision == "approve":
             forced_prompt = [
@@ -568,29 +546,6 @@ Rules:
             response = llm_with_tools.invoke(messages)
     finally:
         active_thread_id.reset(token)
-
-    # HITL gate for selected external tools.
-    pending_calls = []
-    tool_calls = getattr(response, "tool_calls", None) or []
-    for call in tool_calls:
-        name = call.get("name") if isinstance(call, dict) else None
-        if name in APPROVAL_REQUIRED_TOOLS:
-            pending_calls.append(call)
-
-    if pending_calls:
-        tool_names = ", ".join(sorted({c.get("name", "unknown") for c in pending_calls}))
-        request = (
-            f"HITL approval needed: agent wants to run tool(s): {tool_names}. "
-            "Choose Approve to execute or Regenerate to answer without these tools."
-        )
-        return {
-            "awaiting_approval": True,
-            "approval_request": request,
-            "approval_type": "tool_calls",
-            "approval_tool_calls": pending_calls,
-            "approval_decision": "",
-            "messages": [AIMessage(content=request)],
-        }
 
     return {"messages": [response]}
 

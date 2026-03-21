@@ -309,7 +309,20 @@ if user_input or uploaded_files:
             st.success(f'Uploaded {saved_count} file(s). {upload_status}')
 
     if not user_input:
-        user_input = 'I uploaded files. Please confirm what was indexed and how to query them.'
+        uploaded_names = ', '.join(f.name for f in uploaded_files) if uploaded_files else 'No files'
+        confirmation = (
+            f"Uploaded files: {uploaded_names}\n\n"
+            f"{upload_status}\n\n"
+            "You can now ask questions from these documents in this chat."
+        )
+        with st.chat_message('assistant'):
+            st.markdown(confirmation)
+
+        st.session_state['message_history'].append(
+            {'role': 'assistant', 'content': confirmation}
+        )
+        refresh_pending_approval(st.session_state['thread_id'])
+        st.stop()
 
     st.session_state['message_history'].append({'role': 'user', 'content': user_input})
 
