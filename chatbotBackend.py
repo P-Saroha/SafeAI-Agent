@@ -3,9 +3,14 @@
 # ==============================
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage, FunctionMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.sqlite import SqliteSaver
+try:
+    from langgraph.store.postgres import PostgresStore
+except Exception:
+    PostgresStore = None
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
@@ -32,6 +37,8 @@ import math
 import json
 import hashlib
 from datetime import datetime
+from contextlib import contextmanager
+import uuid
 from contextvars import ContextVar
 import re
 import shutil
@@ -59,6 +66,8 @@ class ChatState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     mode: str
     thread_id: str
+    user_id: str
+    allow_tools: bool
     awaiting_approval: bool
     approval_request: str
     approval_type: str
@@ -73,6 +82,19 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 RAG_DOCS_ROOT = BASE_DIR / "knowledge_base"
 RAG_INDEX_ROOT = BASE_DIR / "faiss_index"
+
+# ==============================
+# LTM CONFIG (Postgres + Memory)
+# ==============================
+LTM_DB_URI = os.getenv(
+    "LTM_POSTGRES_URI",
+    "postgresql://postgres:postgres@localhost:5442/postgres?sslmode=disable",
+)
+LTM_TOP_K = int(os.getenv("LTM_TOP_K", "4"))
+LTM_STM_MAX_MESSAGES = int(os.getenv("LTM_STM_MAX_MESSAGES", "12"))
+LTM_SUMMARY_EVERY_N = int(os.getenv("LTM_SUMMARY_EVERY_N", "10"))
+LTM_SUMMARY_KEEP_LAST = int(os.getenv("LTM_SUMMARY_KEEP_LAST", "6"))
+LTM_EMBEDDING_BACKEND = os.getenv("LTM_EMBEDDING_BACKEND", "hash").lower()
 
 rag_retriever_cache = {}
 rag_status_cache = {}
@@ -149,6 +171,172 @@ def _embedding_from_backend(backend: str):
 
     dim = int(os.getenv("RAG_HASH_EMBEDDING_DIM", "384"))
     return HashEmbeddings(dim=dim), {"backend": "hash", "dim": dim}
+
+
+MEMORY_PROMPT = """You are responsible for updating and maintaining accurate user memory.
+
+CURRENT USER DETAILS (existing memories):
+{user_details_content}
+
+TASK:
+- Review the user's latest message.
+- Extract user-specific info worth storing long-term (identity, stable preferences, ongoing projects/goals).
+- For each extracted item, set is_new=true ONLY if it adds NEW information compared to CURRENT USER DETAILS.
+- If it is basically the same meaning as something already present, set is_new=false.
+- Keep each memory as a short atomic sentence.
+- No speculation; only facts stated by the user.
+- If there is nothing memory-worthy, return should_write=false and an empty list.
+
+Return ONLY valid JSON in this format:
+{"should_write": true|false, "memories": [{"text": "...", "is_new": true|false}]}
+"""
+
+
+SUMMARY_PROMPT = """Summarize the following conversation history into short, factual memory notes.
+Focus on stable facts about the user, preferences, goals, and ongoing work.
+Return 3-6 short bullet-like sentences, each on its own line. No speculation.
+
+Conversation:
+{history}
+"""
+
+
+def _init_memory_store() -> bool:
+    """Initialize PostgresStore for long-term memory."""
+    if PostgresStore is None:
+        print("LTM store unavailable: langgraph.store.postgres is not installed.")
+        return False
+    try:
+        with PostgresStore.from_conn_string(LTM_DB_URI) as store:
+            store.setup()
+        return True
+    except Exception as err:
+        print(f"LTM store init warning: {err}")
+        return False
+
+
+memory_store_available = _init_memory_store()
+memory_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+memory_embeddings, _memory_meta = _embedding_from_backend(LTM_EMBEDDING_BACKEND)
+
+
+@contextmanager
+def _open_memory_store():
+    if not memory_store_available or PostgresStore is None:
+        yield None
+        return
+    with PostgresStore.from_conn_string(LTM_DB_URI) as store:
+        yield store
+
+
+def _memory_namespace(user_id: str) -> tuple:
+    return ("user", user_id, "details")
+
+
+def _memory_texts(items: list) -> str:
+    if not items:
+        return "(empty)"
+    lines = []
+    for item in items:
+        value = getattr(item, "value", {}) or {}
+        text = value.get("data", "")
+        if text:
+            lines.append(text)
+    return "\n".join(lines) if lines else "(empty)"
+
+
+def _parse_memory_json(raw_text: str) -> dict:
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        return {"should_write": False, "memories": []}
+
+    should_write = bool(data.get("should_write"))
+    memories = data.get("memories") or []
+    parsed = []
+    for mem in memories:
+        if not isinstance(mem, dict):
+            continue
+        text = str(mem.get("text", "")).strip()
+        is_new = bool(mem.get("is_new"))
+        if text:
+            parsed.append({"text": text, "is_new": is_new})
+
+    return {"should_write": should_write, "memories": parsed}
+
+
+def _embed_text(text: str) -> list[float]:
+    try:
+        return memory_embeddings.embed_query(text)
+    except Exception:
+        return []
+
+
+def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    if not vec_a or not vec_b:
+        return 0.0
+    a = np.array(vec_a, dtype=np.float32)
+    b = np.array(vec_b, dtype=np.float32)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def _search_memory(items: list, query: str, k: int) -> list[str]:
+    if not items:
+        return []
+    query_vec = _embed_text(query)
+    scored = []
+    for item in items:
+        value = getattr(item, "value", {}) or {}
+        text = value.get("data", "")
+        emb = value.get("embedding", [])
+        score = _cosine_similarity(query_vec, emb) if query_vec and emb else 0.0
+        scored.append((score, text))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [text for _, text in scored[:k] if text]
+
+
+def _maybe_store_summary(messages: list[BaseMessage], user_id: str) -> None:
+    if not memory_store_available:
+        return
+    if len(messages) < LTM_SUMMARY_EVERY_N:
+        return
+
+    if len(messages) % LTM_SUMMARY_EVERY_N != 0:
+        return
+
+    history_messages = messages[:-LTM_SUMMARY_KEEP_LAST]
+    if not history_messages:
+        return
+
+    history_text = "\n".join(
+        f"{msg.type}: {msg.content}" for msg in history_messages if getattr(msg, "content", None)
+    )
+    if not history_text:
+        return
+
+    summary_text = llm.invoke(
+        SystemMessage(content=SUMMARY_PROMPT.format(history=history_text))
+    ).content.strip()
+
+    if summary_text:
+        ns = _memory_namespace(user_id)
+        with _open_memory_store() as store:
+            if store is None:
+                return
+            store.put(
+                ns,
+                str(uuid.uuid4()),
+                {
+                    "data": summary_text,
+                    "embedding": _embed_text(summary_text),
+                    "kind": "summary",
+                    "ts": datetime.utcnow().isoformat(),
+                },
+            )
 
 
 def _save_rag_meta(meta: dict, thread_id: str) -> None:
@@ -329,6 +517,69 @@ def _rag_context_for_query(query: str, thread_id: str, k: int = 4) -> str:
     return "\n\n".join(snippets)
 
 
+def _is_self_query(query: str) -> bool:
+    q = query.lower().strip()
+    if not q:
+        return False
+    markers = [
+        "tell me about myself",
+        "about myself",
+        "who am i",
+        "my details",
+        "my information",
+        "my profile",
+        "what do you know about me",
+    ]
+    return any(marker in q for marker in markers)
+
+
+def _extract_name_from_memory(memory_context: str) -> str:
+    match = re.search(r"name is ([A-Za-z][A-Za-z\s'-]{0,40})", memory_context, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def _filter_messages_for_llm(messages: list[BaseMessage]) -> list[BaseMessage]:
+    filtered = []
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            tool_calls = getattr(msg, "tool_calls", None)
+            if tool_calls:
+                continue
+        if isinstance(msg, (ToolMessage, FunctionMessage)):
+            continue
+        filtered.append(msg)
+    return filtered
+
+
+def _heuristic_memories(text: str) -> list[str]:
+    if not text:
+        return []
+    items = []
+    name_match = re.search(r"\bmy name is\s+([A-Za-z][A-Za-z\s'-]{1,40})", text, re.IGNORECASE)
+    if name_match:
+        items.append(f"User's name is {name_match.group(1).strip()}.")
+
+    uni_match = re.search(r"\b(?:from|at)\s+([A-Za-z][A-Za-z\s'-]{2,60}university)\b", text, re.IGNORECASE)
+    if uni_match:
+        items.append(f"User studies at {uni_match.group(1).strip()}.")
+
+    degree_match = re.search(r"\b(?:doing|studying)\s+([A-Za-z\.\s]{2,30})\b", text, re.IGNORECASE)
+    if degree_match:
+        items.append(f"User is studying {degree_match.group(1).strip()}.")
+
+    interest_match = re.search(r"\binterest in\s+([A-Za-z\s,&-]{2,60})", text, re.IGNORECASE)
+    if interest_match:
+        items.append(f"User is interested in {interest_match.group(1).strip()}.")
+
+    age_match = re.search(r"\b(\d{1,2})\s*(?:years? old|yo)\b", text, re.IGNORECASE)
+    if age_match:
+        items.append(f"User is {age_match.group(1)} years old.")
+
+    return list(dict.fromkeys(items))
+
+
 def _is_document_intent(query: str) -> bool:
     """Detect whether user is explicitly asking about uploaded/local documents."""
     q = query.lower().strip()
@@ -340,6 +591,19 @@ def _is_document_intent(query: str) -> bool:
         "from this", "according to", "provided", "page",
     ]
     return any(marker in q for marker in doc_markers)
+
+
+def _needs_external_tools(query: str) -> bool:
+    """Heuristic gate to avoid tool calls for simple knowledge questions."""
+    q = query.lower().strip()
+    if not q:
+        return False
+
+    tool_markers = [
+        "latest", "today", "current", "news", "headline", "price", "stock",
+        "weather", "score", "live", "market", "exchange rate", "time now",
+    ]
+    return any(marker in q for marker in tool_markers)
 
 
 def _approval_reset_state() -> dict:
@@ -469,9 +733,99 @@ llm_with_agent_tools = llm.bind_tools(agent_tools)
 # ==============================
 # CHAT NODE
 # ==============================
+def _get_user_memory_context(user_id: str, query: str) -> str:
+    if not memory_store_available:
+        return ""
+
+    ns = _memory_namespace(user_id)
+    with _open_memory_store() as store:
+        if store is None:
+            return ""
+        try:
+            items = store.search(ns)
+        except Exception as err:
+            print(f"LTM search warning: {err}")
+            return ""
+
+    if not items:
+        return ""
+
+    matches = _search_memory(items, query, LTM_TOP_K) if query else _memory_texts(items).splitlines()
+    if not matches:
+        return ""
+
+    return "\n".join(f"- {item}" for item in matches)
+
+
+def remember_node(state: ChatState):
+    if not memory_store_available:
+        return {"messages": []}
+
+    user_id = _safe_thread_id(state.get("user_id") or state.get("thread_id", "default"))
+    ns = _memory_namespace(user_id)
+
+    last_text = _latest_user_query(state.get("messages", []))
+    if not last_text:
+        return {"messages": []}
+
+    with _open_memory_store() as store:
+        if store is None:
+            return {"messages": []}
+        try:
+            items = store.search(ns)
+        except Exception as err:
+            print(f"LTM search warning: {err}")
+            return {"messages": []}
+
+    existing = _memory_texts(items)
+
+    try:
+        raw = memory_llm.invoke(
+            [
+                SystemMessage(content=MEMORY_PROMPT.format(user_details_content=existing)),
+                HumanMessage(content=last_text),
+            ]
+        ).content
+        decision = _parse_memory_json(raw)
+    except Exception as err:
+        print(f"LTM extract warning: {err}")
+        return {"messages": []}
+
+    memories_to_write = []
+    if decision.get("should_write"):
+        for mem in decision.get("memories", []):
+            text = mem.get("text", "").strip()
+            if mem.get("is_new") and text:
+                memories_to_write.append(text)
+
+    if not memories_to_write:
+        memories_to_write = _heuristic_memories(last_text)
+
+    if memories_to_write:
+        with _open_memory_store() as store:
+            if store is None:
+                return {"messages": []}
+            for text in memories_to_write:
+                store.put(
+                    ns,
+                    str(uuid.uuid4()),
+                    {
+                        "data": text,
+                        "embedding": _embed_text(text),
+                        "kind": "fact",
+                        "ts": datetime.utcnow().isoformat(),
+                    },
+                )
+
+    _maybe_store_summary(state.get("messages", []), user_id)
+    return {"messages": []}
+
+
 def chat_node(state: ChatState):
     latest_query = _latest_user_query(state["messages"])
     thread_id = _safe_thread_id(state.get("thread_id", "default"))
+    user_id = _safe_thread_id(state.get("user_id") or state.get("thread_id", "default"))
+    memory_context = _get_user_memory_context(user_id, latest_query)
 
     # If waiting for human decision and none provided, keep asking for approval.
     if state.get("awaiting_approval") and not state.get("approval_decision"):
@@ -496,6 +850,18 @@ def chat_node(state: ChatState):
     if decision_result is not None:
         return decision_result
 
+    if memory_context and _is_self_query(latest_query):
+        name = _extract_name_from_memory(memory_context)
+        greeting = f"Sure {name}, " if name else "Sure, "
+        response_text = f"{greeting}here is what I remember about you:\n{memory_context}"
+        return {"messages": [AIMessage(content=response_text)]}
+    if _is_self_query(latest_query) and not memory_context:
+        response_text = (
+            "I do not have any saved details about you yet. "
+            "Tell me your name, school, or interests and I will remember them."
+        )
+        return {"messages": [AIMessage(content=response_text)]}
+
     # HITL gate for low-confidence document answers.
     if mode in {"hybrid", "rag_only"} and _is_document_intent(latest_query):
         if not rag_context or len(rag_context) < LOW_CONFIDENCE_RAG_MIN_CHARS:
@@ -518,6 +884,8 @@ def chat_node(state: ChatState):
         "If context is not relevant, then use tools as needed."
     ) if rag_context else "No RAG context available for this query."
 
+    allow_tools = _needs_external_tools(latest_query)
+
     system_prompt = f"""
 You are a smart AI assistant.
 
@@ -527,33 +895,42 @@ Rules:
 - If mode is rag_only: answer only from RAG context and clearly say when answer is not found in context
 - If mode is agent_only: use tools for web/stock/math and do not rely on RAG context
 - If mode is hybrid: prefer RAG context when relevant, otherwise use tools
+- Only call tools when the user asks for live/current data or explicitly requests a tool
 - Keep responses concise and useful
 
 {rag_instructions}
 """
 
-    messages = [
-        SystemMessage(content=system_prompt)
-    ] + state["messages"]
+    if memory_context:
+        system_prompt += f"\n\nUser memory (use only if relevant):\n{memory_context}\n"
+
+    short_term_messages = state["messages"][-LTM_STM_MAX_MESSAGES:]
+    safe_messages = _filter_messages_for_llm(short_term_messages)
+    if not safe_messages and latest_query:
+        safe_messages = [HumanMessage(content=latest_query)]
+    messages = [SystemMessage(content=system_prompt)] + safe_messages
 
     token = active_thread_id.set(thread_id)
     try:
         if mode == "rag_only":
             response = llm.invoke(messages)
         elif mode == "agent_only":
-            response = llm_with_agent_tools.invoke(messages)
+            response = llm_with_agent_tools.invoke(messages) if allow_tools else llm.invoke(messages)
         else:
-            response = llm_with_tools.invoke(messages)
+            response = llm_with_tools.invoke(messages) if allow_tools else llm.invoke(messages)
     finally:
         active_thread_id.reset(token)
 
-    return {"messages": [response]}
+    return {"messages": [response], "allow_tools": allow_tools}
 
 
 def route_after_chat(state: ChatState):
     """Route to tools, end, or wait for human based on state and latest message."""
     if state.get("awaiting_approval"):
         return "wait_for_human"
+
+    if state.get("allow_tools") is False:
+        return "__end__"
 
     decision = tools_condition(state)
     if decision == "tools":
@@ -629,6 +1006,19 @@ def delete_thread_history(thread_id: str) -> str:
         rag_retriever_cache.pop(thread_key, None)
         rag_status_cache.pop(thread_key, None)
 
+        if memory_store_available:
+            try:
+                ns = _memory_namespace(thread_key)
+                with _open_memory_store() as store:
+                    if store is not None:
+                        items = store.search(ns)
+                        for item in items:
+                            key = getattr(item, "key", None)
+                            if key is not None:
+                                store.delete(ns, key)
+            except Exception as err:
+                print(f"LTM delete warning: {err}")
+
         if total_deleted == 0:
             return "Chat deleted permanently (no checkpoints found, local docs/index removed)."
 
@@ -646,10 +1036,12 @@ def delete_thread_history(thread_id: str) -> str:
 # ==============================
 builder = StateGraph(ChatState)
 
+builder.add_node("remember", remember_node)
 builder.add_node("chat_node", chat_node)
 builder.add_node("tools", ToolNode(tools))
 
-builder.add_edge(START, "chat_node")
+builder.add_edge(START, "remember")
+builder.add_edge("remember", "chat_node")
 
 builder.add_conditional_edges(
     "chat_node",

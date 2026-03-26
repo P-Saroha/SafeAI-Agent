@@ -22,6 +22,12 @@ def generate_thread_id():
     return str(uuid.uuid4())
 
 
+def get_or_create_user_id():
+    if 'user_id' not in st.session_state:
+        st.session_state['user_id'] = str(uuid.uuid4())
+    return st.session_state['user_id']
+
+
 def reset_chat():
     thread_id = generate_thread_id()
     st.session_state['thread_id'] = thread_id
@@ -52,13 +58,17 @@ def delete_thread(thread_id):
 
 
 def load_conversation(thread_id):
-    state = chatbot.get_state(config={'configurable': {'thread_id': thread_id}})
+    state = chatbot.get_state(
+        config={'configurable': {'thread_id': thread_id, 'user_id': get_or_create_user_id()}}
+    )
     return state.values.get('messages', [])
 
 
 def refresh_pending_approval(thread_id):
     """Load HITL pending request from graph state for the active thread."""
-    state = chatbot.get_state(config={'configurable': {'thread_id': thread_id}})
+    state = chatbot.get_state(
+        config={'configurable': {'thread_id': thread_id, 'user_id': get_or_create_user_id()}}
+    )
     values = state.values or {}
 
     if values.get('awaiting_approval'):
@@ -117,6 +127,8 @@ if 'message_history' not in st.session_state:
 
 if 'thread_id' not in st.session_state:
     st.session_state['thread_id'] = generate_thread_id()
+
+get_or_create_user_id()
 
 if 'chat_threads' not in st.session_state:
     st.session_state['chat_threads'] = unique_thread_pointer()
@@ -221,7 +233,12 @@ if pending:
     col_a, col_b = st.columns(2)
 
     if col_a.button('Approve', key=f"approve_{st.session_state['thread_id']}"):
-        CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
+        CONFIG = {
+            'configurable': {
+                'thread_id': st.session_state['thread_id'],
+                'user_id': get_or_create_user_id(),
+            }
+        }
         with st.chat_message('user'):
             st.markdown('[HITL] Approve')
 
@@ -235,6 +252,7 @@ if pending:
                                 'messages': [],
                                 'mode': 'auto',
                                 'thread_id': st.session_state['thread_id'],
+                                'user_id': get_or_create_user_id(),
                                 'approval_decision': 'approve',
                             },
                             config=CONFIG,
@@ -249,7 +267,12 @@ if pending:
         st.rerun()
 
     if col_b.button('Regenerate', key=f"regen_{st.session_state['thread_id']}"):
-        CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
+        CONFIG = {
+            'configurable': {
+                'thread_id': st.session_state['thread_id'],
+                'user_id': get_or_create_user_id(),
+            }
+        }
         with st.chat_message('user'):
             st.markdown('[HITL] Regenerate')
 
@@ -263,6 +286,7 @@ if pending:
                                 'messages': [],
                                 'mode': 'auto',
                                 'thread_id': st.session_state['thread_id'],
+                                'user_id': get_or_create_user_id(),
                                 'approval_decision': 'regenerate',
                             },
                             config=CONFIG,
@@ -332,7 +356,12 @@ if user_input or uploaded_files:
             file_names = ', '.join(f.name for f in uploaded_files)
             st.caption(f'Attached files: {file_names}')
 
-    CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
+    CONFIG = {
+        'configurable': {
+            'thread_id': st.session_state['thread_id'],
+            'user_id': get_or_create_user_id(),
+        }
+    }
     selected_mode = 'auto'
 
     with st.chat_message("assistant"):
@@ -347,6 +376,7 @@ if user_input or uploaded_files:
                             "messages": [HumanMessage(content=user_input)],
                             "mode": selected_mode,
                             "thread_id": st.session_state['thread_id'],
+                            "user_id": get_or_create_user_id(),
                         },
                         config=CONFIG,
                         stream_mode="messages"
