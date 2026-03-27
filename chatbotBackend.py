@@ -68,6 +68,7 @@ class ChatState(TypedDict, total=False):
     thread_id: str
     user_id: str
     allow_tools: bool
+    pending_weather: bool
     awaiting_approval: bool
     approval_request: str
     approval_type: str
@@ -191,7 +192,6 @@ Return ONLY valid JSON in this format:
 {"should_write": true|false, "memories": [{"text": "...", "is_new": true|false}]}
 """
 
-
 SUMMARY_PROMPT = """Summarize the following conversation history into short, factual memory notes.
 Focus on stable facts about the user, preferences, goals, and ongoing work.
 Return 3-6 short bullet-like sentences, each on its own line. No speculation.
@@ -201,16 +201,24 @@ Conversation:
 """
 
 
+memory_store_last_error = ""
+
+
 def _init_memory_store() -> bool:
     """Initialize PostgresStore for long-term memory."""
+    global memory_store_last_error
+    memory_store_last_error = ""
     if PostgresStore is None:
+        memory_store_last_error = "Postgres store unavailable (missing langgraph.store.postgres)."
         print("LTM store unavailable: langgraph.store.postgres is not installed.")
         return False
     try:
         with PostgresStore.from_conn_string(LTM_DB_URI) as store:
             store.setup()
+        memory_store_last_error = ""
         return True
     except Exception as err:
+        memory_store_last_error = str(err)
         print(f"LTM store init warning: {err}")
         return False
 
@@ -220,9 +228,20 @@ memory_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
 memory_embeddings, _memory_meta = _embedding_from_backend(LTM_EMBEDDING_BACKEND)
 
 
+def _ensure_memory_store() -> bool:
+    global memory_store_available
+    if memory_store_available:
+        return True
+    memory_store_available = _init_memory_store()
+    return memory_store_available
+
+
 @contextmanager
 def _open_memory_store():
-    if not memory_store_available or PostgresStore is None:
+    if PostgresStore is None:
+        yield None
+        return
+    if not _ensure_memory_store():
         yield None
         return
     with PostgresStore.from_conn_string(LTM_DB_URI) as store:
@@ -243,6 +262,22 @@ def _memory_texts(items: list) -> str:
         if text:
             lines.append(text)
     return "\n".join(lines) if lines else "(empty)"
+
+
+def _normalize_memory_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _dedupe_memory_list(items: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for item in items:
+        norm = _normalize_memory_text(item)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        result.append(item)
+    return result
 
 
 def _parse_memory_json(raw_text: str) -> dict:
@@ -300,7 +335,7 @@ def _search_memory(items: list, query: str, k: int) -> list[str]:
 
 
 def _maybe_store_summary(messages: list[BaseMessage], user_id: str) -> None:
-    if not memory_store_available:
+    if not _ensure_memory_store():
         return
     if len(messages) < LTM_SUMMARY_EVERY_N:
         return
@@ -319,7 +354,7 @@ def _maybe_store_summary(messages: list[BaseMessage], user_id: str) -> None:
         return
 
     summary_text = llm.invoke(
-        SystemMessage(content=SUMMARY_PROMPT.format(history=history_text))
+        [SystemMessage(content=SUMMARY_PROMPT.format(history=history_text))]
     ).content.strip()
 
     if summary_text:
@@ -529,6 +564,8 @@ def _is_self_query(query: str) -> bool:
         "my information",
         "my profile",
         "what do you know about me",
+        "my interest",
+        "my interests",
     ]
     return any(marker in q for marker in markers)
 
@@ -569,15 +606,19 @@ def _heuristic_memories(text: str) -> list[str]:
     if degree_match:
         items.append(f"User is studying {degree_match.group(1).strip()}.")
 
-    interest_match = re.search(r"\binterest in\s+([A-Za-z\s,&-]{2,60})", text, re.IGNORECASE)
+    interest_match = re.search(r"\binterest(?:ed)?(?:\s+lies)?\s+in\s+([A-Za-z\s,&/-]{2,80})", text, re.IGNORECASE)
     if interest_match:
         items.append(f"User is interested in {interest_match.group(1).strip()}.")
+
+    plan_match = re.search(r"\b(?:plan(?:ning)? to|going to|travel(?:ing)? to|trip to)\s+([A-Za-z\s'-]{2,60})", text, re.IGNORECASE)
+    if plan_match:
+        items.append(f"User plans to go to {plan_match.group(1).strip()}.")
 
     age_match = re.search(r"\b(\d{1,2})\s*(?:years? old|yo)\b", text, re.IGNORECASE)
     if age_match:
         items.append(f"User is {age_match.group(1)} years old.")
 
-    return list(dict.fromkeys(items))
+    return _dedupe_memory_list(items)
 
 
 def _is_document_intent(query: str) -> bool:
@@ -604,6 +645,60 @@ def _needs_external_tools(query: str) -> bool:
         "weather", "score", "live", "market", "exchange rate", "time now",
     ]
     return any(marker in q for marker in tool_markers)
+
+
+def _is_stock_query(query: str) -> bool:
+    q = query.lower()
+    return "stock" in q or "price" in q
+
+
+def _is_weather_query(query: str) -> bool:
+    return "weather" in query.lower()
+
+
+def _has_location_hint(query: str) -> bool:
+    q = query.lower()
+    return " in " in q or " at " in q or " of " in q or bool(_extract_weather_location(query))
+
+
+def _extract_weather_location(query: str) -> str:
+    q = query.lower()
+    match = re.search(r"weather\s+(?:in|of|for)\s+([a-z\s]+)", q)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"([a-z\s]+)\s+weather", q)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def _truncate_text(text: str, limit: int = 240) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _extract_stock_symbol(query: str) -> str:
+    q = query.lower()
+    mapping = {
+        "google": "GOOGL",
+        "alphabet": "GOOGL",
+        "microsoft": "MSFT",
+        "apple": "AAPL",
+        "amazon": "AMZN",
+        "meta": "META",
+        "facebook": "META",
+        "tesla": "TSLA",
+        "nvidia": "NVDA",
+    }
+    for name, symbol in mapping.items():
+        if name in q:
+            return symbol
+
+    match = re.search(r"\b([A-Z]{1,5})\b", query)
+    if match:
+        return match.group(1).upper()
+    return ""
 
 
 def _approval_reset_state() -> dict:
@@ -654,9 +749,36 @@ def _resolve_hitl_decision(state: ChatState, latest_query: str, rag_context: str
 @tool
 def search_tool(query: str) -> str:
     """Search latest information from web"""
+    search_query = query
+    if _is_weather_query(query):
+        location = _extract_weather_location(query)
+        if location:
+            search_query = f"{location} weather today"
+
     with DDGS() as ddgs:
-        results = list(ddgs.text(query, max_results=5))
-    return "\n".join([r["body"] for r in results])
+        results = list(ddgs.text(search_query, max_results=5))
+
+    snippets = []
+    seen = set()
+    for r in results:
+        body = _truncate_text(str(r.get("body", "")).strip(), 200)
+        title = _truncate_text(str(r.get("title", "")).strip(), 120)
+        url = str(r.get("href", "")).strip()
+        if _is_weather_query(query):
+            text_blob = f"{title} {body}".lower()
+            if "weather" not in text_blob:
+                continue
+        text = " - ".join(part for part in [title, body] if part)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        if url:
+            text = f"{text} ({url})"
+        snippets.append(text)
+        if len(snippets) >= 1:
+            break
+
+    return "\n".join(snippets) if snippets else "No results found."
 
 
 @tool
@@ -734,7 +856,7 @@ llm_with_agent_tools = llm.bind_tools(agent_tools)
 # CHAT NODE
 # ==============================
 def _get_user_memory_context(user_id: str, query: str) -> str:
-    if not memory_store_available:
+    if not _ensure_memory_store():
         return ""
 
     ns = _memory_namespace(user_id)
@@ -750,7 +872,10 @@ def _get_user_memory_context(user_id: str, query: str) -> str:
     if not items:
         return ""
 
-    matches = _search_memory(items, query, LTM_TOP_K) if query else _memory_texts(items).splitlines()
+    if _is_self_query(query):
+        matches = _dedupe_memory_list(_memory_texts(items).splitlines())
+    else:
+        matches = _search_memory(items, query, LTM_TOP_K) if query else _memory_texts(items).splitlines()
     if not matches:
         return ""
 
@@ -758,7 +883,7 @@ def _get_user_memory_context(user_id: str, query: str) -> str:
 
 
 def remember_node(state: ChatState):
-    if not memory_store_available:
+    if not _ensure_memory_store():
         return {"messages": []}
 
     user_id = _safe_thread_id(state.get("user_id") or state.get("thread_id", "default"))
@@ -778,6 +903,11 @@ def remember_node(state: ChatState):
             return {"messages": []}
 
     existing = _memory_texts(items)
+    existing_set = {
+        _normalize_memory_text(text)
+        for text in existing.splitlines()
+        if text.strip()
+    }
 
     try:
         raw = memory_llm.invoke(
@@ -789,7 +919,7 @@ def remember_node(state: ChatState):
         decision = _parse_memory_json(raw)
     except Exception as err:
         print(f"LTM extract warning: {err}")
-        return {"messages": []}
+        decision = {"should_write": False, "memories": []}
 
     memories_to_write = []
     if decision.get("should_write"):
@@ -798,8 +928,12 @@ def remember_node(state: ChatState):
             if mem.get("is_new") and text:
                 memories_to_write.append(text)
 
-    if not memories_to_write:
-        memories_to_write = _heuristic_memories(last_text)
+    memories_to_write.extend(_heuristic_memories(last_text))
+    memories_to_write = _dedupe_memory_list(memories_to_write)
+    memories_to_write = [
+        text for text in memories_to_write
+        if _normalize_memory_text(text) not in existing_set
+    ]
 
     if memories_to_write:
         with _open_memory_store() as store:
@@ -826,6 +960,14 @@ def chat_node(state: ChatState):
     thread_id = _safe_thread_id(state.get("thread_id", "default"))
     user_id = _safe_thread_id(state.get("user_id") or state.get("thread_id", "default"))
     memory_context = _get_user_memory_context(user_id, latest_query)
+
+    if state.get("pending_weather") and latest_query:
+        weather_answer = search_tool(f"weather in {latest_query}")
+        return {
+            "messages": [AIMessage(content=weather_answer)],
+            "allow_tools": False,
+            "pending_weather": False,
+        }
 
     # If waiting for human decision and none provided, keep asking for approval.
     if state.get("awaiting_approval") and not state.get("approval_decision"):
@@ -876,6 +1018,40 @@ def chat_node(state: ChatState):
                 "approval_tool_calls": [],
                 "approval_decision": "",
                 "messages": [AIMessage(content=request)],
+            }
+
+    if _is_weather_query(latest_query) and not _has_location_hint(latest_query):
+        return {
+            "messages": [AIMessage(content="Which city are you asking about?")],
+            "allow_tools": False,
+            "pending_weather": True,
+        }
+
+    if _is_weather_query(latest_query) and _has_location_hint(latest_query):
+        location = _extract_weather_location(latest_query) or latest_query
+        raw_weather = search_tool(f"weather in {location}")
+        summary_prompt = (
+            "Summarize the weather in 1-2 short sentences using the provided snippet. "
+            "If the snippet lacks a clear forecast, say that only a link is available."
+        )
+        summary = llm.invoke(
+            [
+                SystemMessage(content=summary_prompt),
+                HumanMessage(content=raw_weather),
+            ]
+        ).content.strip()
+        return {
+            "messages": [AIMessage(content=summary or raw_weather)],
+            "allow_tools": False,
+            "pending_weather": False,
+        }
+
+    if _is_stock_query(latest_query):
+        symbol = _extract_stock_symbol(latest_query)
+        if symbol:
+            return {
+                "messages": [AIMessage(content=get_stock_price(symbol))],
+                "allow_tools": False,
             }
 
     rag_instructions = (
@@ -1006,7 +1182,7 @@ def delete_thread_history(thread_id: str) -> str:
         rag_retriever_cache.pop(thread_key, None)
         rag_status_cache.pop(thread_key, None)
 
-        if memory_store_available:
+        if _ensure_memory_store():
             try:
                 ns = _memory_namespace(thread_key)
                 with _open_memory_store() as store:
@@ -1102,3 +1278,50 @@ def unique_thread_pointer():
     for checkpoint in checkpointer.list(None):
         all_threads.add(checkpoint.config['configurable']['thread_id'])
     return list(all_threads)
+
+
+def get_user_memory(user_id: str) -> list[str]:
+    """Return stored memory entries for a user."""
+    if not _ensure_memory_store():
+        return []
+
+    user_key = _safe_thread_id(user_id)
+    ns = _memory_namespace(user_key)
+    with _open_memory_store() as store:
+        if store is None:
+            return []
+        try:
+            items = store.search(ns)
+        except Exception:
+            return []
+
+    return [
+        item.value.get("data", "")
+        for item in items
+        if getattr(item, "value", None) and item.value.get("data")
+    ]
+
+
+def get_user_memory_count(user_id: str) -> int:
+    if not _ensure_memory_store():
+        return 0
+
+    user_key = _safe_thread_id(user_id)
+    ns = _memory_namespace(user_key)
+    with _open_memory_store() as store:
+        if store is None:
+            return 0
+        try:
+            items = store.search(ns)
+        except Exception:
+            return 0
+
+    return len(items)
+
+
+def get_memory_status() -> dict:
+    return {
+        "available": _ensure_memory_store(),
+        "last_error": memory_store_last_error,
+        "db_uri": LTM_DB_URI,
+    }

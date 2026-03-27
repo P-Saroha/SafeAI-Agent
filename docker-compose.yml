@@ -14,3 +14,8 @@ services:
 
 volumes:
   chatbot_postgres_data:
+
+
+# Docker run
+# cd Chatbot
+# docker compose up -d

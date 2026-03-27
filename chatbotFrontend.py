@@ -6,6 +6,9 @@ from chatbotBackend import (
     rebuild_rag_index,
     delete_thread_history,
     get_thread_rag_docs_dir,
+    get_user_memory,
+    get_memory_status,
+    get_user_memory_count,
 )
 from langchain_core.messages import HumanMessage, AIMessage
 import uuid
@@ -23,9 +26,20 @@ def generate_thread_id():
 
 
 def get_or_create_user_id():
-    if 'user_id' not in st.session_state:
-        st.session_state['user_id'] = str(uuid.uuid4())
-    return st.session_state['user_id']
+    if 'user_id' in st.session_state:
+        return st.session_state['user_id']
+
+    user_id_path = Path(__file__).resolve().parent / ".user_id"
+    if user_id_path.exists():
+        stored = user_id_path.read_text(encoding="utf-8").strip()
+        if stored:
+            st.session_state['user_id'] = stored
+            return stored
+
+    user_id = str(uuid.uuid4())
+    user_id_path.write_text(user_id, encoding="utf-8")
+    st.session_state['user_id'] = user_id
+    return user_id
 
 
 def reset_chat():
@@ -171,6 +185,23 @@ st.sidebar.caption("Upload PDF, TXT, or MD files here to add chatbot knowledge."
 st.sidebar.caption('Attach files directly from chat input (paperclip) for GPT-like flow.')
 
 st.sidebar.header('My Conversations')
+
+st.sidebar.header('Memory (Debug)')
+st.sidebar.caption(f"User ID: {get_or_create_user_id()}")
+status = get_memory_status()
+if status.get("available"):
+    st.sidebar.success("LTM connected")
+    st.sidebar.caption(f"Entries: {get_user_memory_count(get_or_create_user_id())}")
+else:
+    st.sidebar.warning("LTM not connected")
+    if status.get("last_error"):
+        st.sidebar.caption(status["last_error"])
+if st.sidebar.button('Show Memory'):
+    memories = get_user_memory(get_or_create_user_id())
+    if memories:
+        st.sidebar.write("\n".join(f"- {m}" for m in memories))
+    else:
+        st.sidebar.info('No LTM entries found for this user.')
 
 for thread_id in st.session_state['chat_threads'][::-1]:
     col1, col2 = st.sidebar.columns([4,1])
