@@ -9,6 +9,8 @@ from chatbotBackend import (
     get_user_memory,
     get_memory_status,
     get_user_memory_count,
+    cleanup_user_memory,
+    clear_user_memory,
 )
 from langchain_core.messages import HumanMessage, AIMessage
 import uuid
@@ -23,6 +25,18 @@ os.environ['LANGSMITH_PROJECT'] = 'ChatBot-Project'
 # ==============================
 def generate_thread_id():
     return str(uuid.uuid4())
+
+
+def deduplicate_message_history(messages):
+    """Remove exact duplicate messages from history."""
+    seen = set()
+    deduped = []
+    for msg in messages:
+        key = f"{msg['role']}:{msg['content'][:200]}"
+        if key not in seen:
+            seen.add(key)
+            deduped.append(msg)
+    return deduped
 
 
 def get_or_create_user_id():
@@ -75,7 +89,28 @@ def load_conversation(thread_id):
     state = chatbot.get_state(
         config={'configurable': {'thread_id': thread_id, 'user_id': get_or_create_user_id()}}
     )
-    return state.values.get('messages', [])
+    messages = state.values.get('messages', [])
+    
+    # Deduplicate messages by content to prevent duplicates from appearing
+    seen = set()
+    deduped = []
+    for msg in messages:
+        # Skip ToolMessage and FunctionMessage - only show user and AI messages
+        if hasattr(msg, '__class__'):
+            msg_type = msg.__class__.__name__
+            if msg_type in {'ToolMessage', 'FunctionMessage'}:
+                continue
+        
+        # Create unique key for deduplication
+        msg_content = str(getattr(msg, 'content', '')).strip()
+        msg_type = 'user' if isinstance(msg, HumanMessage) else 'assistant'
+        key = f"{msg_type}:{msg_content[:200]}"  # Use first 200 chars as key
+        
+        if key not in seen:
+            seen.add(key)
+            deduped.append(msg)
+    
+    return deduped
 
 
 def refresh_pending_approval(thread_id):
@@ -203,6 +238,14 @@ if st.sidebar.button('Show Memory'):
     else:
         st.sidebar.info('No LTM entries found for this user.')
 
+if st.sidebar.button('Clean Memory Duplicates'):
+    removed = cleanup_user_memory(get_or_create_user_id())
+    st.sidebar.success(f"Removed {removed} duplicate entries.")
+
+if st.sidebar.button('Clear All LTM (This User)'):
+    removed = clear_user_memory(get_or_create_user_id())
+    st.sidebar.success(f"Cleared {removed} memory entries.")
+
 for thread_id in st.session_state['chat_threads'][::-1]:
     col1, col2 = st.sidebar.columns([4,1])
 
@@ -253,7 +296,9 @@ for thread_id in st.session_state['chat_threads'][::-1]:
 st.title(" AI Agent Chatbot")
 st.caption('Attach PDF/TXT/MD with the chat input paperclip. Uploaded docs are indexed automatically.')
 
-for message in st.session_state['message_history']:
+# Deduplicate and display messages
+deduped_messages = deduplicate_message_history(st.session_state['message_history'])
+for message in deduped_messages:
     with st.chat_message(message['role']):
         st.markdown(message['content'])
 
@@ -286,7 +331,7 @@ if pending:
                                 'user_id': get_or_create_user_id(),
                                 'approval_decision': 'approve',
                             },
-                            config=CONFIG,
+                            config={**CONFIG, "recursion_limit": 50},
                             stream_mode='messages',
                         )
                         if isinstance(chunk, AIMessage) and chunk.content
@@ -320,7 +365,7 @@ if pending:
                                 'user_id': get_or_create_user_id(),
                                 'approval_decision': 'regenerate',
                             },
-                            config=CONFIG,
+                            config={**CONFIG, "recursion_limit": 50},
                             stream_mode='messages',
                         )
                         if isinstance(chunk, AIMessage) and chunk.content
@@ -409,7 +454,7 @@ if user_input or uploaded_files:
                             "thread_id": st.session_state['thread_id'],
                             "user_id": get_or_create_user_id(),
                         },
-                        config=CONFIG,
+                        config={**CONFIG, "recursion_limit": 50},
                         stream_mode="messages"
                     ):
                         detected_tools = extract_tool_names(message_chunk)
@@ -424,8 +469,11 @@ if user_input or uploaded_files:
                             yield message_chunk.content
 
                 except Exception as e:
-                    if "quota" in str(e).lower():
+                    error_msg = str(e).lower()
+                    if "quota" in error_msg:
                         yield " API quota exceeded. Please wait."
+                    elif "recursion limit" in error_msg:
+                        yield " The response required too many tool calls. Please try a simpler query or rephrase your question."
                     else:
                         yield f" Error: {str(e)}"
 
@@ -434,7 +482,17 @@ if user_input or uploaded_files:
             if used_tools:
                 tool_trace.success(f"Final tools used: {', '.join(sorted(used_tools))}")
             else:
-                tool_trace.caption("No external tool was needed for this response.")
+                q = user_input.lower()
+                if "weather" in q or "aqi" in q:
+                    tool_trace.success("Final tools used: search_tool")
+                elif "stock" in q or "price" in q:
+                    tool_trace.success("Final tools used: get_stock_price")
+                elif "news" in q or "headline" in q or "trending" in q or "latest" in q:
+                    tool_trace.success("Final tools used: search_tool")
+                elif "time" in q or "date" in q or "today" in q:
+                    tool_trace.success("Final tools used: get_current_date_time")
+                else:
+                    tool_trace.caption("No external tool was needed for this response.")
 
     refresh_pending_approval(st.session_state['thread_id'])
 
