@@ -344,12 +344,16 @@ def _filter_auto_facts(facts: list[str], structured: dict) -> list[str]:
     skip_terms = []
     if structured.get("name"):
         skip_terms.extend(["name is", "your name"])
+    if structured.get("age"):
+        skip_terms.extend(["years old", "age"])
     if structured.get("education"):
         skip_terms.extend(["studying", "education", "b.e", "b.s", "b.sc"])
     if structured.get("university"):
         skip_terms.append("university")
     if structured.get("favorite_language"):
         skip_terms.append("favorite programming language")
+    if structured.get("favorite_color"):
+        skip_terms.append("favorite color")
     if structured.get("favorite_laptop"):
         skip_terms.append("favorite laptop")
     if structured.get("interests"):
@@ -358,6 +362,8 @@ def _filter_auto_facts(facts: list[str], structured: dict) -> list[str]:
         skip_terms.append("you like")
     if structured.get("projects"):
         skip_terms.append("worked on")
+    if structured.get("travel_plans"):
+        skip_terms.append("plan to go")
 
     filtered = []
     for fact in facts:
@@ -575,14 +581,18 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
                         pass
 
         timestamp = datetime.utcnow().isoformat()
-        for key in ["name", "education", "university", "favorite_language", "favorite_laptop"]:
+        for key in ["name", "age", "education", "university", "favorite_language", "favorite_color", "favorite_laptop"]:
             value = str(memory.get(key) or "").strip()
             if key == "name":
                 value = _clean_name_value(value)
+            if key == "age":
+                value = _clean_age_value(value)
             if key == "education":
                 value = _normalize_degree_text(value).rstrip(".")
             if key == "favorite_language":
                 value = _clean_favorite_language(value)
+            if key == "favorite_color":
+                value = _clean_favorite_color(value)
             if key == "favorite_laptop":
                 value = _clean_favorite_device(value)
             if not value:
@@ -601,7 +611,7 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
                 },
             )
 
-        for key in ["interests", "likes", "projects"]:
+        for key in ["interests", "likes", "projects", "travel_plans"]:
             values = _normalize_list(memory.get(key) or [])
             if not values:
                 continue
@@ -609,6 +619,8 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
                 sentence = f"You are interested in {', '.join(values)}."
             elif key == "likes":
                 sentence = f"You like {', '.join(values)}."
+            elif key == "travel_plans":
+                sentence = f"You plan to go to {', '.join(values)}."
             else:
                 sentence = f"You worked on {', '.join(values)}."
 
@@ -724,7 +736,7 @@ def _memory_matches_query(text: str, query: str) -> bool:
     if "like" in q:
         return "likes" in t or "like" in t
     if "plan" in q or "going" in q or "travel" in q:
-        return "plans to go" in t
+        return "plan to go" in t or "plans to go" in t
     if "name" in q:
         return "name is" in t
     if "study" in q or "education" in q:
@@ -1304,13 +1316,16 @@ def _heuristic_structured_memory(text: str) -> dict:
     clean = re.sub(r"\s+", " ", text.strip())
     memory = {
         "name": "",
+        "age": "",
         "education": "",
         "university": "",
         "favorite_language": "",
+        "favorite_color": "",
         "favorite_laptop": "",
         "interests": [],
         "likes": [],
         "projects": [],
+        "travel_plans": [],
     }
 
     name_match = re.search(
@@ -1340,6 +1355,22 @@ def _heuristic_structured_memory(text: str) -> dict:
     )
     if fav_lang_match:
         memory["favorite_language"] = fav_lang_match.group(1).strip()
+
+    fav_color_match = re.search(
+        r"\bfavorite color is\s+([A-Za-z\s-]{2,30})(?=[\.,]|$)",
+        clean,
+        re.IGNORECASE,
+    )
+    if fav_color_match:
+        memory["favorite_color"] = _clean_favorite_color(fav_color_match.group(1).strip())
+
+    age_match = re.search(
+        r"\b(?:my age is|i am)\s+(\d{1,2})\s*(?:years? old|yo)?\b",
+        clean,
+        re.IGNORECASE,
+    )
+    if age_match:
+        memory["age"] = age_match.group(1).strip()
 
     fav_laptop_match = re.search(
         r"\bfavorite laptop is\s+([A-Za-z0-9][A-Za-z0-9\s+-]{1,60})(?=[\.,]|$)",
@@ -1373,9 +1404,18 @@ def _heuristic_structured_memory(text: str) -> dict:
     if project_match:
         memory["projects"].append(project_match.group(2).strip())
 
+    plan_match = re.search(
+        r"\b(?:planning to|plan to|going to)\s+go\s+to\s+([A-Za-z\s'-]{2,60})\b",
+        clean,
+        re.IGNORECASE,
+    )
+    if plan_match:
+        memory["travel_plans"].append(plan_match.group(1).strip())
+
     memory["interests"] = _normalize_interest_list(memory["interests"])
     memory["likes"] = _normalize_list(memory["likes"])
     memory["projects"] = _normalize_list(memory["projects"])
+    memory["travel_plans"] = _normalize_list(memory["travel_plans"])
 
     return memory
 
@@ -1522,7 +1562,22 @@ def _is_news_query(query: str) -> bool:
 
 def _is_time_query(query: str) -> bool:
     q = query.lower()
-    return any(word in q for word in ["time", "date", "today date", "current time", "what is today"])
+    if not q:
+        return False
+    if _is_weather_query(q) or "temperature" in q or "temp" in q:
+        return False
+    return any(word in q for word in ["time", "date", "today date", "current time"]) or q.strip() in {"what is today", "today date"}
+
+
+def _is_greeting(query: str) -> bool:
+    q = query.lower().strip()
+    if not q:
+        return False
+    if len(q.split()) > 4:
+        return False
+    greetings = {"hi", "hello", "hey", "hii", "hllo", "yo", "namaste"}
+    tokens = [t.strip("!.?,") for t in q.split()]
+    return any(t in greetings for t in tokens)
 
 
 def _is_stock_query(query: str) -> bool:
@@ -1531,7 +1586,15 @@ def _is_stock_query(query: str) -> bool:
 
 
 def _is_weather_query(query: str) -> bool:
-    return "weather" in query.lower()
+    q = query.lower()
+    return (
+        "weather" in q
+        or "weaher" in q
+        or "weather" in q
+        or "wheather" in q
+        or "temperature" in q
+        or "temp" in q
+    )
 
 
 def _has_location_hint(query: str) -> bool:
@@ -1630,6 +1693,7 @@ def _format_search_results(raw_text: str, max_items: int = 5) -> str:
 def _extract_stock_symbol(query: str) -> str:
     q = query.lower()
     mapping = {
+        "oracle": "ORCL",
         "google": "GOOGL",
         "alphabet": "GOOGL",
         "microsoft": "MSFT",
@@ -1828,6 +1892,27 @@ def _get_user_memory_context(user_id: str, query: str) -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
+def _extract_stm_facts(messages: list[BaseMessage], exclude_latest: bool = True) -> list[str]:
+    if not messages:
+        return []
+    human_texts = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
+            human_texts.append(msg.content)
+
+    if exclude_latest and human_texts:
+        human_texts = human_texts[:-1]
+
+    combined = " ".join(human_texts).strip()
+    if not combined:
+        return []
+
+    stm_structured = _heuristic_structured_memory(combined)
+    stm_facts = _structured_memory_to_sentences(stm_structured)
+    stm_facts.extend(_heuristic_auto_facts(combined))
+    return _dedupe_memory_list([f for f in stm_facts if f])
+
+
 def _get_user_memory_items(user_id: str, query: str) -> list[str]:
     if not _ensure_memory_store():
         return []
@@ -1971,8 +2056,11 @@ def chat_node(state: ChatState):
     latest_query = _latest_user_query(state["messages"])
     thread_id = _safe_thread_id(state.get("thread_id", "default"))
     user_id = _safe_thread_id(state.get("user_id") or state.get("thread_id", "default"))
-    memory_context = _get_user_memory_context(user_id, latest_query)
+    memory_context = "" if _is_greeting(latest_query) else _get_user_memory_context(user_id, latest_query)
     last_weather_link = str(state.get("last_weather_link") or "")
+
+    if _is_greeting(latest_query):
+        return {"messages": [AIMessage(content="Hello! How can I help you today?")], "allow_tools": False}
 
     if latest_query and re.search(r"\b(link|that link|the link|share link|give me that link)\b", latest_query.lower()):
         if last_weather_link:
@@ -2043,12 +2131,13 @@ def chat_node(state: ChatState):
 
     if _is_self_query(latest_query):
         memory_items = _get_user_memory_items(user_id, latest_query)
+        stm_items = _extract_stm_facts(state.get("messages", []), exclude_latest=True)
         if memory_items:
             name = _extract_name_from_memory("\n".join(memory_items))
             greeting = "Sure, "
             seen = set()
             lines = []
-            for item in memory_items:
+            for item in memory_items + stm_items:
                 formatted = _format_memory_item(item, "")
                 key = _memory_display_key(formatted, "")
                 if not key or key in seen:
@@ -2064,18 +2153,6 @@ def chat_node(state: ChatState):
             "Tell me your name, school, or interests and I will remember them."
         )
         return {"messages": [AIMessage(content=response_text)]}
-
-    # Date/time query handling
-    if _is_time_query(latest_query):
-        now_text = _call_time_tool()
-        response_text = f"Date/Time:\n- {now_text}\n\n" + _format_sources([], fallback="System clock")
-        return {"messages": [AIMessage(content=response_text)], "allow_tools": False}
-
-    # News/trending query handling
-    if _is_news_query(latest_query):
-        raw_news = _call_search_tool(latest_query)
-        response_text = "Top results:\n" + _format_search_results(raw_news)
-        return {"messages": [AIMessage(content=response_text)], "allow_tools": False}
 
     # HITL gate for low-confidence document answers.
     if mode in {"hybrid", "rag_only"} and _is_document_intent(latest_query):
@@ -2131,6 +2208,18 @@ def chat_node(state: ChatState):
             "last_weather_link": weather_link or last_weather_link,
         }
 
+    # Date/time query handling
+    if _is_time_query(latest_query):
+        now_text = _call_time_tool()
+        response_text = f"Date/Time:\n- {now_text}\n\n" + _format_sources([], fallback="System clock")
+        return {"messages": [AIMessage(content=response_text)], "allow_tools": False}
+
+    # News/trending query handling
+    if _is_news_query(latest_query):
+        raw_news = _call_search_tool(latest_query)
+        response_text = "Top results:\n" + _format_search_results(raw_news)
+        return {"messages": [AIMessage(content=response_text)], "allow_tools": False}
+
     if _is_stock_query(latest_query):
         symbol = _extract_stock_symbol(latest_query)
         if symbol:
@@ -2140,6 +2229,18 @@ def chat_node(state: ChatState):
                 "messages": [AIMessage(content=response_text)],
                 "allow_tools": False,
             }
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "Stock:\n- I need a ticker or company name I can match. "
+                        "Try something like 'stock price of Oracle (ORCL)'.\n\n"
+                        + _format_sources([], fallback="Market data")
+                    )
+                )
+            ],
+            "allow_tools": False,
+        }
 
     # Generic tool-needed queries: run search directly to avoid tool-calling loops.
     if _needs_external_tools(latest_query):
