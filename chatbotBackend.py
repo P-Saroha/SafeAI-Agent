@@ -44,6 +44,9 @@ import shutil
 import numpy as np
 from ddgs import DDGS
 import yfinance as yf
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 
 # ==============================
@@ -55,6 +58,12 @@ llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",  # change if needed
     temperature=0,
     streaming=True
+)
+
+router_llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0,
+    streaming=False,
 )
 
 
@@ -98,6 +107,9 @@ LTM_SUMMARY_EVERY_N = int(os.getenv("LTM_SUMMARY_EVERY_N", "10"))
 LTM_SUMMARY_KEEP_LAST = int(os.getenv("LTM_SUMMARY_KEEP_LAST", "6"))
 LTM_EMBEDDING_BACKEND = os.getenv("LTM_EMBEDDING_BACKEND", "hash").lower()
 LTM_MAX_ENTRIES = int(os.getenv("LTM_MAX_ENTRIES", "25"))
+
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
+OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 
 rag_retriever_cache = {}
 rag_status_cache = {}
@@ -1548,11 +1560,85 @@ def _needs_external_tools(query: str) -> bool:
     if not q:
         return False
 
+    if _is_simple_question(q):
+        return False
+
     tool_markers = [
         "latest", "today", "current", "news", "headline", "price", "stock",
         "weather", "score", "live", "market", "exchange rate", "time now",
     ]
     return any(marker in q for marker in tool_markers)
+
+
+def _is_simple_question(query: str) -> bool:
+    """Return True for definition/explanation-style questions that the LLM can answer directly."""
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+
+    # Definitions or concept explanations (non-real-time)
+    if re.match(r"^(what is|what's|who is|who's|define|definition of|meaning of|explain)\b", q):
+        return True
+    if "purpose of" in q or "difference between" in q:
+        return True
+
+    return False
+
+
+def _route_tool_with_llm(query: str) -> str:
+    """LLM-based fallback router. Returns: weather|time|news|stock|search|none."""
+    q = (query or "").strip()
+    if not q:
+        return "none"
+
+    if _is_simple_question(q):
+        return "none"
+
+    prompt = (
+        "You are a tool router. Choose the best tool for the user query.\n"
+        "Return ONLY JSON in the form: {\"tool\": \"weather|time|news|stock|search|none\"}.\n"
+        "Guidelines:\n"
+        "- weather: weather, temperature, forecast, AQI, or location-based weather\n"
+        "- time: date/time now or today date\n"
+        "- news: latest news, headlines, trending\n"
+        "- stock: stock price, ticker, market price\n"
+        "- search: current facts not covered above\n"
+        "- none: general knowledge, definitions, or chit-chat"
+    )
+
+    try:
+        result = router_llm.invoke([SystemMessage(content=prompt), HumanMessage(content=q)])
+        raw = str(getattr(result, "content", "") or "").strip()
+        data = json.loads(raw)
+        tool = str(data.get("tool", "none")).strip().lower()
+    except Exception:
+        raw = str(raw) if "raw" in locals() else ""
+        match = re.search(r"tool\s*[:=]\s*\"?(\w+)\"?", raw, re.IGNORECASE)
+        tool = match.group(1).strip().lower() if match else "none"
+
+    allowed = {"weather", "time", "news", "stock", "search", "none"}
+    return tool if tool in allowed else "none"
+
+
+def _llm_needs_tool(query: str) -> bool:
+    """LLM gate to decide if a query needs external tools (real-time or unknown facts)."""
+    q = (query or "").strip()
+    if not q or _is_simple_question(q):
+        return False
+
+    prompt = (
+        "You decide if a query needs external tools.\n"
+        "Return ONLY JSON: {\"needs_tool\": true|false}.\n"
+        "Use tools for real-time info (today, weather, news, stocks, live data) or unknown current facts.\n"
+        "Do NOT use tools for definitions, explanations, or general knowledge."
+    )
+    try:
+        result = router_llm.invoke([SystemMessage(content=prompt), HumanMessage(content=q)])
+        raw = str(getattr(result, "content", "") or "").strip()
+        data = json.loads(raw)
+        return bool(data.get("needs_tool"))
+    except Exception:
+        return _needs_external_tools(q)
 
 
 def _is_news_query(query: str) -> bool:
@@ -1623,6 +1709,20 @@ def _extract_weather_location(query: str) -> str:
     return ""
 
 
+def _parse_weather_payload(raw: str) -> dict:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if "temp_c" not in data:
+        return {}
+    return data
+
+
 def _truncate_text(text: str, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
@@ -1669,7 +1769,7 @@ def _format_sources(urls: list[str], fallback: str = "Internal knowledge") -> st
 
 def _format_search_results(raw_text: str, max_items: int = 5) -> str:
     lines = [l.strip() for l in (raw_text or "").splitlines() if l.strip()]
-    bullets = []
+    entries = []
     sources = []
     for line in lines[:max_items]:
         url_match = re.search(r"\((https?://[^)]+)\)$", line)
@@ -1680,13 +1780,20 @@ def _format_search_results(raw_text: str, max_items: int = 5) -> str:
         parts = [p.strip() for p in line.split(" - ") if p.strip()]
         title = parts[0] if parts else "Result"
         snippet = _truncate_text(" ".join(parts[1:]), 160) if len(parts) > 1 else ""
+        domain = ""
+        if url:
+            parsed = urlparse(url)
+            domain = parsed.netloc or ""
+        summary = f"{title}"
         if snippet:
-            bullets.append(f"- {title}: {snippet}")
-        else:
-            bullets.append(f"- {title}")
-    if not bullets:
-        bullets.append("- No results found.")
-    return "\n".join(bullets) + "\n\n" + _format_sources(sources, fallback="Web search")
+            summary += f" — {snippet}"
+        if domain:
+            summary += f" (Source: {domain})"
+        entries.append(summary)
+    if not entries:
+        entries.append("No results found.")
+    numbered = [f"{idx}) {text}" for idx, text in enumerate(entries, start=1)]
+    return "\n".join(numbered) + "\n\n" + _format_sources(sources, fallback="Web search")
 
 
 
@@ -1838,6 +1945,45 @@ def get_current_date_time() -> str:
 
 
 @tool
+def get_weather(location: str) -> str:
+    """Get current weather for a location using OpenWeather."""
+    if not OPENWEATHER_API_KEY:
+        return "Weather API key not configured."
+    loc = (location or "").strip()
+    if not loc:
+        return "Weather location not provided."
+
+    params = urlencode({"q": loc, "appid": OPENWEATHER_API_KEY, "units": "metric"})
+    url = f"{OPENWEATHER_BASE_URL}?{params}"
+    req = Request(url, headers={"User-Agent": "Chatbot/1.0"})
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError) as err:
+        return f"Weather API error: {err}"
+    except Exception as err:
+        return f"Weather API error: {err}"
+
+    if not isinstance(data, dict) or str(data.get("cod")) not in {"200", "200.0"}:
+        message = data.get("message") if isinstance(data, dict) else "unknown error"
+        return f"Weather not found: {message}"
+
+    weather = (data.get("weather") or [{}])[0]
+    main = data.get("main") or {}
+    wind = data.get("wind") or {}
+
+    payload = {
+        "location": data.get("name") or loc,
+        "description": weather.get("description") or "",
+        "temp_c": main.get("temp"),
+        "feels_like_c": main.get("feels_like"),
+        "humidity": main.get("humidity"),
+        "wind_mps": wind.get("speed"),
+    }
+    return json.dumps(payload)
+
+
+@tool
 def rag_search(question: str) -> str:
     """Search local knowledge base documents for RAG context."""
     thread_id = active_thread_id.get()
@@ -1880,6 +2026,10 @@ def _call_stock_tool(symbol: str) -> str:
 
 def _call_time_tool() -> str:
     return str(get_current_date_time.invoke({}))
+
+
+def _call_weather_tool(location: str) -> str:
+    return str(get_weather.invoke({"location": location}))
 
 
 # ==============================
@@ -2070,6 +2220,26 @@ def chat_node(state: ChatState):
             }
 
     if state.get("pending_weather") and latest_query:
+        raw_weather = _call_weather_tool(latest_query)
+        payload = _parse_weather_payload(raw_weather)
+        if payload:
+            response_text = (
+                "Weather:\n"
+                f"- Location: {payload.get('location', latest_query).strip()}\n"
+                f"- Condition: {payload.get('description', '').strip() or 'Unavailable'}\n"
+                f"- Temperature: {payload.get('temp_c')} C\n"
+                f"- Feels like: {payload.get('feels_like_c')} C\n"
+                f"- Humidity: {payload.get('humidity')}%\n"
+                f"- Wind: {payload.get('wind_mps')} m/s\n\n"
+                f"{_format_sources(['https://openweathermap.org/'], fallback='OpenWeather')}"
+            )
+            return {
+                "messages": [AIMessage(content=response_text)],
+                "allow_tools": False,
+                "pending_weather": False,
+                "last_weather_link": "https://openweathermap.org/",
+            }
+
         weather_answer = _call_search_tool(f"weather in {latest_query}")
         if weather_answer:
             weather_link = _extract_first_url(weather_answer)
@@ -2095,7 +2265,7 @@ def chat_node(state: ChatState):
                 "pending_weather": False,
                 "last_weather_link": weather_link or last_weather_link,
             }
-        # If no weather answer, just return the empty message
+
         return {
             "messages": [
                 AIMessage(
@@ -2128,6 +2298,20 @@ def chat_node(state: ChatState):
     decision_result = _resolve_hitl_decision(state, latest_query, rag_context)
     if decision_result is not None:
         return decision_result
+
+    route_hint = "none"
+    if latest_query:
+        has_rule_match = any(
+            [
+                _is_weather_query(latest_query),
+                _is_time_query(latest_query),
+                _is_news_query(latest_query),
+                _is_stock_query(latest_query),
+            ]
+        )
+        if not has_rule_match and not _is_simple_question(latest_query):
+            if _llm_needs_tool(latest_query):
+                route_hint = _route_tool_with_llm(latest_query)
 
     if _is_self_query(latest_query):
         memory_items = _get_user_memory_items(user_id, latest_query)
@@ -2171,7 +2355,7 @@ def chat_node(state: ChatState):
             }
 
     # Weather query handling - try to extract location first
-    if _is_weather_query(latest_query):
+    if _is_weather_query(latest_query) or route_hint == "weather":
         location = _extract_weather_location(latest_query)
         if not location:
             # No location found, ask user
@@ -2180,8 +2364,27 @@ def chat_node(state: ChatState):
                 "allow_tools": False,
                 "pending_weather": True,
             }
-        # Location found, use search tool
         location = location or latest_query
+        raw_weather = _call_weather_tool(location)
+        payload = _parse_weather_payload(raw_weather)
+        if payload:
+            response_text = (
+                "Weather:\n"
+                f"- Location: {payload.get('location', location).strip()}\n"
+                f"- Condition: {payload.get('description', '').strip() or 'Unavailable'}\n"
+                f"- Temperature: {payload.get('temp_c')} C\n"
+                f"- Feels like: {payload.get('feels_like_c')} C\n"
+                f"- Humidity: {payload.get('humidity')}%\n"
+                f"- Wind: {payload.get('wind_mps')} m/s\n\n"
+                f"{_format_sources(['https://openweathermap.org/'], fallback='OpenWeather')}"
+            )
+            return {
+                "messages": [AIMessage(content=response_text)],
+                "allow_tools": False,
+                "pending_weather": False,
+                "last_weather_link": "https://openweathermap.org/",
+            }
+
         aqi_hint = " AQI" if "aqi" in latest_query.lower() else ""
         raw_weather = _call_search_tool(f"weather{aqi_hint} in {location}")
         weather_link = _extract_first_url(raw_weather)
@@ -2209,18 +2412,18 @@ def chat_node(state: ChatState):
         }
 
     # Date/time query handling
-    if _is_time_query(latest_query):
+    if _is_time_query(latest_query) or route_hint == "time":
         now_text = _call_time_tool()
         response_text = f"Date/Time:\n- {now_text}\n\n" + _format_sources([], fallback="System clock")
         return {"messages": [AIMessage(content=response_text)], "allow_tools": False}
 
     # News/trending query handling
-    if _is_news_query(latest_query):
+    if _is_news_query(latest_query) or route_hint == "news":
         raw_news = _call_search_tool(latest_query)
         response_text = "Top results:\n" + _format_search_results(raw_news)
         return {"messages": [AIMessage(content=response_text)], "allow_tools": False}
 
-    if _is_stock_query(latest_query):
+    if _is_stock_query(latest_query) or route_hint == "stock":
         symbol = _extract_stock_symbol(latest_query)
         if symbol:
             stock_text = _call_stock_tool(symbol)
@@ -2243,7 +2446,7 @@ def chat_node(state: ChatState):
         }
 
     # Generic tool-needed queries: run search directly to avoid tool-calling loops.
-    if _needs_external_tools(latest_query):
+    if _needs_external_tools(latest_query) or route_hint == "search":
         raw = _call_search_tool(latest_query)
         response_text = "Top results:\n" + _format_search_results(raw)
         return {"messages": [AIMessage(content=response_text)], "allow_tools": False}

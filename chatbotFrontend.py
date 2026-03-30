@@ -483,8 +483,8 @@ if user_input or uploaded_files:
                 tool_trace.success(f"Final tools used: {', '.join(sorted(used_tools))}")
             else:
                 q = user_input.lower()
-                if "weather" in q or "aqi" in q:
-                    tool_trace.success("Final tools used: search_tool")
+                if "weather" in q or "aqi" in q or "temperature" in q or "temp" in q:
+                    tool_trace.success("Final tools used: get_weather")
                 elif "stock" in q or "price" in q:
                     tool_trace.success("Final tools used: get_stock_price")
                 elif "news" in q or "headline" in q or "trending" in q or "latest" in q:
