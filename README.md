@@ -31,25 +31,39 @@ A production-style chatbot that blends deterministic tool routing, LLM responses
   - Tool trace
   - RAG controls
 
-## Agent Workflow
+## Agent Workflow (Exact)
 
-The agent follows a deterministic flow with an LLM gate for tool usage:
+The runtime flow matches the current `chat_node` logic:
 
-1) **Input normalization**: extract latest user query and thread context.
-2) **Memory prep**: load STM and LTM (skip memory injection for greetings).
-3) **RAG routing**: if document intent is detected, fetch RAG context.
-4) **Rule-based intent**: detect weather/news/stock/time quickly.
-5) **LLM tool gate**: decide if external data is required.
-6) **LLM router**: select the best tool when rules do not match.
-7) **Tool execution**: call one tool and stop in the same turn.
-8) **Fallbacks**: degrade gracefully if tool fails (weather -> search).
-9) **Response formatting**: structured bullets + Sources.
+1) **Read latest query** and set `thread_id` and `user_id`.
+2) **Greeting short-circuit**: if greeting, respond immediately and skip memory.
+3) **Link recall**: if user asks for the last weather link, return it.
+4) **Pending weather**: if the bot asked for a city, call `get_weather` with the new location.
+  - If OpenWeather succeeds, return structured weather.
+  - If it fails, fallback to `search_tool`.
+5) **Awaiting approval**: if HITL approval is pending, repeat the approval request.
+6) **Mode resolution**: auto -> `agent_only` if no docs, `rag_only` for doc intent, else `hybrid`.
+7) **RAG context**: load RAG context when in `hybrid` or `rag_only`.
+8) **HITL decision handler**: resolve explicit Approve/Regenerate responses.
+9) **Tool routing**:
+  - If no rule match, and not a simple question, the LLM gate decides if a tool is needed.
+  - If needed, the LLM router picks `weather`, `time`, `news`, `stock`, or `search`.
+10) **Self-query**: if user asks about memory, return saved LTM + STM facts.
+11) **Low-confidence RAG**: if RAG context is weak, ask for HITL approval.
+12) **Tool handlers** in order:
+   - Weather -> `get_weather` (fallback to `search_tool`).
+   - Time -> `get_current_date_time`.
+   - News -> `search_tool`.
+   - Stock -> `get_stock_price` (or ask for ticker).
+   - Generic tool-needed -> `search_tool`.
+13) **LLM answer**: if no tool matched, answer using LLM with RAG context (if any) and memory context (if relevant).
+14) **Fallback to tool output**: if LLM returns empty, use last tool output.
 
-### Routing Logic (Simplified)
+### Routing Logic (Exact Summary)
 
-- If weather/news/stock/time is detected -> call the specific tool.
-- Else if LLM says tools are needed -> route to best tool.
-- Else -> answer directly with the LLM.
+- Rules first (weather/time/news/stock), then LLM gate, then LLM router.
+- One tool per turn; the answer is finalized from that tool output.
+- RAG is only used in `hybrid` or `rag_only` modes and is gated by HITL when low confidence.
 
 ## Tools
 
@@ -67,22 +81,27 @@ The agent follows a deterministic flow with an LLM gate for tool usage:
 
 The agent merges STM + LTM as context, but avoids memory injection for greetings.
 
-## Mini Diagram
+## Mini Diagram (Exact)
 
 ```mermaid
 flowchart TD
-  U[User Query] --> N[Normalize + Thread Context]
-  N --> M[STM/LTM Memory Prep]
-  M --> D{Document Intent?}
-  D -->|Yes| RAG[RAG Retrieval]
-  D -->|No| R[Rule-based Intent]
-  R -->|Weather/News/Stock/Time| T[Tool Call]
-  R -->|No match| G[LLM Tool Gate]
-  G -->|No tool| L[LLM Answer]
-  G -->|Tool needed| RT[LLM Router]
-  RT --> T
-  T --> F[Formatted Answer + Sources]
-  RAG --> L
+  U[User Query] --> Greet{Greeting}
+  Greet -->|Yes| Hello[Return greeting]
+  Greet -->|No| Link{Asking for last link}
+  Link -->|Yes| LinkOut[Return last weather link]
+  Link -->|No| Pending{Pending weather}
+  Pending -->|Yes| WeatherPending[Call get_weather and respond]
+  Pending -->|No| Mode[Resolve mode]
+  Mode --> RAG{RAG context needed}
+  RAG -->|Yes| RAGCtx[Fetch RAG context]
+  RAG -->|No| Route[Tool routing]
+  RAGCtx --> Route
+  Route -->|Rules match| Tool[Call tool]
+  Route -->|No match| Gate[LLM tool gate]
+  Gate -->|No tool| LLM[LLM answer]
+  Gate -->|Tool| Router[LLM router]
+  Router --> Tool
+  Tool --> Answer[Formatted answer with sources]
 ```
 
 ## Quick Start
