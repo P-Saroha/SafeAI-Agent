@@ -81,20 +81,27 @@ The runtime flow matches the current `chat_node` logic:
 
 The agent merges STM + LTM as context, but avoids memory injection for greetings.
 
-## Mini Diagram (Simple)
+## Mini Diagram (Exact)
 
 ```mermaid
 flowchart TD
-  U[User Query] --> P[Prechecks and short circuits]
-  P --> M[Mode and RAG context]
-  M --> R[Tool routing]
-  R -->|Rules match| T[Tool call]
-  R -->|No match| G[LLM tool gate]
-  G -->|No tool| L[LLM answer]
-  G -->|Tool| RT[LLM router]
-  RT --> T
-  T --> F[Formatted answer with sources]
-  L --> F
+  U[User Query] --> Greet{Greeting}
+  Greet -->|Yes| Hello[Return greeting]
+  Greet -->|No| Link{Asking for last link}
+  Link -->|Yes| LinkOut[Return last weather link]
+  Link -->|No| Pending{Pending weather}
+  Pending -->|Yes| WeatherPending[Call get_weather and respond]
+  Pending -->|No| Mode[Resolve mode]
+  Mode --> RAG{RAG context needed}
+  RAG -->|Yes| RAGCtx[Fetch RAG context]
+  RAG -->|No| Route[Tool routing]
+  RAGCtx --> Route
+  Route -->|Rules match| Tool[Call tool]
+  Route -->|No match| Gate[LLM tool gate]
+  Gate -->|No tool| LLM[LLM answer]
+  Gate -->|Tool| Router[LLM router]
+  Router --> Tool
+  Tool --> Answer[Formatted answer with sources]
 ```
 
 ## Quick Start
