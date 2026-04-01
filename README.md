@@ -20,8 +20,8 @@ A production-style chatbot that blends deterministic tool routing, LLM responses
 - **Time tool**: local system time
 - **Memory**:
   - Structured long-term memory (Postgres)
-  - Auto-memory for stable facts
-  - Short-term memory for the active chat
+  - Explicit remember support for user requests
+  - Short-term memory summary + last-N messages for active chat
 - **RAG**:
   - Upload docs to `knowledge_base/`
   - Per-thread FAISS index
@@ -61,11 +61,12 @@ The agent follows a deterministic flow with an LLM gate for tool usage:
 
 ## Memory Flow
 
-- **STM (short-term memory)**: recent messages in the active chat
+- **STM (short-term memory)**: summary of older chat + last-N recent messages
 - **LTM (long-term memory)**: Postgres-backed structured user facts
-- **Auto-memory**: stable facts captured automatically
+- **Explicit memory**: always saved when the user asks to remember
 
 The agent merges STM + LTM as context, but avoids memory injection for greetings.
+Self-queries like "about me" also include STM summary and last-N messages alongside LTM facts.
 
 ## Mini Diagram
 
@@ -128,16 +129,19 @@ streamlit run chatbotFrontend.py
 
 ```
 Chatbot/
-  chatbotBackend.py       # Agent logic, tools, memory, RAG
+  chatbotBackend.py       # Agent logic and routing
   chatbotFrontend.py      # Streamlit UI
+  chatbot_memory.py       # LTM + STM memory logic
+  chatbot_rag.py          # RAG retrieval and index helpers
+  chatbot_tools.py        # Tool routing and tool helpers
   knowledge_base/         # Uploaded docs for RAG
   faiss_index/            # Per-thread FAISS indexes
   docker-compose.yml      # Postgres for long-term memory
 ```
 
-## Notes for Recruiters
 
-This project demonstrates:
+
+## This project demonstrates:
 
 - Applied LLM engineering (routing + tool usage + structured outputs)
 - RAG design with local docs and citations

@@ -37,8 +37,6 @@ LTM_DB_URI = os.getenv(
 )
 LTM_TOP_K = int(os.getenv("LTM_TOP_K", "4"))
 LTM_STM_MAX_MESSAGES = int(os.getenv("LTM_STM_MAX_MESSAGES", "12"))
-LTM_SUMMARY_EVERY_N = int(os.getenv("LTM_SUMMARY_EVERY_N", "10"))
-LTM_SUMMARY_KEEP_LAST = int(os.getenv("LTM_SUMMARY_KEEP_LAST", "6"))
 LTM_EMBEDDING_BACKEND = os.getenv("LTM_EMBEDDING_BACKEND", "hash").lower()
 LTM_MAX_ENTRIES = int(os.getenv("LTM_MAX_ENTRIES", "25"))
 
@@ -52,6 +50,7 @@ TASK:
 - Extract ONLY new or updated facts that are explicitly stated.
 - If nothing new is present, set should_write=false and all fields empty.
 - Keep values short, clean, and precise.
+- Capture ALL degrees and ALL institutions mentioned. Use arrays when multiple items exist.
 - Normalize abbreviations like B.E., E.C.E., ML, AI, DL.
 - If the user explicitly asks to remember something, set should_write=true and capture any relevant fields.
 
@@ -61,8 +60,8 @@ Return ONLY valid JSON in this exact format:
     "memory": {
         "name": "",
         "age": "",
-        "education": "",
-        "university": "",
+        "education": [],
+        "university": [],
         "favorite_language": "",
         "favorite_color": "",
         "favorite_laptop": "",
@@ -74,26 +73,6 @@ Return ONLY valid JSON in this exact format:
 }
 """
 
-AUTO_MEMORY_PROMPT = """You decide what user facts are worth remembering.
-
-EXISTING USER MEMORY:
-{user_details_content}
-
-TASK:
-- Read the latest user message.
-- Extract only stable, long-term facts about the user.
-- Ignore casual chatter, one-off opinions, and temporary states.
-- Avoid duplicating facts already present in existing memory.
-
-Return ONLY valid JSON in this exact format:
-{
-    "should_write": true|false,
-    "facts": [
-        "You are 23 years old.",
-        "You completed 12th class in 2022."
-    ]
-}
-"""
 
 SUMMARY_PROMPT = """Summarize the following conversation history into short, factual memory notes.
 Focus on stable facts about the user, preferences, goals, and ongoing work.
@@ -153,91 +132,6 @@ def _memory_namespace(user_id: str) -> tuple:
     return ("user", user_id, "details")
 
 
-def _memory_texts(items: list) -> str:
-    if not items:
-        return "(empty)"
-    lines = []
-    for item in items:
-        value = getattr(item, "value", {}) or {}
-        text = value.get("data", "")
-        if text:
-            cleaned = text
-            if cleaned.lower().startswith("user's name is"):
-                cleaned = re.split(r"\b i \b", cleaned, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-            lines.append(cleaned)
-    return "\n".join(lines) if lines else "(empty)"
-
-
-def _parse_auto_memory_json(raw_text: str) -> dict:
-    try:
-        data = json.loads(raw_text)
-    except Exception:
-        return {"should_write": False, "facts": []}
-
-    facts = data.get("facts") or []
-    if isinstance(facts, str):
-        facts = [facts]
-    facts = [str(f).strip() for f in facts if str(f).strip()]
-    return {"should_write": bool(data.get("should_write")), "facts": facts}
-
-
-def _heuristic_auto_facts(text: str) -> list[str]:
-    if not text:
-        return []
-    clean = re.sub(r"\s+", " ", text.strip())
-    facts = []
-    age_match = re.search(r"\b(?:my age is|i am)\s+(\d{1,2})\s*(?:years? old|yo)?\b", clean, re.IGNORECASE)
-    if age_match:
-        facts.append(f"You are {age_match.group(1)} years old.")
-
-    class_match = re.search(r"\b(?:done|completed|passed|finished)\s+12(?:th)?\s*(?:class)?\s*(?:in)?\s*(\d{4})\b", clean, re.IGNORECASE)
-    if class_match:
-        facts.append(f"You completed 12th class in {class_match.group(1)}.")
-
-    plan_match = re.search(r"\b(?:planning to|plan to|going to)\s+go\s+to\s+([A-Za-z\s'-]{2,60})\b", clean, re.IGNORECASE)
-    if plan_match:
-        destination = plan_match.group(1).strip()
-        facts.append(f"You are planning to go to {destination}.")
-
-    return _dedupe_memory_list(facts)
-
-
-def _filter_auto_facts(facts: list[str], structured: dict) -> list[str]:
-    if not facts:
-        return []
-    skip_terms = []
-    if structured.get("name"):
-        skip_terms.extend(["name is", "your name"])
-    if structured.get("age"):
-        skip_terms.extend(["years old", "age"])
-    if structured.get("education"):
-        skip_terms.extend(["studying", "education", "b.e", "b.s", "b.sc"])
-    if structured.get("university"):
-        skip_terms.append("university")
-    if structured.get("favorite_language"):
-        skip_terms.append("favorite programming language")
-    if structured.get("favorite_color"):
-        skip_terms.append("favorite color")
-    if structured.get("favorite_laptop"):
-        skip_terms.append("favorite laptop")
-    if structured.get("interests"):
-        skip_terms.append("interested in")
-    if structured.get("likes"):
-        skip_terms.append("you like")
-    if structured.get("projects"):
-        skip_terms.append("worked on")
-    if structured.get("travel_plans"):
-        skip_terms.append("plan to go")
-
-    filtered = []
-    for fact in facts:
-        lowered = str(fact).lower()
-        if any(term in lowered for term in skip_terms):
-            continue
-        filtered.append(fact)
-    return _dedupe_memory_list(filtered)
-
-
 def _normalize_list(values: list[str]) -> list[str]:
     seen = set()
     result = []
@@ -253,15 +147,29 @@ def _normalize_list(values: list[str]) -> list[str]:
     return result
 
 
+def _as_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    text = str(value).strip()
+    return [text] if text else []
+
+
 def _structured_memory_summary(memory: dict) -> str:
     if not memory:
         return "(empty)"
 
     parts = []
-    for key in ["name", "age", "education", "university", "favorite_language", "favorite_color", "favorite_laptop"]:
+    for key in ["name", "age", "favorite_language", "favorite_color", "favorite_laptop"]:
         value = str(memory.get(key) or "").strip()
         if value:
             parts.append(f"{key}: {value}")
+
+    for key in ["education", "university"]:
+        values = _normalize_list(_as_list(memory.get(key)))
+        if values:
+            parts.append(f"{key}: {', '.join(values)}")
 
     for key in ["interests", "likes", "projects", "travel_plans"]:
         values = _normalize_interest_list(memory.get(key) or []) if key == "interests" else _normalize_list(memory.get(key) or [])
@@ -297,8 +205,8 @@ def _parse_structured_memory_json(raw_text: str) -> dict:
     parsed = {
         "name": str(memory.get("name", "")).strip(),
         "age": str(memory.get("age", "")).strip(),
-        "education": str(memory.get("education", "")).strip(),
-        "university": str(memory.get("university", "")).strip(),
+        "education": _normalize_list(_as_list(memory.get("education"))),
+        "university": _normalize_list(_as_list(memory.get("university"))),
         "favorite_language": str(memory.get("favorite_language", "")).strip(),
         "favorite_color": str(memory.get("favorite_color", "")).strip(),
         "favorite_laptop": str(memory.get("favorite_laptop", "")).strip(),
@@ -321,8 +229,9 @@ def _structured_memory_to_sentences(memory: dict) -> list[str]:
     sentences = []
     name = _clean_name_value(memory.get("name") or "")
     age = _clean_age_value(memory.get("age") or "")
-    education = _normalize_degree_text(str(memory.get("education") or "").strip()).rstrip(".")
-    university = str(memory.get("university") or "").strip()
+    education_list = [_normalize_degree_text(v).rstrip(".") for v in _as_list(memory.get("education"))]
+    education_list = _normalize_list([v for v in education_list if v])
+    university_list = _normalize_list(_as_list(memory.get("university")))
     favorite_language = _clean_favorite_language(memory.get("favorite_language") or "")
     favorite_color = _clean_favorite_color(memory.get("favorite_color") or "")
     favorite_laptop = _clean_favorite_device(memory.get("favorite_laptop") or "")
@@ -331,10 +240,10 @@ def _structured_memory_to_sentences(memory: dict) -> list[str]:
         sentences.append(f"Your name is {name}.")
     if age:
         sentences.append(f"You are {age} years old.")
-    if education:
-        sentences.append(f"You are studying {education}.")
-    if university:
-        sentences.append(f"You study at {university}.")
+    if education_list:
+        sentences.append(f"You are studying {'; '.join(education_list)}.")
+    if university_list:
+        sentences.append(f"You study at {'; '.join(university_list)}.")
     if favorite_language:
         sentences.append(f"Your favorite programming language is {favorite_language}.")
     if favorite_color:
@@ -374,11 +283,16 @@ def _structured_memory_from_items(items: list) -> dict:
                 raw_list = _split_list_terms(raw_list)
             memory[field] = _normalize_list(raw_list)
         else:
-            memory[field] = str(value.get("data", "")).strip()
+            data_value = value.get("data", "")
+            if field in {"education", "university"}:
+                memory[field] = _normalize_list(_as_list(data_value))
+            else:
+                memory[field] = str(data_value).strip()
 
     memory["name"] = _clean_name_value(memory.get("name", ""))
     memory["age"] = _clean_age_value(memory.get("age", ""))
-    memory["education"] = _normalize_degree_text(memory.get("education", "")).rstrip(".")
+    education_list = [_normalize_degree_text(v).rstrip(".") for v in _as_list(memory.get("education"))]
+    memory["education"] = _normalize_list([v for v in education_list if v])
     memory["favorite_language"] = _clean_favorite_language(memory.get("favorite_language", ""))
     memory["favorite_color"] = _clean_favorite_color(memory.get("favorite_color", ""))
     memory["favorite_laptop"] = _clean_favorite_device(memory.get("favorite_laptop", ""))
@@ -389,13 +303,27 @@ def _structured_memory_from_items(items: list) -> dict:
 def _merge_structured_memory(base: dict, incoming: dict) -> dict:
     result = dict(base or {})
     for key in ["name", "age", "education", "university", "favorite_language", "favorite_color", "favorite_laptop"]:
-        value = str(incoming.get(key) or "").strip()
+        value = incoming.get(key)
         if key == "name":
             value = _clean_name_value(value)
         if key == "age":
             value = _clean_age_value(value)
         if key == "education":
-            value = _normalize_degree_text(value).rstrip(".")
+            incoming_list = _normalize_list(
+                [_normalize_degree_text(v).rstrip(".") for v in _as_list(value)]
+            )
+            existing_list = _normalize_list(_as_list(result.get("education")))
+            merged_list = _normalize_list(existing_list + incoming_list)
+            if merged_list:
+                result["education"] = merged_list
+            continue
+        if key == "university":
+            incoming_list = _normalize_list(_as_list(value))
+            existing_list = _normalize_list(_as_list(result.get("university")))
+            merged_list = _normalize_list(existing_list + incoming_list)
+            if merged_list:
+                result["university"] = merged_list
+            continue
         if key == "favorite_language":
             value = _clean_favorite_language(value)
         if key == "favorite_color":
@@ -403,6 +331,7 @@ def _merge_structured_memory(base: dict, incoming: dict) -> dict:
         if key == "favorite_laptop":
             value = _clean_favorite_device(value)
         existing = str(result.get(key, "") or "").strip()
+        value = str(value or "").strip()
         if value and value.lower() != existing.lower():
             result[key] = value
 
@@ -445,19 +374,55 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
 
         timestamp = datetime.utcnow().isoformat()
         for key in ["name", "age", "education", "university", "favorite_language", "favorite_color", "favorite_laptop"]:
-            value = str(memory.get(key) or "").strip()
+            raw_value = memory.get(key)
             if key == "name":
-                value = _clean_name_value(value)
+                value = _clean_name_value(raw_value)
             if key == "age":
-                value = _clean_age_value(value)
+                value = _clean_age_value(raw_value)
             if key == "education":
-                value = _normalize_degree_text(value).rstrip(".")
+                values = _normalize_list(
+                    [_normalize_degree_text(v).rstrip(".") for v in _as_list(raw_value)]
+                )
+                if values:
+                    sentence = f"You are studying {'; '.join(values)}."
+                    store.put(
+                        ns,
+                        "structured:education",
+                        {
+                            "data": values,
+                            "list": values,
+                            "sentence": sentence,
+                            "embedding": _embed_text(sentence),
+                            "kind": "structured",
+                            "field": "education",
+                            "ts": timestamp,
+                        },
+                    )
+                continue
+            if key == "university":
+                values = _normalize_list(_as_list(raw_value))
+                if values:
+                    sentence = f"You study at {'; '.join(values)}."
+                    store.put(
+                        ns,
+                        "structured:university",
+                        {
+                            "data": values,
+                            "list": values,
+                            "sentence": sentence,
+                            "embedding": _embed_text(sentence),
+                            "kind": "structured",
+                            "field": "university",
+                            "ts": timestamp,
+                        },
+                    )
+                continue
             if key == "favorite_language":
-                value = _clean_favorite_language(value)
+                value = _clean_favorite_language(raw_value)
             if key == "favorite_color":
-                value = _clean_favorite_color(value)
+                value = _clean_favorite_color(raw_value)
             if key == "favorite_laptop":
-                value = _clean_favorite_device(value)
+                value = _clean_favorite_device(raw_value)
             if not value:
                 continue
             sentence = _structured_memory_to_sentences({key: value})[0]
@@ -522,28 +487,6 @@ def _store_explicit_memory(user_id: str, text: str) -> None:
                 "ts": datetime.utcnow().isoformat(),
             },
         )
-
-
-def _store_auto_memory(user_id: str, facts: list[str]) -> None:
-    if not _ensure_memory_store():
-        return
-    if not facts:
-        return
-    ns = _memory_namespace(_safe_thread_id(user_id))
-    with _open_memory_store() as store:
-        if store is None:
-            return
-        for fact in _dedupe_memory_list(facts):
-            store.put(
-                ns,
-                str(uuid.uuid4()),
-                {
-                    "data": fact,
-                    "embedding": _embed_text(fact),
-                    "kind": "auto",
-                    "ts": datetime.utcnow().isoformat(),
-                },
-            )
 
 
 def _search_memory_texts(texts: list[str], query: str, k: int) -> list[str]:
@@ -612,6 +555,9 @@ def _normalize_degree_text(text: str) -> str:
     value = text
     value = re.sub(r"\b(studying|doing)\s+B\.\b", r"\1 B.E.", value, flags=re.IGNORECASE)
     value = re.sub(r"\bB\.E\.E\b", "B.E.", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bB\.?S\.?\b", "B.S.", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bB\.?Sc\.?\b", "B.Sc.", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip()
     return value
 
 
@@ -799,26 +745,6 @@ def _prune_memory(user_id: str) -> None:
                 store.delete(ns, key)
 
 
-def _parse_memory_json(raw_text: str) -> dict:
-    try:
-        data = json.loads(raw_text)
-    except Exception:
-        return {"should_write": False, "memories": []}
-
-    should_write = bool(data.get("should_write"))
-    memories = data.get("memories") or []
-    parsed = []
-    for mem in memories:
-        if not isinstance(mem, dict):
-            continue
-        text = str(mem.get("text", "")).strip()
-        is_new = bool(mem.get("is_new"))
-        if text:
-            parsed.append({"text": text, "is_new": is_new})
-
-    return {"should_write": should_write, "memories": parsed}
-
-
 def _embed_text(text: str) -> list[float]:
     try:
         return memory_embeddings.embed_query(text)
@@ -835,62 +761,6 @@ def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
     if denom == 0:
         return 0.0
     return float(np.dot(a, b) / denom)
-
-
-def _search_memory(items: list, query: str, k: int) -> list[str]:
-    if not items:
-        return []
-    query_vec = _embed_text(query)
-    scored = []
-    for item in items:
-        value = getattr(item, "value", {}) or {}
-        text = value.get("data", "")
-        emb = value.get("embedding", [])
-        score = _cosine_similarity(query_vec, emb) if query_vec and emb else 0.0
-        scored.append((score, text))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [text for _, text in scored[:k] if text]
-
-
-def _maybe_store_summary(messages: list[BaseMessage], user_id: str) -> None:
-    if not _ensure_memory_store():
-        return
-    if len(messages) < LTM_SUMMARY_EVERY_N:
-        return
-
-    if len(messages) % LTM_SUMMARY_EVERY_N != 0:
-        return
-
-    history_messages = messages[:-LTM_SUMMARY_KEEP_LAST]
-    if not history_messages:
-        return
-
-    history_text = "\n".join(
-        f"{msg.type}: {msg.content}" for msg in history_messages if getattr(msg, "content", None)
-    )
-    if not history_text:
-        return
-
-    summary_text = memory_llm.invoke(
-        [SystemMessage(content=SUMMARY_PROMPT.format(history=history_text))]
-    ).content.strip()
-
-    if summary_text:
-        ns = _memory_namespace(user_id)
-        with _open_memory_store() as store:
-            if store is None:
-                return
-            store.put(
-                ns,
-                str(uuid.uuid4()),
-                {
-                    "data": summary_text,
-                    "embedding": _embed_text(summary_text),
-                    "kind": "summary",
-                    "ts": datetime.utcnow().isoformat(),
-                },
-            )
 
 
 def _latest_user_query(messages: list[BaseMessage]) -> str:
@@ -971,245 +841,43 @@ def _normalize_interest_list(values: list[str]) -> list[str]:
     return _normalize_list(cleaned)
 
 
-def _heuristic_structured_memory(text: str) -> dict:
-    if not text:
-        return {}
-
-    clean = re.sub(r"\s+", " ", text.strip())
-    memory = {
-        "name": "",
-        "age": "",
-        "education": "",
-        "university": "",
-        "favorite_language": "",
-        "favorite_color": "",
-        "favorite_laptop": "",
-        "interests": [],
-        "likes": [],
-        "projects": [],
-        "travel_plans": [],
-    }
-
-    name_match = re.search(
-        r"\bmy name is\s+([A-Za-z][A-Za-z\s'-]{1,40})(?=\b(?:i am|i'm|i do|i like|my|from|at|favorite|interest|interested)\b|[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if name_match:
-        memory["name"] = name_match.group(1).strip()
-
-    uni_match = re.search(r"\b(?:from|at)\s+([A-Za-z][A-Za-z\s'-]{2,60}university)\b", clean, re.IGNORECASE)
-    if uni_match:
-        memory["university"] = uni_match.group(1).strip()
-
-    degree_match = re.search(
-        r"\b(?:doing|studying|pursuing)\s+([A-Za-z\.\s]{2,40}?)(?=\b(?:in|from|at)\b|[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if degree_match:
-        memory["education"] = _normalize_degree_text(degree_match.group(1).strip())
-
-    fav_lang_match = re.search(
-        r"\bfavorite programming language is\s+([A-Za-z#+-]+)(?=\s|[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if fav_lang_match:
-        memory["favorite_language"] = fav_lang_match.group(1).strip()
-
-    fav_color_match = re.search(
-        r"\bfavorite color is\s+([A-Za-z\s-]{2,30})(?=[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if fav_color_match:
-        memory["favorite_color"] = _clean_favorite_color(fav_color_match.group(1).strip())
-
-    age_match = re.search(
-        r"\b(?:my age is|i am)\s+(\d{1,2})\s*(?:years? old|yo)?\b",
-        clean,
-        re.IGNORECASE,
-    )
-    if age_match:
-        memory["age"] = age_match.group(1).strip()
-
-    fav_laptop_match = re.search(
-        r"\bfavorite laptop is\s+([A-Za-z0-9][A-Za-z0-9\s+-]{1,60})(?=[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if fav_laptop_match:
-        memory["favorite_laptop"] = _clean_favorite_device(fav_laptop_match.group(1).strip())
-
-    interest_match = re.search(
-        r"\b(?:my\s+interest\s+is|interests?\s+are|interested\s+in)\s+([A-Za-z\s,&/+-]{2,120}?)(?=\b(?:i like|i do|i am|and i|my|from|at)\b|[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if interest_match:
-        interest_text = interest_match.group(1).replace("leaning", "learning")
-        interests = _split_list_terms(interest_text)
-        memory["interests"].extend(_normalize_interest_list(interests))
-
-    likes_match = re.findall(r"\bi (?:really )?like\s+([A-Za-z\s,&/+-]{2,120}?)(?=\b(?:i do|i am|my|and i|from|at)\b|[\.,]|$)", clean, re.IGNORECASE)
-    for like in likes_match:
-        memory["likes"].extend(_split_list_terms(like))
-
-    if re.search(r"\blearning\b", clean, re.IGNORECASE) and re.search(r"\bai agent", clean, re.IGNORECASE):
-        memory["likes"].append("learning to build AI agents")
-
-    if re.search(r"\bbuilding\b", clean, re.IGNORECASE) and re.search(r"\bai agent", clean, re.IGNORECASE):
-        memory["likes"].append("building AI agents")
-
-    project_match = re.search(r"\b(done|built|created)\s+([A-Za-z\s-]{2,60}project)", clean, re.IGNORECASE)
-    if project_match:
-        memory["projects"].append(project_match.group(2).strip())
-
-    plan_match = re.search(
-        r"\b(?:planning to|plan to|going to)\s+go\s+to\s+([A-Za-z\s'-]{2,60})\b",
-        clean,
-        re.IGNORECASE,
-    )
-    if plan_match:
-        memory["travel_plans"].append(plan_match.group(1).strip())
-
-    memory["interests"] = _normalize_interest_list(memory["interests"])
-    memory["likes"] = _normalize_list(memory["likes"])
-    memory["projects"] = _normalize_list(memory["projects"])
-    memory["travel_plans"] = _normalize_list(memory["travel_plans"])
-
-    return memory
-
-
-def _heuristic_memories(text: str) -> list[str]:
-    if not text:
-        return []
-    items = []
-    clean = re.sub(r"\s+", " ", text.replace(";", ".")).strip()
-
-    clauses = re.split(r"[\.!?]+", clean)
-    extra = re.split(r"\b(?:and i|also)\b", clean, flags=re.IGNORECASE)
-    parts = [c.strip() for c in clauses + extra if c.strip()]
-
-    name_match = re.search(
-        r"\bmy name is\s+([A-Za-z][A-Za-z\s'-]{1,40})(?=\b(?:i am|i'm|i do|i like|my|from|at|favorite|interest|interested)\b|[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if name_match:
-        items.append(f"User's name is {name_match.group(1).strip()}.")
-
-    uni_match = re.search(r"\b(?:from|at)\s+([A-Za-z][A-Za-z\s'-]{2,60}university)\b", clean, re.IGNORECASE)
-    if uni_match:
-        items.append(f"User studies at {uni_match.group(1).strip()}.")
-
-    degree_match = re.search(
-        r"\b(?:doing|studying|pursuing)\s+([A-Za-z\.\s]{2,40}?)(?=\b(?:in|from|at)\b|[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if degree_match:
-        items.append(f"User is studying {degree_match.group(1).strip()}.")
-
-    for part in parts:
-        interest_match = re.search(
-            r"\b(?:my\s+interest\s+is|interests?\s+are|interested\s+in)\s+([A-Za-z\s,&/+-]{2,120})",
-            part,
-            re.IGNORECASE,
-        )
-        if interest_match:
-            items.append(f"User is interested in {interest_match.group(1).strip()}.")
-
-    fav_lang_match = re.search(
-        r"\bfavorite programming language is\s+([A-Za-z#+-]+)(?=\s|[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if fav_lang_match:
-        items.append(f"User's favorite programming language is {fav_lang_match.group(1).strip()}.")
-
-    fav_laptop_match = re.search(
-        r"\bfavorite laptop is\s+([A-Za-z0-9][A-Za-z0-9\s+-]{1,60})(?=[\.,]|$)",
-        clean,
-        re.IGNORECASE,
-    )
-    if fav_laptop_match:
-        items.append(f"User's favorite laptop is {_clean_favorite_device(fav_laptop_match.group(1).strip())}.")
-
-    fav_color_match = re.search(r"\bfavorite color is\s+([A-Za-z\s-]{2,30})(?=[\.,]|$)", clean, re.IGNORECASE)
-    if fav_color_match:
-        items.append(f"User's favorite color is {fav_color_match.group(1).strip()}.")
-
-    likes_match = re.findall(r"\bi (?:really )?like\s+([A-Za-z\s,&/+-]{2,120}?)(?=\b(?:i do|i am|my|and i|from|at)\b|[\.,]|$)", clean, re.IGNORECASE)
-    for like in likes_match:
-        items.append(f"User likes {str(like).strip()}.")
-
-    hobbies_match = re.findall(r"\bi do\s+([A-Za-z\s,&/+-]{2,120}?)(?=\b(?:i like|i am|my|and i|from|at)\b|[\.,]|$)", clean, re.IGNORECASE)
-    for hobby in hobbies_match:
-        items.append(f"User does {hobby.strip()}.")
-
-    for part in parts:
-        if re.search(r"\blearning\b", part, re.IGNORECASE) and re.search(r"\bai agent", part, re.IGNORECASE):
-            items.append("User is learning to build AI agents.")
-        if re.search(r"\bbuilding\b", part, re.IGNORECASE) and re.search(r"\bai agent", part, re.IGNORECASE):
-            items.append("User likes building AI agents.")
-        project_match = re.search(r"\b(done|built|created)\s+([A-Za-z\s-]{2,60}project)", part, re.IGNORECASE)
-        if project_match:
-            items.append(f"User completed a {project_match.group(2).strip()}.")
-
-    plan_match = re.search(r"\b(?:plan(?:ning)? to|going to|travel(?:ing)? to|trip to)\s+([A-Za-z\s'-]{2,60})", clean, re.IGNORECASE)
-    if plan_match:
-        items.append(f"User plans to go to {plan_match.group(1).strip()}.")
-
-    age_match = re.search(r"\b(\d{1,2})\s*(?:years? old|yo)\b", clean, re.IGNORECASE)
-    if age_match:
-        items.append(f"User is {age_match.group(1)} years old.")
-
-    return _dedupe_memory_list(items)
-
-
-def _clean_memory_text(text: str) -> str:
-    value = re.sub(r"\s+", " ", str(text).strip())
-    value = re.sub(r"\s*(,|\.)\s*", r"\1 ", value).strip()
-
-    if value.lower().startswith("user's name is"):
-        value = re.split(r"\b(i am|i'm|doing|studying|from|at|favorite|interest|interested)\b", value, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-        if not value.endswith("."):
-            value += "."
-
-    if "favorite programming language" in value.lower():
-        value = re.split(r"\b(my interest|interest|interested|i like|and i)\b", value, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-        if not value.endswith("."):
-            value += "."
-
-    if "interested in" in value.lower():
-        value = re.split(r"\b(i like|and i|i do)\b", value, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-        if not value.endswith("."):
-            value += "."
-
-    return value
-
-
 def _extract_stm_facts(messages: list[BaseMessage], exclude_latest: bool = True) -> list[str]:
     if not messages:
         return []
-    human_texts = []
-    for msg in messages:
-        if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
-            human_texts.append(msg.content)
+
+    human_texts = [
+        msg.content
+        for msg in messages
+        if isinstance(msg, HumanMessage) and isinstance(msg.content, str)
+    ]
 
     if exclude_latest and human_texts:
         human_texts = human_texts[:-1]
 
-    combined = " ".join(human_texts).strip()
-    if not combined:
+    if not human_texts:
         return []
 
-    stm_structured = _heuristic_structured_memory(combined)
-    stm_facts = _structured_memory_to_sentences(stm_structured)
-    stm_facts.extend(_heuristic_auto_facts(combined))
-    return _dedupe_memory_list([f for f in stm_facts if f])
+    if len(human_texts) <= LTM_STM_MAX_MESSAGES:
+        return _dedupe_memory_list([text.strip() for text in human_texts if text.strip()])
+
+    older = human_texts[:-LTM_STM_MAX_MESSAGES]
+    recent = human_texts[-LTM_STM_MAX_MESSAGES:]
+
+    summary_text = ""
+    if older:
+        history = "\n".join(older)
+        try:
+            summary_text = memory_llm.invoke(
+                [SystemMessage(content=SUMMARY_PROMPT.format(history=history))]
+            ).content.strip()
+        except Exception:
+            summary_text = ""
+
+    stm_items = [text.strip() for text in recent if text.strip()]
+    if summary_text:
+        stm_items.insert(0, f"Summary of earlier chat: {summary_text}")
+
+    return _dedupe_memory_list(stm_items)
 
 
 def _get_user_memory_items(user_id: str, query: str) -> list[str]:
@@ -1231,7 +899,6 @@ def _get_user_memory_items(user_id: str, query: str) -> list[str]:
 
     structured = _structured_memory_from_items(items)
     structured_texts = _structured_memory_to_sentences(structured)
-    auto_texts = []
     unstructured_texts = []
     for item in items:
         value = getattr(item, "value", {}) or {}
@@ -1239,27 +906,21 @@ def _get_user_memory_items(user_id: str, query: str) -> list[str]:
         data = value.get("data")
         if not data:
             continue
-        if kind == "auto":
-            auto_texts.append(str(data))
-        elif kind not in {"structured", "summary"}:
+        if kind not in {"structured", "summary"}:
             unstructured_texts.append(str(data))
 
-    auto_texts = _dedupe_memory_list([t for t in auto_texts if t])
     unstructured_texts = _dedupe_memory_list([t for t in unstructured_texts if t])
 
     if _is_self_query(query):
         about_me = "about myself" in query.lower() or "about me" in query.lower()
         if structured_texts:
             if about_me:
-                combined = structured_texts + _filter_auto_facts(auto_texts, structured)
-                return _dedupe_memory_list(combined)
+                return _dedupe_memory_list(structured_texts)
             filtered = [item for item in structured_texts if _memory_matches_query(item, query)]
-            filtered_auto = [item for item in auto_texts if _memory_matches_query(item, query)]
-            combined = filtered + filtered_auto
-            return _dedupe_memory_list(combined or structured_texts)
-        return _dedupe_memory_list(auto_texts)
+            return _dedupe_memory_list(filtered or structured_texts)
+        return []
 
-    candidates = structured_texts + auto_texts + unstructured_texts
+    candidates = structured_texts + unstructured_texts
     if not candidates:
         return []
     if query:
@@ -1290,7 +951,7 @@ def remember_node(state: dict):
     explicit_text = ""
     explicit_requested = _is_explicit_remember(last_text)
     if explicit_requested:
-        explicit_text = _extract_explicit_remember_text(last_text)
+        explicit_text = _extract_explicit_remember_text(last_text) or last_text
 
     with _open_memory_store() as store:
         if store is None:
@@ -1316,28 +977,9 @@ def remember_node(state: dict):
         print(f"LTM extract warning: {err}")
         parsed = {"should_write": False, "memory": {}}
 
-    auto_facts = []
-    try:
-        raw_auto = memory_llm.invoke(
-            [
-                SystemMessage(content=AUTO_MEMORY_PROMPT.format(user_details_content=structured_summary)),
-                HumanMessage(content=last_text),
-            ]
-        ).content
-        parsed_auto = _parse_auto_memory_json(raw_auto)
-        if parsed_auto.get("should_write"):
-            auto_facts.extend(parsed_auto.get("facts") or [])
-    except Exception as err:
-        print(f"Auto memory warning: {err}")
-
-    heuristics = _heuristic_structured_memory(last_text)
     should_write = bool(parsed.get("should_write")) or explicit_requested
     incoming = parsed.get("memory", {}) if should_write else {}
     merged = _merge_structured_memory(existing_structured, incoming)
-    merged = _merge_structured_memory(merged, heuristics)
-
-    auto_facts.extend(_heuristic_auto_facts(last_text))
-    auto_facts = _filter_auto_facts(auto_facts, merged)
 
     if merged and merged != existing_structured:
         _store_structured_memory(user_id, merged)
@@ -1347,11 +989,6 @@ def remember_node(state: dict):
         _store_explicit_memory(user_id, explicit_text)
         _prune_memory(user_id)
 
-    if auto_facts:
-        _store_auto_memory(user_id, auto_facts)
-        _prune_memory(user_id)
-
-    _maybe_store_summary(state.get("messages", []), user_id)
     _prune_memory(user_id)
     return {"messages": [], "tools_called_in_turn": tools_count}
 
