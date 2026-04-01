@@ -179,10 +179,26 @@ def _structured_memory_summary(memory: dict) -> str:
     return "\n".join(parts) if parts else "(empty)"
 
 
-def _parse_structured_memory_json(raw_text: str) -> dict:
+def _try_load_json(text: str) -> dict | None:
+    if not text:
+        return None
     try:
-        data = json.loads(raw_text)
+        return json.loads(text)
     except Exception:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return None
+
+
+def _parse_structured_memory_json(raw_text: str) -> dict:
+    data = _try_load_json(raw_text)
+    if not isinstance(data, dict):
         return {"should_write": False, "memory": {}}
 
     memory = data.get("memory") or {}
@@ -220,6 +236,95 @@ def _parse_structured_memory_json(raw_text: str) -> dict:
         "should_write": bool(data.get("should_write")),
         "memory": parsed,
     }
+
+
+def _memory_has_facts(memory: dict) -> bool:
+    if not memory:
+        return False
+    for value in memory.values():
+        if isinstance(value, list) and value:
+            return True
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _clean_institution_value(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.split(
+        r"\b(and|also|i am|i'm|im|doing|studying|my|interest)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,;")
+    return cleaned
+
+
+def _fallback_extract_from_text(text: str) -> dict:
+    result = {
+        "name": "",
+        "age": "",
+        "education": [],
+        "university": [],
+        "favorite_language": "",
+        "favorite_color": "",
+        "favorite_laptop": "",
+        "interests": [],
+        "likes": [],
+        "projects": [],
+        "travel_plans": [],
+    }
+    if not text:
+        return result
+
+    name_match = re.search(r"\bmy name is\s+([A-Za-z][A-Za-z\s'\-]{1,60})", text, re.IGNORECASE)
+    if not name_match:
+        name_match = re.search(r"\bi'm\s+([A-Za-z][A-Za-z\s'\-]{1,60})", text, re.IGNORECASE)
+    if name_match:
+        result["name"] = _clean_name_value(name_match.group(1))
+
+    interest_match = re.search(r"\bmy interest is\s+([^\.;,]+)", text, re.IGNORECASE)
+    if not interest_match:
+        interest_match = re.search(r"\bi am interested in\s+([^\.;,]+)", text, re.IGNORECASE)
+    if interest_match:
+        result["interests"] = _normalize_interest_list([interest_match.group(1).strip()])
+
+    edu_matches = re.findall(
+        r"\b(B\.?E\.?|B\.?S\.?|B\.?Sc\.?)\b\s*(?:in\s+([A-Za-z0-9&.\s]+?))?(?=\bfrom\b|\band\b|\bmy\b|,|;|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    education = []
+    for degree, field in edu_matches:
+        degree_text = _normalize_degree_text(degree)
+        field_text = re.sub(r"\.{2,}", ".", str(field or ""))
+        field_text = re.sub(r"\s+", " ", field_text.strip(" ."))
+        entry = f"{degree_text} in {field_text}".strip() if field_text else degree_text
+        if entry:
+            education.append(entry)
+    result["education"] = _normalize_list(education)
+
+    uni_matches = re.findall(r"\bfrom\s+([A-Za-z][A-Za-z\s.&'\-]{2,60})", text, re.IGNORECASE)
+    uni_matches += re.findall(r"\bat\s+([A-Za-z][A-Za-z\s.&'\-]{2,60})", text, re.IGNORECASE)
+    universities = []
+    for item in uni_matches:
+        cleaned = _clean_institution_value(item)
+        if cleaned:
+            universities.append(cleaned)
+    result["university"] = _normalize_list(universities)
+
+    project_match = re.search(r"\bproject\s*(?:is|was|:)?\s*([^\.;,]+)", text, re.IGNORECASE)
+    if not project_match:
+        project_match = re.search(r"\bbuilt\s+(?:an|a)?\s*([^\.;,]+)", text, re.IGNORECASE)
+    if project_match:
+        project_text = project_match.group(1).strip()
+        project_text = re.sub(r"\bremember\s+(this|it)\b", "", project_text, flags=re.IGNORECASE).strip(" .,:;")
+        if project_text:
+            result["projects"] = _normalize_list([project_text])
+
+    return result
 
 
 def _structured_memory_to_sentences(memory: dict) -> list[str]:
@@ -557,6 +662,7 @@ def _normalize_degree_text(text: str) -> str:
     value = re.sub(r"\bB\.E\.E\b", "B.E.", value, flags=re.IGNORECASE)
     value = re.sub(r"\bB\.?S\.?\b", "B.S.", value, flags=re.IGNORECASE)
     value = re.sub(r"\bB\.?Sc\.?\b", "B.Sc.", value, flags=re.IGNORECASE)
+    value = re.sub(r"\.{2,}", ".", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
 
@@ -581,8 +687,9 @@ def _clean_name_value(value: str) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
+    text = re.sub(r"\.{2,}", ".", text).strip(" .")
     text = re.split(
-        r"\b(i am|i'm|im|doing|studying|from|my|and)\b",
+        r"\b(i am|i'm|im|doing|studying|from|my|and|also)\b",
         text,
         maxsplit=1,
         flags=re.IGNORECASE,
@@ -631,7 +738,9 @@ def _extract_explicit_remember_text(text: str) -> str:
     for pattern in patterns:
         match = re.match(pattern, cleaned, re.IGNORECASE)
         if match:
-            return match.group(1).strip()
+            value = match.group(1).strip()
+            value = re.sub(r"\bremember\s+(this|it)\b", "", value, flags=re.IGNORECASE).strip(" .,:;")
+            return value
     return ""
 
 
@@ -639,6 +748,7 @@ def _format_memory_item(text: str, name: str) -> str:
     value = _normalize_degree_text(str(text).strip())
     value = re.sub(r"\bgo to go\b", "go to", value, flags=re.IGNORECASE)
     value = value.replace("B.E..", "B.E.")
+    value = re.sub(r"\.{2,}", ".", value)
 
     if value.lower().startswith("your name is") or value.lower().startswith("user's name is"):
         raw_name = re.sub(r"^your name is\s+|^user's name is\s+", "", value, flags=re.IGNORECASE).strip()
@@ -913,12 +1023,12 @@ def _get_user_memory_items(user_id: str, query: str) -> list[str]:
 
     if _is_self_query(query):
         about_me = "about myself" in query.lower() or "about me" in query.lower()
-        if structured_texts:
-            if about_me:
-                return _dedupe_memory_list(structured_texts)
-            filtered = [item for item in structured_texts if _memory_matches_query(item, query)]
-            return _dedupe_memory_list(filtered or structured_texts)
-        return []
+        if not structured_texts:
+            return []
+        if about_me:
+            return _dedupe_memory_list(structured_texts)
+        filtered = [item for item in structured_texts if _memory_matches_query(item, query)]
+        return _dedupe_memory_list(filtered or structured_texts)
 
     candidates = structured_texts + unstructured_texts
     if not candidates:
@@ -977,16 +1087,30 @@ def remember_node(state: dict):
         print(f"LTM extract warning: {err}")
         parsed = {"should_write": False, "memory": {}}
 
-    should_write = bool(parsed.get("should_write")) or explicit_requested
+    if explicit_requested and not parsed.get("memory") and explicit_text:
+        try:
+            explicit_raw = memory_llm.invoke(
+                [
+                    SystemMessage(content=STRUCTURED_MEMORY_PROMPT.format(user_details_content=structured_summary)),
+                    HumanMessage(content=explicit_text),
+                ]
+            ).content
+            parsed = _parse_structured_memory_json(explicit_raw)
+        except Exception as err:
+            print(f"LTM explicit extract warning: {err}")
+
+    fallback = _fallback_extract_from_text(explicit_text or last_text)
+    if _memory_has_facts(fallback):
+        merged_fallback = _merge_structured_memory(parsed.get("memory", {}), fallback)
+        parsed = {"should_write": True, "memory": merged_fallback}
+
+    has_facts = _memory_has_facts(parsed.get("memory", {}))
+    should_write = bool(parsed.get("should_write")) or explicit_requested or has_facts
     incoming = parsed.get("memory", {}) if should_write else {}
     merged = _merge_structured_memory(existing_structured, incoming)
 
     if merged and merged != existing_structured:
         _store_structured_memory(user_id, merged)
-        _prune_memory(user_id)
-
-    if explicit_requested and explicit_text:
-        _store_explicit_memory(user_id, explicit_text)
         _prune_memory(user_id)
 
     _prune_memory(user_id)

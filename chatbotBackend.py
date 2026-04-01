@@ -280,13 +280,21 @@ def chat_node(state: ChatState):
     if _is_self_query(latest_query):
         memory_items = _get_user_memory_items(user_id, latest_query)
         stm_items = _extract_stm_facts(state.get("messages", []), exclude_latest=True)
-        combined_items = memory_items + stm_items
+        stm_summary = ""
+        for item in stm_items:
+            if item.lower().startswith("summary of earlier chat:"):
+                stm_summary = item
+                break
+
+        combined_items = memory_items + ([stm_summary] if stm_summary else [])
         if combined_items:
             greeting = "Sure, "
             seen = set()
             lines = []
             for item in combined_items:
                 formatted = _format_memory_item(item, "")
+                if not formatted.lower().startswith(("you ", "your ")):
+                    continue
                 key = _memory_display_key(formatted, "")
                 if not key or key in seen:
                     continue
