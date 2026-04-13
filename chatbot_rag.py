@@ -36,24 +36,29 @@ active_thread_id = ContextVar("active_thread_id", default="default")
 
 
 def _safe_thread_id(thread_id: str) -> str:
+    # Normalize thread IDs for safe filesystem and index usage.
     value = str(thread_id or "default").strip()
     value = re.sub(r"[^A-Za-z0-9._-]", "_", value)
     return value or "default"
 
 
 def get_thread_rag_docs_dir(thread_id: str) -> Path:
+    # Return the per-thread document upload directory.
     return RAG_DOCS_ROOT / _safe_thread_id(thread_id)
 
 
 def get_thread_rag_index_dir(thread_id: str) -> Path:
+    # Return the per-thread FAISS index directory.
     return RAG_INDEX_ROOT / _safe_thread_id(thread_id)
 
 
 def _get_rag_status(thread_id: str) -> str:
+    # Read the cached RAG status message for a thread.
     return rag_status_cache.get(_safe_thread_id(thread_id), "RAG not initialized")
 
 
 def _set_rag_status(thread_id: str, status: str) -> None:
+    # Update the cached RAG status message for a thread.
     rag_status_cache[_safe_thread_id(thread_id)] = status
 
 
@@ -64,10 +69,12 @@ class HashEmbeddings(Embeddings):
         self.dim = dim
 
     def _hash_token(self, token: str) -> int:
+        # Hash a token into a fixed embedding dimension.
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
         return int(digest, 16) % self.dim
 
     def _embed(self, text: str) -> list[float]:
+        # Build a simple bag-of-words embedding using token hashes.
         vec = np.zeros(self.dim, dtype=np.float32)
         tokens = text.lower().split()
         if not tokens:
@@ -83,13 +90,16 @@ class HashEmbeddings(Embeddings):
         return vec.tolist()
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        # Embed a batch of documents for indexing.
         return [self._embed(t) for t in texts]
 
     def embed_query(self, text: str) -> list[float]:
+        # Embed a single query string.
         return self._embed(text)
 
 
 def _embedding_from_backend(backend: str):
+    # Choose embedding backend (Google or local hash embeddings).
     if backend == "google":
         model_name = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/text-embedding-004")
         return GoogleGenerativeAIEmbeddings(model=model_name), {"backend": "google", "model": model_name}
@@ -99,6 +109,7 @@ def _embedding_from_backend(backend: str):
 
 
 def _save_rag_meta(meta: dict, thread_id: str) -> None:
+    # Persist RAG index metadata to disk.
     index_dir = get_thread_rag_index_dir(thread_id)
     try:
         index_dir.mkdir(parents=True, exist_ok=True)
@@ -109,6 +120,7 @@ def _save_rag_meta(meta: dict, thread_id: str) -> None:
 
 
 def _load_rag_meta(thread_id: str) -> dict:
+    # Load RAG index metadata from disk.
     meta_path = get_thread_rag_index_dir(thread_id) / "meta.json"
     if not meta_path.exists():
         return {}
@@ -120,6 +132,7 @@ def _load_rag_meta(thread_id: str) -> dict:
 
 
 def _collect_rag_files(thread_id: str) -> list[Path]:
+    # Collect supported files from the per-thread knowledge base.
     supported = {".txt", ".md", ".pdf"}
     files: list[Path] = []
 
@@ -132,6 +145,7 @@ def _collect_rag_files(thread_id: str) -> list[Path]:
 
 
 def _load_documents(paths: list[Path]) -> list[Document]:
+    # Load PDF/TXT/MD files into LangChain documents.
     documents: list[Document] = []
 
     for path in paths:
@@ -155,6 +169,8 @@ def _load_documents(paths: list[Path]) -> list[Document]:
 
 
 def _build_rag_retriever(thread_id: str, force_rebuild: bool = False):
+    # Build or load the per-thread FAISS retriever from uploaded documents.
+    # Build or load the per-thread FAISS retriever from uploaded documents.
     thread_key = _safe_thread_id(thread_id)
     index_dir = get_thread_rag_index_dir(thread_key)
     docs_dir = get_thread_rag_docs_dir(thread_key)
@@ -219,6 +235,7 @@ def _build_rag_retriever(thread_id: str, force_rebuild: bool = False):
 
 
 def ensure_rag_ready(thread_id: str, force_rebuild: bool = False):
+    # Ensure the retriever is initialized and cached for a thread.
     thread_key = _safe_thread_id(thread_id)
 
     if thread_key not in rag_retriever_cache or force_rebuild:
@@ -228,6 +245,7 @@ def ensure_rag_ready(thread_id: str, force_rebuild: bool = False):
 
 
 def rebuild_rag_index(thread_id: str) -> str:
+    # Force a rebuild of the FAISS index for a thread.
     thread_key = _safe_thread_id(thread_id)
     retriever = ensure_rag_ready(thread_key, force_rebuild=True)
     if retriever is None:
@@ -236,6 +254,8 @@ def rebuild_rag_index(thread_id: str) -> str:
 
 
 def _rag_context_for_query(query: str, thread_id: str, k: int = 4) -> str:
+    # Fetch top-k relevant chunks and format them into a single RAG context string.
+    # Fetch top-k relevant chunks and format them into a single RAG context string.
     if not query.strip():
         return ""
 
@@ -263,6 +283,7 @@ def _rag_context_for_query(query: str, thread_id: str, k: int = 4) -> str:
 
 
 def _extract_rag_source_tags(rag_context: str) -> list[str]:
+    # Extract citation tags like [1], [2] from the RAG context.
     tags = re.findall(r"\[(\d+)\]", rag_context or "")
     seen = set()
     ordered = []
@@ -275,6 +296,7 @@ def _extract_rag_source_tags(rag_context: str) -> list[str]:
 
 
 def _ensure_rag_citations(text: str, rag_context: str) -> str:
+    # Append source tags if the answer lacks citations.
     if not rag_context:
         return text
 

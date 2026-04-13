@@ -35,6 +35,7 @@ OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 
 
 def _needs_external_tools(query: str) -> bool:
+    # Fast heuristic to decide if external tools are needed.
     """Heuristic gate to avoid tool calls for simple knowledge questions."""
     q = query.lower().strip()
     if not q:
@@ -51,6 +52,7 @@ def _needs_external_tools(query: str) -> bool:
 
 
 def _is_simple_question(query: str) -> bool:
+    # Identify definition/explanation questions that do not need tools.
     """Return True for definition/explanation-style questions that the LLM can answer directly."""
     q = (query or "").strip().lower()
     if not q:
@@ -65,6 +67,8 @@ def _is_simple_question(query: str) -> bool:
 
 
 def _route_tool_with_llm(query: str) -> str:
+    # Lightweight LLM router to choose the best external tool for a query.
+    # Lightweight LLM router to choose the best external tool for a query.
     """LLM-based fallback router. Returns: weather|time|news|stock|search|none."""
     q = (query or "").strip()
     if not q:
@@ -100,6 +104,7 @@ def _route_tool_with_llm(query: str) -> str:
 
 
 def _llm_needs_tool(query: str) -> bool:
+    # LLM gate to decide if a query needs tool calls.
     """LLM gate to decide if a query needs external tools (real-time or unknown facts)."""
     q = (query or "").strip()
     if not q or _is_simple_question(q):
@@ -121,11 +126,13 @@ def _llm_needs_tool(query: str) -> bool:
 
 
 def _is_news_query(query: str) -> bool:
+    # Detect news-related queries.
     q = query.lower()
     return any(word in q for word in ["news", "headline", "trending", "top trending", "latest"])
 
 
 def _is_time_query(query: str) -> bool:
+    # Detect date/time queries while avoiding weather overlap.
     q = query.lower()
     if not q:
         return False
@@ -135,6 +142,7 @@ def _is_time_query(query: str) -> bool:
 
 
 def _is_greeting(query: str) -> bool:
+    # Detect short greeting messages.
     q = query.lower().strip()
     if not q:
         return False
@@ -146,11 +154,13 @@ def _is_greeting(query: str) -> bool:
 
 
 def _is_stock_query(query: str) -> bool:
+    # Detect stock price queries.
     q = query.lower()
     return "stock" in q or "price" in q
 
 
 def _is_weather_query(query: str) -> bool:
+    # Detect weather-related queries.
     q = query.lower()
     return (
         "weather" in q
@@ -163,6 +173,7 @@ def _is_weather_query(query: str) -> bool:
 
 
 def _has_location_hint(query: str) -> bool:
+    # Check whether a query contains a location signal.
     q = query.lower()
     if " in " in q or " at " in q or " of " in q:
         return True
@@ -171,6 +182,7 @@ def _has_location_hint(query: str) -> bool:
 
 
 def _extract_weather_location(query: str) -> str:
+    # Extract a location from a weather query.
     q = query.lower()
     match = re.search(r"weather\s+(?:in|of|for)\s+([a-z\s]+?)(?:\s+(?:today|tomorrow|yesterday|now|forecast))?[\?\.,]?$", q)
     if match:
@@ -186,6 +198,7 @@ def _extract_weather_location(query: str) -> str:
 
 
 def _parse_weather_payload(raw: str) -> dict:
+    # Validate and parse weather payload JSON.
     if not raw:
         return {}
     try:
@@ -200,12 +213,14 @@ def _parse_weather_payload(raw: str) -> dict:
 
 
 def _truncate_text(text: str, limit: int = 240) -> str:
+    # Trim text to a fixed length for compact UI output.
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "..."
 
 
 def _extract_first_url(text: str) -> str:
+    # Grab the first URL from a text blob.
     match = re.search(r"https?://\S+", text or "")
     if not match:
         return ""
@@ -213,6 +228,7 @@ def _extract_first_url(text: str) -> str:
 
 
 def _collapse_duplicate_phrase(text: str, phrase: str) -> str:
+    # Remove duplicated phrases in model output.
     if not text or not phrase:
         return text
     doubled = f"{phrase}{phrase}"
@@ -222,6 +238,7 @@ def _collapse_duplicate_phrase(text: str, phrase: str) -> str:
 
 
 def _extract_urls_from_text(text: str) -> list[str]:
+    # Extract and de-duplicate URLs from text.
     urls = re.findall(r"https?://[^\s)]+", text or "")
     seen = set()
     ordered = []
@@ -235,6 +252,7 @@ def _extract_urls_from_text(text: str) -> list[str]:
 
 
 def _format_sources(urls: list[str], fallback: str = "Internal knowledge") -> str:
+    # Format a Sources block for responses.
     if not urls:
         return f"Sources:\n- {fallback}"
     lines = ["Sources:"]
@@ -244,6 +262,7 @@ def _format_sources(urls: list[str], fallback: str = "Internal knowledge") -> st
 
 
 def _format_search_results(raw_text: str, max_items: int = 5) -> str:
+    # Convert raw search output into a numbered summary list.
     lines = [l.strip() for l in (raw_text or "").splitlines() if l.strip()]
     entries = []
     sources = []
@@ -273,6 +292,7 @@ def _format_search_results(raw_text: str, max_items: int = 5) -> str:
 
 
 def _extract_stock_symbol(query: str) -> str:
+    # Map company names or tickers to a stock symbol.
     q = query.lower()
     mapping = {
         "oracle": "ORCL",
@@ -298,6 +318,8 @@ def _extract_stock_symbol(query: str) -> str:
 
 @tool
 def search_tool(query: str) -> str:
+    # Web search helper used when the answer needs current or external information.
+    # Web search helper used when the answer needs current or external information.
     """Search latest information from web"""
     search_query = query
     if _is_weather_query(query):
@@ -343,6 +365,7 @@ def search_tool(query: str) -> str:
 
 @tool
 def calculator(expression: str) -> str:
+    # Evaluate a math expression safely using math functions only.
     """Solve math expressions"""
     try:
         return str(eval(expression, {"__builtins__": None}, vars(math)))
@@ -352,6 +375,7 @@ def calculator(expression: str) -> str:
 
 @tool
 def get_stock_price(symbol: str) -> str:
+    # Fetch the latest stock close price for a symbol.
     """Get stock price"""
     try:
         stock = yf.Ticker(symbol)
@@ -363,6 +387,7 @@ def get_stock_price(symbol: str) -> str:
 
 @tool
 def get_current_date_time() -> str:
+    # Return the local machine date/time in a readable format.
     """Get current local date and time."""
     now = datetime.now()
     return now.strftime("%A, %d %B %Y, %I:%M %p")
@@ -370,6 +395,8 @@ def get_current_date_time() -> str:
 
 @tool
 def get_weather(location: str) -> str:
+    # Call OpenWeather and return a compact JSON payload.
+    # Call OpenWeather and return a compact JSON payload.
     """Get current weather for a location using OpenWeather."""
     if not OPENWEATHER_API_KEY:
         return "Weather API key not configured."
@@ -408,16 +435,20 @@ def get_weather(location: str) -> str:
 
 
 def _call_search_tool(query: str) -> str:
+    # Invoke the search tool and return its string response.
     return str(search_tool.invoke({"query": query}))
 
 
 def _call_stock_tool(symbol: str) -> str:
+    # Invoke the stock tool and return its string response.
     return str(get_stock_price.invoke({"symbol": symbol}))
 
 
 def _call_time_tool() -> str:
+    # Invoke the time tool and return its string response.
     return str(get_current_date_time.invoke({}))
 
 
 def _call_weather_tool(location: str) -> str:
+    # Invoke the weather tool and return its string response.
     return str(get_weather.invoke({"location": location}))

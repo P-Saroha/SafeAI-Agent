@@ -99,6 +99,7 @@ LOW_CONFIDENCE_RAG_MIN_CHARS = 220
 
 
 def _is_document_intent(query: str) -> bool:
+    # Detect if a query is asking about uploaded documents.
     q = query.lower().strip()
     if not q:
         return False
@@ -121,6 +122,7 @@ def _is_document_intent(query: str) -> bool:
 
 
 def _approval_reset_state() -> dict:
+    # Reset HITL approval state in the graph.
     return {
         "awaiting_approval": False,
         "approval_request": "",
@@ -131,6 +133,7 @@ def _approval_reset_state() -> dict:
 
 
 def _resolve_hitl_decision(state: ChatState, latest_query: str, rag_context: str) -> dict | None:
+    # Apply a human approval decision to continue or refine the response.
     decision = str(state.get("approval_decision", "")).lower().strip()
     if not decision:
         return None
@@ -168,6 +171,8 @@ def _resolve_hitl_decision(state: ChatState, latest_query: str, rag_context: str
 # CHAT NODE
 # ==============================
 def chat_node(state: ChatState):
+    # Main response pipeline: decide routing, apply memory/RAG/tool logic, and return an answer.
+    # Main response pipeline: decide routing, apply memory/RAG/tool logic, and return an answer.
     latest_query = _latest_user_query(state["messages"])
     thread_id = _safe_thread_id(state.get("thread_id", "default"))
     user_id = _safe_thread_id(state.get("user_id") or state.get("thread_id", "default"))
@@ -492,6 +497,7 @@ Rules:
 
 
 def _latest_user_query(messages: list[BaseMessage]) -> str:
+    # Return the most recent user text message.
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
             return msg.content
@@ -499,10 +505,12 @@ def _latest_user_query(messages: list[BaseMessage]) -> str:
 
 
 def _link_request(text: str) -> bool:
+    # Detect requests that ask for a previously shared link.
     return bool(re.search(r"\b(link|that link|the link|share link|give me that link)\b", text.lower()))
 
 
 def route_after_chat(state: ChatState):
+    # Determine whether to pause for HITL approval or finish the turn.
     if state.get("awaiting_approval"):
         return "wait_for_human"
     return "__end__"
@@ -512,6 +520,8 @@ def route_after_chat(state: ChatState):
 # DATABASE (MEMORY)
 # ==============================
 def init_checkpointer():
+    # Initialize the SqliteSaver checkpointer for chat state persistence.
+    # Initialize the SqliteSaver checkpointer for chat state persistence.
     db_path = "chatbot_db"
 
     try:
@@ -540,6 +550,7 @@ checkpointer, conn = init_checkpointer()
 
 
 def delete_thread_history(thread_id: str) -> str:
+    # Delete all stored checkpoints and RAG artifacts for a thread.
     if not thread_id or not thread_id.strip():
         return "Delete failed: invalid thread id."
 
@@ -623,6 +634,7 @@ chatbot = builder.compile(checkpointer=checkpointer)
 # CHAT TITLE GENERATION
 # ==============================
 def generate_chat_title(user_message: str) -> str:
+    # Generate a short chat title from the first user message.
     if not user_message or not user_message.strip():
         return "New Chat"
 
@@ -656,6 +668,7 @@ def generate_chat_title(user_message: str) -> str:
 # THREAD UTIL
 # ==============================
 def unique_thread_pointer():
+    # List all thread IDs stored in the checkpointer.
     all_threads = set()
     for checkpoint in checkpointer.list(None):
         all_threads.add(checkpoint.config["configurable"]["thread_id"])

@@ -15,6 +15,7 @@ from chatbotBackend import (
 from langchain_core.messages import HumanMessage, AIMessage
 import uuid
 import os
+import re
 from pathlib import Path
 
 os.environ['LANGSMITH_PROJECT'] = 'ChatBot-Project'
@@ -24,10 +25,12 @@ os.environ['LANGSMITH_PROJECT'] = 'ChatBot-Project'
 # UTIL FUNCTIONS
 # ==============================
 def generate_thread_id():
+    # Create a new random thread identifier.
     return str(uuid.uuid4())
 
 
 def deduplicate_message_history(messages):
+    # Remove duplicate chat messages before rendering.
     """Remove exact duplicate messages from history."""
     seen = set()
     deduped = []
@@ -40,6 +43,7 @@ def deduplicate_message_history(messages):
 
 
 def get_or_create_user_id():
+    # Load or create a stable user id for LTM scoping.
     if 'user_id' in st.session_state:
         return st.session_state['user_id']
 
@@ -56,19 +60,46 @@ def get_or_create_user_id():
     return user_id
 
 
+def _active_thread_file(user_id: str) -> Path:
+    # Map a user id to a file that stores the last active thread.
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", user_id or "")
+    return Path(__file__).resolve().parent / f".active_thread_{safe_id}"
+
+
+def get_active_thread_id(user_id: str) -> str | None:
+    # Read the last active thread id from disk.
+    path = _active_thread_file(user_id)
+    if not path.exists():
+        return None
+    value = path.read_text(encoding="utf-8").strip()
+    return value or None
+
+
+def set_active_thread_id(user_id: str, thread_id: str) -> None:
+    # Persist the last active thread id for reloads.
+    if not user_id or not thread_id:
+        return
+    _active_thread_file(user_id).write_text(thread_id, encoding="utf-8")
+
+
 def reset_chat():
+    # Start a new chat thread and clear in-memory message history.
+    # Start a new chat thread and clear in-memory message history.
     thread_id = generate_thread_id()
     st.session_state['thread_id'] = thread_id
     add_thread(thread_id)
     st.session_state['message_history'] = []
+    set_active_thread_id(get_or_create_user_id(), thread_id)
 
 
 def add_thread(thread_id):
+    # Add a thread to the sidebar list if missing.
     if thread_id not in st.session_state['chat_threads']:
         st.session_state['chat_threads'].append(thread_id)
 
 
 def delete_thread(thread_id):
+    # Delete a thread's history and remove it from the UI.
     delete_status = delete_thread_history(thread_id)
 
     if thread_id in st.session_state['chat_threads']:
@@ -86,6 +117,8 @@ def delete_thread(thread_id):
 
 
 def load_conversation(thread_id):
+    # Load thread history from the LangGraph checkpointer into the UI.
+    # Load thread history from the LangGraph checkpointer into the UI.
     state = chatbot.get_state(
         config={'configurable': {'thread_id': thread_id, 'user_id': get_or_create_user_id()}}
     )
@@ -114,6 +147,7 @@ def load_conversation(thread_id):
 
 
 def refresh_pending_approval(thread_id):
+    # Pull HITL approval state from the graph into session state.
     """Load HITL pending request from graph state for the active thread."""
     state = chatbot.get_state(
         config={'configurable': {'thread_id': thread_id, 'user_id': get_or_create_user_id()}}
@@ -130,6 +164,7 @@ def refresh_pending_approval(thread_id):
 
 
 def save_uploaded_docs(uploaded_files, thread_id):
+    # Save uploaded files and rebuild the per-thread RAG index.
     """Save uploaded docs to knowledge folder and rebuild index."""
     if not uploaded_files:
         return 0, ""
@@ -149,6 +184,7 @@ def save_uploaded_docs(uploaded_files, thread_id):
 
 
 def extract_tool_names(message_chunk):
+    # Parse tool names from streamed model/tool messages.
     """Extract tool names from model/tool message chunks."""
     tool_names = set()
 
@@ -177,7 +213,7 @@ if 'message_history' not in st.session_state:
 if 'thread_id' not in st.session_state:
     st.session_state['thread_id'] = generate_thread_id()
 
-get_or_create_user_id()
+user_id = get_or_create_user_id()
 
 if 'chat_threads' not in st.session_state:
     st.session_state['chat_threads'] = unique_thread_pointer()
@@ -188,7 +224,22 @@ if 'thread_titles' not in st.session_state:
 if 'pending_approval' not in st.session_state:
     st.session_state['pending_approval'] = None
 
+stored_thread = get_active_thread_id(user_id)
+if stored_thread and stored_thread in st.session_state['chat_threads']:
+    st.session_state['thread_id'] = stored_thread
+elif st.session_state['chat_threads']:
+    st.session_state['thread_id'] = st.session_state['chat_threads'][-1]
+    set_active_thread_id(user_id, st.session_state['thread_id'])
+else:
+    set_active_thread_id(user_id, st.session_state['thread_id'])
+
 add_thread(st.session_state['thread_id'])
+if not st.session_state['message_history']:
+    messages = load_conversation(st.session_state['thread_id'])
+    st.session_state['message_history'] = [
+        {'role': 'user' if isinstance(msg, HumanMessage) else 'assistant', 'content': msg.content}
+        for msg in messages
+    ]
 refresh_pending_approval(st.session_state['thread_id'])
 
 
@@ -271,6 +322,7 @@ for thread_id in st.session_state['chat_threads'][::-1]:
     with col1:
         if st.button(title, key=f"load_{thread_id}"):
             st.session_state['thread_id'] = thread_id
+            set_active_thread_id(get_or_create_user_id(), thread_id)
             messages = load_conversation(thread_id)
 
             temp_messages = []

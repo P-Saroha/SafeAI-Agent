@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import uuid
@@ -39,6 +40,12 @@ LTM_TOP_K = int(os.getenv("LTM_TOP_K", "4"))
 LTM_STM_MAX_MESSAGES = int(os.getenv("LTM_STM_MAX_MESSAGES", "12"))
 LTM_EMBEDDING_BACKEND = os.getenv("LTM_EMBEDDING_BACKEND", "hash").lower()
 LTM_MAX_ENTRIES = int(os.getenv("LTM_MAX_ENTRIES", "25"))
+LTM_IMPORTANCE_THRESHOLD = float(os.getenv("LTM_IMPORTANCE_THRESHOLD", "0.6"))
+LTM_DECAY_DAYS = int(os.getenv("LTM_DECAY_DAYS", "30"))
+LTM_WEIGHT_BASE = float(os.getenv("LTM_WEIGHT_BASE", "0.6"))
+LTM_WEIGHT_FREQ = float(os.getenv("LTM_WEIGHT_FREQ", "0.2"))
+LTM_WEIGHT_RECENCY = float(os.getenv("LTM_WEIGHT_RECENCY", "0.2"))
+LTM_USAGE_BOOST = float(os.getenv("LTM_USAGE_BOOST", "0.2"))
 
 STRUCTURED_MEMORY_PROMPT = """You extract user memory into a strict JSON structure.
 
@@ -60,15 +67,28 @@ Return ONLY valid JSON in this exact format:
     "memory": {
         "name": "",
         "age": "",
+        "location": "",
+        "role": "",
         "education": [],
         "university": [],
         "favorite_language": "",
         "favorite_color": "",
         "favorite_laptop": "",
+        "favorite_tools": [],
+        "response_style": "",
+        "tone": "",
+        "likes_code_examples": false,
+        "learning_preferences": [],
         "interests": [],
         "likes": [],
         "projects": [],
-        "travel_plans": []
+        "travel_plans": [],
+        "recent_topics": [],
+        "goals": [],
+        "current_project": "",
+        "issues": [],
+        "level": "",
+        "skills": []
     }
 }
 """
@@ -86,6 +106,7 @@ memory_store_last_error = ""
 
 
 def _init_memory_store() -> bool:
+    # Initialize Postgres-backed LTM storage and capture connection errors.
     global memory_store_last_error
     memory_store_last_error = ""
     if PostgresStore is None:
@@ -109,6 +130,7 @@ memory_embeddings, _memory_meta = _embedding_from_backend(LTM_EMBEDDING_BACKEND)
 
 
 def _ensure_memory_store() -> bool:
+    # Lazily re-initialize the LTM store if it was unavailable.
     global memory_store_available
     if memory_store_available:
         return True
@@ -118,6 +140,7 @@ def _ensure_memory_store() -> bool:
 
 @contextmanager
 def _open_memory_store():
+    # Context manager to safely open and close the LTM store.
     if PostgresStore is None:
         yield None
         return
@@ -129,10 +152,12 @@ def _open_memory_store():
 
 
 def _memory_namespace(user_id: str) -> tuple:
+    # Build the per-user namespace used for LTM keys.
     return ("user", user_id, "details")
 
 
 def _normalize_list(values: list[str]) -> list[str]:
+    # Clean, de-duplicate, and normalize a list of strings.
     seen = set()
     result = []
     for item in values or []:
@@ -147,7 +172,19 @@ def _normalize_list(values: list[str]) -> list[str]:
     return result
 
 
+def _coerce_list(value) -> list[str]:
+    # Coerce scalars into list form for uniform downstream processing.
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return _split_list_terms(value)
+    return []
+
+
 def _as_list(value) -> list[str]:
+    # Wrap a single value in a list when needed.
     if value is None:
         return []
     if isinstance(value, list):
@@ -157,11 +194,25 @@ def _as_list(value) -> list[str]:
 
 
 def _structured_memory_summary(memory: dict) -> str:
+    # Summarize structured memory into a compact, readable block.
     if not memory:
         return "(empty)"
 
     parts = []
-    for key in ["name", "age", "favorite_language", "favorite_color", "favorite_laptop"]:
+    for key in [
+        "name",
+        "age",
+        "location",
+        "role",
+        "favorite_language",
+        "favorite_color",
+        "favorite_laptop",
+        "response_style",
+        "tone",
+        "current_project",
+        "level",
+        "likes_code_examples",
+    ]:
         value = str(memory.get(key) or "").strip()
         if value:
             parts.append(f"{key}: {value}")
@@ -171,15 +222,108 @@ def _structured_memory_summary(memory: dict) -> str:
         if values:
             parts.append(f"{key}: {', '.join(values)}")
 
-    for key in ["interests", "likes", "projects", "travel_plans"]:
-        values = _normalize_interest_list(memory.get(key) or []) if key == "interests" else _normalize_list(memory.get(key) or [])
+    for key in [
+        "favorite_tools",
+        "learning_preferences",
+        "interests",
+        "likes",
+        "projects",
+        "travel_plans",
+        "recent_topics",
+        "goals",
+        "issues",
+        "skills",
+    ]:
+        values = (
+            _normalize_interest_list(memory.get(key) or [])
+            if key == "interests"
+            else _normalize_list(memory.get(key) or [])
+        )
         if values:
             parts.append(f"{key}: {', '.join(values)}")
 
     return "\n".join(parts) if parts else "(empty)"
 
 
+def _classify_memory_intent(query: str) -> str:
+    # Map a user query to a memory intent bucket.
+    q = query.lower()
+    if any(term in q for term in ["about me", "about myself", "who am i", "my profile"]):
+        return "about_user"
+    if any(term in q for term in ["project", "projects", "build", "built", "debug", "bug", "issue"]):
+        return "technical"
+    if any(term in q for term in ["skill", "skills", "experience", "level"]):
+        return "skills"
+    if any(term in q for term in ["goal", "goals", "dream", "career", "job", "internship"]):
+        return "goals"
+    if any(term in q for term in ["prefer", "preference", "tone", "style", "detailed", "short"]):
+        return "preferences"
+    return "general"
+
+
+def _select_structured_fields(memory: dict, fields: list[str]) -> dict:
+    # Return only the requested fields from structured memory.
+    if not memory:
+        return {}
+    return {key: memory.get(key) for key in fields if key in memory}
+
+
+def _structured_by_intent(memory: dict, intent: str) -> dict:
+    # Filter structured memory based on the detected intent.
+    if intent == "about_user":
+        return memory
+    if intent == "technical":
+        return _select_structured_fields(
+            memory,
+            ["projects", "current_project", "issues", "skills", "education", "university"],
+        )
+    if intent == "skills":
+        return _select_structured_fields(memory, ["level", "skills", "education", "university"])
+    if intent == "goals":
+        return _select_structured_fields(memory, ["goals", "current_project", "issues"])
+    if intent == "preferences":
+        return _select_structured_fields(
+            memory,
+            [
+                "response_style",
+                "tone",
+                "likes_code_examples",
+                "favorite_tools",
+                "learning_preferences",
+                "likes",
+                "favorite_language",
+                "favorite_color",
+                "favorite_laptop",
+            ],
+        )
+    return memory
+
+
+def _fields_for_intent(intent: str) -> list[str]:
+    # Return the list of structured fields relevant to an intent.
+    if intent == "technical":
+        return ["projects", "current_project", "issues", "skills", "education", "university"]
+    if intent == "skills":
+        return ["level", "skills", "education", "university"]
+    if intent == "goals":
+        return ["goals", "current_project", "issues"]
+    if intent == "preferences":
+        return [
+            "response_style",
+            "tone",
+            "likes_code_examples",
+            "favorite_tools",
+            "learning_preferences",
+            "likes",
+            "favorite_language",
+            "favorite_color",
+            "favorite_laptop",
+        ]
+    return []
+
+
 def _try_load_json(text: str) -> dict | None:
+    # Parse JSON from model output, with a fallback to substring extraction.
     if not text:
         return None
     try:
@@ -197,6 +341,7 @@ def _try_load_json(text: str) -> dict | None:
 
 
 def _parse_structured_memory_json(raw_text: str) -> dict:
+    # Normalize the LLM extraction output into a stable structured schema.
     data = _try_load_json(raw_text)
     if not isinstance(data, dict):
         return {"should_write": False, "memory": {}}
@@ -205,31 +350,48 @@ def _parse_structured_memory_json(raw_text: str) -> dict:
     if not isinstance(memory, dict):
         memory = {}
 
-    interests_raw = memory.get("interests") or []
-    likes_raw = memory.get("likes") or []
-    projects_raw = memory.get("projects") or []
-    travel_raw = memory.get("travel_plans") or []
-    if isinstance(interests_raw, str):
-        interests_raw = _split_list_terms(interests_raw)
-    if isinstance(likes_raw, str):
-        likes_raw = _split_list_terms(likes_raw)
-    if isinstance(projects_raw, str):
-        projects_raw = _split_list_terms(projects_raw)
-    if isinstance(travel_raw, str):
-        travel_raw = _split_list_terms(travel_raw)
+    favorite_tools_raw = _coerce_list(memory.get("favorite_tools") or [])
+    learning_raw = _coerce_list(memory.get("learning_preferences") or [])
+    interests_raw = _coerce_list(memory.get("interests") or [])
+    likes_raw = _coerce_list(memory.get("likes") or [])
+    projects_raw = _coerce_list(memory.get("projects") or [])
+    travel_raw = _coerce_list(memory.get("travel_plans") or [])
+    topics_raw = _coerce_list(memory.get("recent_topics") or [])
+    goals_raw = _coerce_list(memory.get("goals") or [])
+    issues_raw = _coerce_list(memory.get("issues") or [])
+    skills_raw = _coerce_list(memory.get("skills") or [])
+
+    likes_code_examples = memory.get("likes_code_examples")
+    if isinstance(likes_code_examples, bool):
+        likes_code_examples = "true" if likes_code_examples else "false"
+    elif likes_code_examples is None:
+        likes_code_examples = ""
 
     parsed = {
         "name": str(memory.get("name", "")).strip(),
         "age": str(memory.get("age", "")).strip(),
+        "location": str(memory.get("location", "")).strip(),
+        "role": str(memory.get("role", "")).strip(),
         "education": _normalize_list(_as_list(memory.get("education"))),
         "university": _normalize_list(_as_list(memory.get("university"))),
         "favorite_language": str(memory.get("favorite_language", "")).strip(),
         "favorite_color": str(memory.get("favorite_color", "")).strip(),
         "favorite_laptop": str(memory.get("favorite_laptop", "")).strip(),
+        "favorite_tools": _normalize_list(favorite_tools_raw),
+        "response_style": str(memory.get("response_style", "")).strip(),
+        "tone": str(memory.get("tone", "")).strip(),
+        "likes_code_examples": str(likes_code_examples or "").strip(),
+        "learning_preferences": _normalize_list(learning_raw),
         "interests": _normalize_interest_list(interests_raw),
         "likes": _normalize_list(likes_raw),
         "projects": _normalize_list(projects_raw),
         "travel_plans": _normalize_list(travel_raw),
+        "recent_topics": _normalize_list(topics_raw),
+        "goals": _normalize_list(goals_raw),
+        "current_project": str(memory.get("current_project", "")).strip(),
+        "issues": _normalize_list(issues_raw),
+        "level": str(memory.get("level", "")).strip(),
+        "skills": _normalize_list(skills_raw),
     }
 
     return {
@@ -239,6 +401,7 @@ def _parse_structured_memory_json(raw_text: str) -> dict:
 
 
 def _memory_has_facts(memory: dict) -> bool:
+    # Check if any usable memory fields exist.
     if not memory:
         return False
     for value in memory.values():
@@ -249,7 +412,74 @@ def _memory_has_facts(memory: dict) -> bool:
     return False
 
 
+def _importance_score_for_field(field: str) -> float:
+    # Assign a static importance weight per memory field.
+    high = {"name", "education", "university", "skills", "goals", "current_project"}
+    medium = {
+        "role",
+        "location",
+        "response_style",
+        "tone",
+        "learning_preferences",
+        "favorite_tools",
+        "level",
+        "issues",
+    }
+    low = {"likes", "favorite_color", "favorite_laptop", "travel_plans"}
+
+    if field in high:
+        return 0.9
+    if field in medium:
+        return 0.7
+    if field in low:
+        return 0.4
+    if field in {"interests", "projects", "favorite_language"}:
+        return 0.6
+    return 0.5
+
+
+def _value_is_repeated(existing: dict, field: str, value: str) -> bool:
+    # Detect whether a value is already stored for a field.
+    if not existing:
+        return False
+    if field in {"education", "university", "favorite_tools", "learning_preferences", "interests", "likes", "projects", "travel_plans", "recent_topics", "goals", "issues", "skills"}:
+        existing_list = _normalize_list(existing.get(field) or [])
+        return _normalize_memory_text(value) in {_normalize_memory_text(v) for v in existing_list}
+    existing_value = str(existing.get(field, "") or "").strip()
+    return _normalize_memory_text(existing_value) == _normalize_memory_text(value)
+
+
+def _filter_by_importance(existing: dict, incoming: dict, force: bool) -> dict:
+    # Filter incoming memory by importance score and repetition.
+    if force or not incoming:
+        return incoming or {}
+
+    filtered: dict = {}
+    for field, value in incoming.items():
+        score = _importance_score_for_field(field)
+        if isinstance(value, list):
+            kept = []
+            for item in value:
+                if not item:
+                    continue
+                repeated = _value_is_repeated(existing, field, str(item))
+                if score >= LTM_IMPORTANCE_THRESHOLD or repeated:
+                    kept.append(item)
+            if kept:
+                filtered[field] = kept
+        else:
+            text_value = str(value or "").strip()
+            if not text_value:
+                continue
+            repeated = _value_is_repeated(existing, field, text_value)
+            if score >= LTM_IMPORTANCE_THRESHOLD or repeated:
+                filtered[field] = text_value
+
+    return filtered
+
+
 def _clean_institution_value(text: str) -> str:
+    # Clean school/institution names extracted from free text.
     if not text:
         return ""
     cleaned = re.split(
@@ -263,18 +493,32 @@ def _clean_institution_value(text: str) -> str:
 
 
 def _fallback_extract_from_text(text: str) -> dict:
+    # Regex-based backup extractor for key memory facts.
     result = {
         "name": "",
         "age": "",
+        "location": "",
+        "role": "",
         "education": [],
         "university": [],
         "favorite_language": "",
         "favorite_color": "",
         "favorite_laptop": "",
+        "favorite_tools": [],
+        "response_style": "",
+        "tone": "",
+        "likes_code_examples": "",
+        "learning_preferences": [],
         "interests": [],
         "likes": [],
         "projects": [],
         "travel_plans": [],
+        "recent_topics": [],
+        "goals": [],
+        "current_project": "",
+        "issues": [],
+        "level": "",
+        "skills": [],
     }
     if not text:
         return result
@@ -285,11 +529,31 @@ def _fallback_extract_from_text(text: str) -> dict:
     if name_match:
         result["name"] = _clean_name_value(name_match.group(1))
 
+    role_match = re.search(r"\b(role|profession)\s*(?:is|:)?\s*([^\.;,]+)", text, re.IGNORECASE)
+    if role_match:
+        result["role"] = _clean_simple_value(role_match.group(2))
+
+    location_match = re.search(r"\b(?:i am in|i live in|based in|location is)\s+([^\.;,]+)", text, re.IGNORECASE)
+    if location_match:
+        result["location"] = _clean_simple_value(location_match.group(1))
+
     interest_match = re.search(r"\bmy interest is\s+([^\.;,]+)", text, re.IGNORECASE)
     if not interest_match:
         interest_match = re.search(r"\bi am interested in\s+([^\.;,]+)", text, re.IGNORECASE)
     if interest_match:
         result["interests"] = _normalize_interest_list([interest_match.group(1).strip()])
+
+    fav_lang_match = re.search(
+        r"\bmy favorite\s+(?:programming\s+)?language\s*(?:is|:)?\s*([^\.;,]+)",
+        text,
+        re.IGNORECASE,
+    )
+    if fav_lang_match:
+        result["favorite_language"] = _clean_favorite_language(fav_lang_match.group(1))
+
+    goal_match = re.search(r"\bgoal\s*(?:is|:)?\s*([^\.;,]+)", text, re.IGNORECASE)
+    if goal_match:
+        result["goals"] = _normalize_list([goal_match.group(1).strip()])
 
     edu_matches = re.findall(
         r"\b(B\.?E\.?|B\.?S\.?|B\.?Sc\.?)\b\s*(?:in\s+([A-Za-z0-9&.\s]+?))?(?=\bfrom\b|\band\b|\bmy\b|,|;|$)",
@@ -324,27 +588,64 @@ def _fallback_extract_from_text(text: str) -> dict:
         if project_text:
             result["projects"] = _normalize_list([project_text])
 
+    current_project_match = re.search(r"\bcurrent project\s*(?:is|:)?\s*([^\.;,]+)", text, re.IGNORECASE)
+    if current_project_match:
+        result["current_project"] = _clean_simple_value(current_project_match.group(1))
+
+    issue_match = re.search(r"\b(issue|bug|problem)\s*(?:is|:)?\s*([^\.;,]+)", text, re.IGNORECASE)
+    if issue_match:
+        result["issues"] = _normalize_list([issue_match.group(2).strip()])
+
+    skills_match = re.search(r"\bskills?\s*(?:are|:)?\s*([^\.;,]+)", text, re.IGNORECASE)
+    if skills_match:
+        result["skills"] = _normalize_list(_split_list_terms(skills_match.group(1)))
+
+    style_match = re.search(r"\b(response style|style)\s*(?:is|:)?\s*(short|detailed|concise|brief)\b", text, re.IGNORECASE)
+    if style_match:
+        result["response_style"] = _clean_simple_value(style_match.group(2))
+
+    tone_match = re.search(r"\btone\s*(?:is|:)?\s*(formal|casual|friendly)\b", text, re.IGNORECASE)
+    if tone_match:
+        result["tone"] = _clean_simple_value(tone_match.group(1))
+
+    if re.search(r"\blike\s+code\s+examples\b", text, re.IGNORECASE):
+        result["likes_code_examples"] = "true"
+    if re.search(r"\bprefer\s+fewer\s+code\s+examples\b", text, re.IGNORECASE):
+        result["likes_code_examples"] = "false"
+
     return result
 
 
 def _structured_memory_to_sentences(memory: dict) -> list[str]:
+    # Convert structured memory into readable sentences.
     if not memory:
         return []
 
     sentences = []
     name = _clean_name_value(memory.get("name") or "")
     age = _clean_age_value(memory.get("age") or "")
+    location = _clean_simple_value(memory.get("location") or "")
+    role = _clean_simple_value(memory.get("role") or "")
     education_list = [_normalize_degree_text(v).rstrip(".") for v in _as_list(memory.get("education"))]
     education_list = _normalize_list([v for v in education_list if v])
     university_list = _normalize_list(_as_list(memory.get("university")))
     favorite_language = _clean_favorite_language(memory.get("favorite_language") or "")
     favorite_color = _clean_favorite_color(memory.get("favorite_color") or "")
     favorite_laptop = _clean_favorite_device(memory.get("favorite_laptop") or "")
+    response_style = _clean_simple_value(memory.get("response_style") or "")
+    tone = _clean_simple_value(memory.get("tone") or "")
+    likes_code_examples = _normalize_bool_preference(memory.get("likes_code_examples") or "")
+    current_project = _clean_simple_value(memory.get("current_project") or "")
+    level = _clean_simple_value(memory.get("level") or "")
 
     if name:
         sentences.append(f"Your name is {name}.")
     if age:
         sentences.append(f"You are {age} years old.")
+    if location:
+        sentences.append(f"You are based in {location}.")
+    if role:
+        sentences.append(f"Your role is {role}.")
     if education_list:
         sentences.append(f"You are studying {'; '.join(education_list)}.")
     if university_list:
@@ -355,6 +656,23 @@ def _structured_memory_to_sentences(memory: dict) -> list[str]:
         sentences.append(f"Your favorite color is {favorite_color}.")
     if favorite_laptop:
         sentences.append(f"Your favorite laptop is {favorite_laptop}.")
+    if response_style:
+        sentences.append(f"You prefer {response_style} responses.")
+    if tone:
+        sentences.append(f"You prefer a {tone} tone.")
+    if likes_code_examples == "true":
+        sentences.append("You like code examples.")
+    if likes_code_examples == "false":
+        sentences.append("You prefer fewer code examples.")
+    if current_project:
+        sentences.append(f"You are working on {current_project}.")
+    if level:
+        sentences.append(f"Your skill level is {level}.")
+
+    for tool in _normalize_list(memory.get("favorite_tools") or []):
+        sentences.append(f"You prefer using {tool}.")
+    for pref in _normalize_list(memory.get("learning_preferences") or []):
+        sentences.append(f"You prefer {pref} for learning.")
 
     for interest in _normalize_list(memory.get("interests") or []):
         sentences.append(f"You are interested in {interest}.")
@@ -364,11 +682,20 @@ def _structured_memory_to_sentences(memory: dict) -> list[str]:
         sentences.append(f"You worked on a {project}.")
     for plan in _normalize_list(memory.get("travel_plans") or []):
         sentences.append(f"You plan to go to {plan}.")
+    for topic in _normalize_list(memory.get("recent_topics") or []):
+        sentences.append(f"You recently discussed {topic}.")
+    for goal in _normalize_list(memory.get("goals") or []):
+        sentences.append(f"Your goal is {goal}.")
+    for issue in _normalize_list(memory.get("issues") or []):
+        sentences.append(f"You are dealing with {issue}.")
+    for skill in _normalize_list(memory.get("skills") or []):
+        sentences.append(f"You have experience with {skill}.")
 
     return sentences
 
 
 def _structured_memory_from_items(items: list) -> dict:
+    # Rebuild a structured memory dict from stored LTM items.
     memory = {}
     for item in items:
         value = getattr(item, "value", {}) or {}
@@ -382,7 +709,18 @@ def _structured_memory_from_items(items: list) -> dict:
         if not field:
             continue
 
-        if field in {"interests", "likes", "projects", "travel_plans"}:
+        if field in {
+            "favorite_tools",
+            "learning_preferences",
+            "interests",
+            "likes",
+            "projects",
+            "travel_plans",
+            "recent_topics",
+            "goals",
+            "issues",
+            "skills",
+        }:
             raw_list = value.get("list") or value.get("data") or []
             if isinstance(raw_list, str):
                 raw_list = _split_list_terms(raw_list)
@@ -396,23 +734,48 @@ def _structured_memory_from_items(items: list) -> dict:
 
     memory["name"] = _clean_name_value(memory.get("name", ""))
     memory["age"] = _clean_age_value(memory.get("age", ""))
+    memory["location"] = _clean_simple_value(memory.get("location", ""))
+    memory["role"] = _clean_simple_value(memory.get("role", ""))
     education_list = [_normalize_degree_text(v).rstrip(".") for v in _as_list(memory.get("education"))]
     memory["education"] = _normalize_list([v for v in education_list if v])
     memory["favorite_language"] = _clean_favorite_language(memory.get("favorite_language", ""))
     memory["favorite_color"] = _clean_favorite_color(memory.get("favorite_color", ""))
     memory["favorite_laptop"] = _clean_favorite_device(memory.get("favorite_laptop", ""))
+    memory["response_style"] = _clean_simple_value(memory.get("response_style", ""))
+    memory["tone"] = _clean_simple_value(memory.get("tone", ""))
+    memory["likes_code_examples"] = _normalize_bool_preference(memory.get("likes_code_examples", ""))
+    memory["current_project"] = _clean_simple_value(memory.get("current_project", ""))
+    memory["level"] = _clean_simple_value(memory.get("level", ""))
 
     return memory
 
 
 def _merge_structured_memory(base: dict, incoming: dict) -> dict:
+    # Merge new structured facts into existing memory with normalization.
     result = dict(base or {})
-    for key in ["name", "age", "education", "university", "favorite_language", "favorite_color", "favorite_laptop"]:
+    for key in [
+        "name",
+        "age",
+        "location",
+        "role",
+        "education",
+        "university",
+        "favorite_language",
+        "favorite_color",
+        "favorite_laptop",
+        "response_style",
+        "tone",
+        "likes_code_examples",
+        "current_project",
+        "level",
+    ]:
         value = incoming.get(key)
         if key == "name":
             value = _clean_name_value(value)
         if key == "age":
             value = _clean_age_value(value)
+        if key in {"location", "role", "response_style", "tone", "current_project", "level"}:
+            value = _clean_simple_value(value)
         if key == "education":
             incoming_list = _normalize_list(
                 [_normalize_degree_text(v).rstrip(".") for v in _as_list(value)]
@@ -435,12 +798,25 @@ def _merge_structured_memory(base: dict, incoming: dict) -> dict:
             value = _clean_favorite_color(value)
         if key == "favorite_laptop":
             value = _clean_favorite_device(value)
+        if key == "likes_code_examples":
+            value = _normalize_bool_preference(value)
         existing = str(result.get(key, "") or "").strip()
         value = str(value or "").strip()
         if value and value.lower() != existing.lower():
             result[key] = value
 
-    for key in ["interests", "likes", "projects", "travel_plans"]:
+    for key in [
+        "favorite_tools",
+        "learning_preferences",
+        "interests",
+        "likes",
+        "projects",
+        "travel_plans",
+        "recent_topics",
+        "goals",
+        "issues",
+        "skills",
+    ]:
         existing = _normalize_list(result.get(key) or [])
         incoming_values = _normalize_list(incoming.get(key) or [])
         if key == "interests":
@@ -454,6 +830,7 @@ def _merge_structured_memory(base: dict, incoming: dict) -> dict:
 
 
 def _store_structured_memory(user_id: str, memory: dict) -> None:
+    # Persist structured memory fields into the LTM store.
     if not _ensure_memory_store():
         return
 
@@ -478,12 +855,29 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
                         pass
 
         timestamp = datetime.utcnow().isoformat()
-        for key in ["name", "age", "education", "university", "favorite_language", "favorite_color", "favorite_laptop"]:
+        for key in [
+            "name",
+            "age",
+            "location",
+            "role",
+            "education",
+            "university",
+            "favorite_language",
+            "favorite_color",
+            "favorite_laptop",
+            "response_style",
+            "tone",
+            "likes_code_examples",
+            "current_project",
+            "level",
+        ]:
             raw_value = memory.get(key)
             if key == "name":
                 value = _clean_name_value(raw_value)
             if key == "age":
                 value = _clean_age_value(raw_value)
+            if key in {"location", "role", "response_style", "tone", "current_project", "level"}:
+                value = _clean_simple_value(raw_value)
             if key == "education":
                 values = _normalize_list(
                     [_normalize_degree_text(v).rstrip(".") for v in _as_list(raw_value)]
@@ -501,6 +895,8 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
                             "kind": "structured",
                             "field": "education",
                             "ts": timestamp,
+                            "access_count": 0,
+                            "last_accessed": timestamp,
                         },
                     )
                 continue
@@ -519,6 +915,8 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
                             "kind": "structured",
                             "field": "university",
                             "ts": timestamp,
+                            "access_count": 0,
+                            "last_accessed": timestamp,
                         },
                     )
                 continue
@@ -528,6 +926,8 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
                 value = _clean_favorite_color(raw_value)
             if key == "favorite_laptop":
                 value = _clean_favorite_device(raw_value)
+            if key == "likes_code_examples":
+                value = _normalize_bool_preference(raw_value)
             if not value:
                 continue
             sentence = _structured_memory_to_sentences({key: value})[0]
@@ -541,19 +941,44 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
                     "kind": "structured",
                     "field": key,
                     "ts": timestamp,
+                    "access_count": 0,
+                    "last_accessed": timestamp,
                 },
             )
 
-        for key in ["interests", "likes", "projects", "travel_plans"]:
+        for key in [
+            "favorite_tools",
+            "learning_preferences",
+            "interests",
+            "likes",
+            "projects",
+            "travel_plans",
+            "recent_topics",
+            "goals",
+            "issues",
+            "skills",
+        ]:
             values = _normalize_list(memory.get(key) or [])
             if not values:
                 continue
-            if key == "interests":
+            if key == "favorite_tools":
+                sentence = f"You prefer using {', '.join(values)}."
+            elif key == "learning_preferences":
+                sentence = f"You prefer {', '.join(values)} for learning."
+            elif key == "interests":
                 sentence = f"You are interested in {', '.join(values)}."
             elif key == "likes":
                 sentence = f"You like {', '.join(values)}."
             elif key == "travel_plans":
                 sentence = f"You plan to go to {', '.join(values)}."
+            elif key == "recent_topics":
+                sentence = f"You recently discussed {', '.join(values)}."
+            elif key == "goals":
+                sentence = f"Your goals include {', '.join(values)}."
+            elif key == "issues":
+                sentence = f"You are dealing with {', '.join(values)}."
+            elif key == "skills":
+                sentence = f"You have experience with {', '.join(values)}."
             else:
                 sentence = f"You worked on {', '.join(values)}."
 
@@ -568,11 +993,14 @@ def _store_structured_memory(user_id: str, memory: dict) -> None:
                     "kind": "structured",
                     "field": key,
                     "ts": timestamp,
+                    "access_count": 0,
+                    "last_accessed": timestamp,
                 },
             )
 
 
 def _store_explicit_memory(user_id: str, text: str) -> None:
+    # Store explicit user notes as unstructured LTM.
     if not _ensure_memory_store():
         return
     value = str(text or "").strip()
@@ -590,11 +1018,14 @@ def _store_explicit_memory(user_id: str, text: str) -> None:
                 "embedding": _embed_text(value),
                 "kind": "explicit",
                 "ts": datetime.utcnow().isoformat(),
+                "access_count": 0,
+                "last_accessed": datetime.utcnow().isoformat(),
             },
         )
 
 
 def _search_memory_texts(texts: list[str], query: str, k: int) -> list[str]:
+    # Rank raw memory texts by embedding similarity.
     if not texts:
         return []
     query_vec = _embed_text(query)
@@ -607,11 +1038,68 @@ def _search_memory_texts(texts: list[str], query: str, k: int) -> list[str]:
     return [text for _, text in scored[:k] if text]
 
 
+def _structured_entries_from_items(items: list) -> list[dict]:
+    # Convert stored structured items into retrieval-ready entries.
+    entries = []
+    for item in items:
+        value = getattr(item, "value", {}) or {}
+        if value.get("kind") != "structured":
+            continue
+        field = value.get("field") or ""
+        key = getattr(item, "key", "")
+        if not field and isinstance(key, str) and key.startswith("structured:"):
+            field = key.split(":", 1)[1]
+        sentence = str(value.get("sentence") or "").strip()
+        data = value.get("data")
+        text = sentence or str(data or "").strip()
+        if not text:
+            continue
+        entries.append({"item": item, "text": text, "field": field, "kind": "structured", "value": value})
+    return entries
+
+
+def _unstructured_entries_from_items(items: list) -> list[dict]:
+    # Convert unstructured items into retrieval-ready entries.
+    entries = []
+    for item in items:
+        value = getattr(item, "value", {}) or {}
+        kind = value.get("kind")
+        if kind in {"structured", "summary"}:
+            continue
+        data = value.get("data")
+        text = str(data or "").strip()
+        if not text:
+            continue
+        entries.append({"item": item, "text": text, "field": "", "kind": kind or "", "value": value})
+    return entries
+
+
+def _rank_memory_entries(entries: list[dict], query: str, k: int) -> list[dict]:
+    # Rank entries using similarity plus usage/decay weighting.
+    if not entries:
+        return []
+    query_vec = _embed_text(query) if query else []
+    scored = []
+    for entry in entries:
+        text = entry.get("text", "")
+        if not text:
+            continue
+        sim = _cosine_similarity(query_vec, _embed_text(text)) if query_vec else 0.0
+        weight = _memory_weight(entry.get("value", {}), entry.get("kind", ""), entry.get("field", ""), text)
+        score = sim + (LTM_USAGE_BOOST * weight)
+        scored.append((score, weight, entry))
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [entry for _, __, entry in scored[:k]]
+
+
 def _normalize_memory_text(text: str) -> str:
+    # Normalize text for de-duplication comparisons.
     return re.sub(r"\s+", " ", str(text).strip().lower())
 
 
 def _dedupe_memory_list(items: list[str]) -> list[str]:
+    # Remove near-duplicate strings from a memory list.
     seen = set()
     result = []
     for item in items:
@@ -624,6 +1112,7 @@ def _dedupe_memory_list(items: list[str]) -> list[str]:
 
 
 def _memory_matches_query(text: str, query: str) -> bool:
+    # Heuristic filter to select memory relevant to a self-query.
     q = query.lower()
     t = text.lower()
 
@@ -652,11 +1141,26 @@ def _memory_matches_query(text: str, query: str) -> bool:
         return "name is" in t
     if "study" in q or "education" in q:
         return "stud" in t or "education" in t
+    if "role" in q or "profession" in q:
+        return "role" in t
+    if "location" in q or "where" in q or "city" in q:
+        return "based in" in t or "location" in t
+    if "tone" in q or "style" in q:
+        return "tone" in t or "responses" in t
+    if "goal" in q:
+        return "goal" in t
+    if "skill" in q:
+        return "experience" in t or "skill" in t
+    if "project" in q:
+        return "worked on" in t or "project" in t
+    if "issue" in q or "bug" in q:
+        return "dealing with" in t or "issue" in t
 
     return True
 
 
 def _normalize_degree_text(text: str) -> str:
+    # Normalize common degree abbreviations.
     value = text
     value = re.sub(r"\b(studying|doing)\s+B\.\b", r"\1 B.E.", value, flags=re.IGNORECASE)
     value = re.sub(r"\bB\.E\.E\b", "B.E.", value, flags=re.IGNORECASE)
@@ -667,7 +1171,31 @@ def _normalize_degree_text(text: str) -> str:
     return value
 
 
+def _clean_simple_value(value: str) -> str:
+    # Trim and normalize a simple string field.
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" .,")
+
+
+def _normalize_bool_preference(value) -> str:
+    # Normalize boolean-like preferences to "true"/"false" strings.
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "y"}:
+        return "true"
+    if text in {"false", "no", "n"}:
+        return "false"
+    return ""
+
+
 def _clean_age_value(value: str) -> str:
+    # Extract a clean numeric age value from text.
     text = str(value or "").strip()
     if not text:
         return ""
@@ -676,6 +1204,7 @@ def _clean_age_value(value: str) -> str:
 
 
 def _clean_favorite_color(value: str) -> str:
+    # Normalize a color preference string.
     text = str(value or "").strip()
     if not text:
         return ""
@@ -684,6 +1213,7 @@ def _clean_favorite_color(value: str) -> str:
 
 
 def _clean_name_value(value: str) -> str:
+    # Clean and constrain a parsed name value.
     text = str(value or "").strip()
     if not text:
         return ""
@@ -701,6 +1231,7 @@ def _clean_name_value(value: str) -> str:
 
 
 def _clean_favorite_language(value: str) -> str:
+    # Normalize a programming language label.
     text = str(value or "").strip()
     if not text:
         return ""
@@ -711,6 +1242,7 @@ def _clean_favorite_language(value: str) -> str:
 
 
 def _clean_favorite_device(value: str) -> str:
+    # Normalize a device or laptop preference string.
     text = str(value or "").strip()
     if not text:
         return ""
@@ -719,12 +1251,14 @@ def _clean_favorite_device(value: str) -> str:
 
 
 def _is_explicit_remember(text: str) -> bool:
+    # Detect whether the user explicitly asked to remember something.
     if not text:
         return False
     return bool(re.search(r"\b(remember|save)\b", text, re.IGNORECASE))
 
 
 def _extract_explicit_remember_text(text: str) -> str:
+    # Extract the payload after "remember" or "save" prompts.
     if not text:
         return ""
     cleaned = str(text).strip()
@@ -745,6 +1279,7 @@ def _extract_explicit_remember_text(text: str) -> str:
 
 
 def _format_memory_item(text: str, name: str) -> str:
+    # Format memory text into user-facing sentences.
     value = _normalize_degree_text(str(text).strip())
     value = re.sub(r"\bgo to go\b", "go to", value, flags=re.IGNORECASE)
     value = value.replace("B.E..", "B.E.")
@@ -789,6 +1324,7 @@ def _format_memory_item(text: str, name: str) -> str:
 
 
 def _memory_display_key(text: str, name: str) -> str:
+    # Build a normalized key for de-duping display lines.
     value = text.lower().strip()
     if name:
         value = value.replace(name.lower(), "")
@@ -800,6 +1336,7 @@ def _memory_display_key(text: str, name: str) -> str:
 
 
 def _memory_priority(text: str) -> int:
+    # Assign a rough priority score for unstructured memory.
     t = text.lower()
     if "user's name" in t:
         return 5
@@ -813,11 +1350,89 @@ def _memory_priority(text: str) -> int:
 
 
 def _parse_memory_ts(value: dict) -> str:
+    # Extract the timestamp string from a stored memory item.
     ts = value.get("ts") if isinstance(value, dict) else None
     return str(ts or "")
 
 
+def _parse_ts_to_datetime(value: str) -> datetime | None:
+    # Parse ISO timestamps into datetime objects.
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _days_since(ts_value: str) -> float | None:
+    # Compute days since a timestamp string.
+    dt = _parse_ts_to_datetime(ts_value)
+    if dt is None:
+        return None
+    return (datetime.utcnow() - dt).total_seconds() / 86400.0
+
+
+def _frequency_score(access_count: int) -> float:
+    # Convert access count into a bounded frequency score.
+    if access_count <= 0:
+        return 0.0
+    return min(1.0, math.log1p(access_count) / math.log1p(10))
+
+
+def _recency_score(ts_value: str) -> float:
+    # Convert timestamp recency into an exponential decay score.
+    if LTM_DECAY_DAYS <= 0:
+        return 1.0
+    days = _days_since(ts_value)
+    if days is None:
+        return 0.0
+    return math.exp(-days / max(1.0, float(LTM_DECAY_DAYS)))
+
+
+def _memory_weight(value: dict, kind: str, field: str, text: str) -> float:
+    # Combine importance, frequency, and recency into a final weight.
+    if kind == "structured" and field:
+        base = _importance_score_for_field(field)
+    else:
+        base = min(1.0, max(0.0, _memory_priority(text) / 5.0))
+
+    access_count = 0
+    if isinstance(value, dict):
+        access_count = int(value.get("access_count") or 0)
+        last_accessed = str(value.get("last_accessed") or value.get("ts") or "")
+    else:
+        last_accessed = ""
+
+    freq = _frequency_score(access_count)
+    recency = _recency_score(last_accessed)
+    weight = (LTM_WEIGHT_BASE * base) + (LTM_WEIGHT_FREQ * freq) + (LTM_WEIGHT_RECENCY * recency)
+    return max(0.0, min(1.0, weight))
+
+
+def _touch_memory_items(store, ns: tuple, items: list) -> None:
+    # Update access_count and last_accessed for retrieved items.
+    if not items:
+        return
+    now = datetime.utcnow().isoformat()
+    for item in items:
+        value = getattr(item, "value", {}) or {}
+        if value.get("kind") == "summary":
+            continue
+        key = getattr(item, "key", None)
+        if not key:
+            continue
+        updated = dict(value)
+        updated["access_count"] = int(updated.get("access_count") or 0) + 1
+        updated["last_accessed"] = now
+        try:
+            store.put(ns, key, updated)
+        except Exception:
+            continue
+
+
 def _prune_memory(user_id: str) -> None:
+    # Remove low-weight unstructured memories beyond the max limit.
     if not _ensure_memory_store():
         return
 
@@ -843,9 +1458,9 @@ def _prune_memory(user_id: str) -> None:
             if value.get("kind") == "structured":
                 continue
             text = value.get("data", "")
-            score = _memory_priority(text)
-            ts = _parse_memory_ts(value)
-            scored.append((score, ts, item))
+            weight = _memory_weight(value, value.get("kind") or "", value.get("field") or "", str(text))
+            ts = value.get("last_accessed") or _parse_memory_ts(value)
+            scored.append((weight, ts, item))
 
         scored.sort(key=lambda x: (x[0], x[1]))
         to_remove = scored[: max(0, len(scored) - LTM_MAX_ENTRIES)]
@@ -856,6 +1471,7 @@ def _prune_memory(user_id: str) -> None:
 
 
 def _embed_text(text: str) -> list[float]:
+    # Compute the embedding vector for a given text.
     try:
         return memory_embeddings.embed_query(text)
     except Exception:
@@ -863,6 +1479,7 @@ def _embed_text(text: str) -> list[float]:
 
 
 def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    # Compute cosine similarity between two vectors.
     if not vec_a or not vec_b:
         return 0.0
     a = np.array(vec_a, dtype=np.float32)
@@ -874,6 +1491,7 @@ def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
 
 
 def _latest_user_query(messages: list[BaseMessage]) -> str:
+    # Return the latest user message text from the message list.
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
             return msg.content
@@ -881,6 +1499,7 @@ def _latest_user_query(messages: list[BaseMessage]) -> str:
 
 
 def _is_self_query(query: str) -> bool:
+    # Check if the query is asking about the user.
     q = query.lower().strip()
     if not q:
         return False
@@ -905,6 +1524,7 @@ def _is_self_query(query: str) -> bool:
 
 
 def _extract_name_from_memory(memory_context: str) -> str:
+    # Extract a name from the memory context summary.
     match = re.search(r"name is ([A-Za-z][A-Za-z\s'-]{0,40})", memory_context, re.IGNORECASE)
     if not match:
         return ""
@@ -918,6 +1538,7 @@ def _extract_name_from_memory(memory_context: str) -> str:
 
 
 def _filter_messages_for_llm(messages: list[BaseMessage]) -> list[BaseMessage]:
+    # Remove tool/function messages before sending to the LLM.
     filtered = []
     for msg in messages:
         if isinstance(msg, AIMessage):
@@ -931,6 +1552,7 @@ def _filter_messages_for_llm(messages: list[BaseMessage]) -> list[BaseMessage]:
 
 
 def _split_list_terms(text: str) -> list[str]:
+    # Split comma/and-separated strings into a list.
     if not text:
         return []
     cleaned = re.sub(r"\s+", " ", text.strip())
@@ -941,6 +1563,7 @@ def _split_list_terms(text: str) -> list[str]:
 
 
 def _normalize_interest_list(values: list[str]) -> list[str]:
+    # Normalize interest phrases and de-duplicate.
     cleaned = []
     for item in values or []:
         raw = str(item).strip()
@@ -952,6 +1575,7 @@ def _normalize_interest_list(values: list[str]) -> list[str]:
 
 
 def _extract_stm_facts(messages: list[BaseMessage], exclude_latest: bool = True) -> list[str]:
+    # Build STM from recent user turns, with an LLM summary for older history when needed.
     if not messages:
         return []
 
@@ -991,6 +1615,7 @@ def _extract_stm_facts(messages: list[BaseMessage], exclude_latest: bool = True)
 
 
 def _get_user_memory_items(user_id: str, query: str) -> list[str]:
+    # Retrieve LTM items using intent-aware filtering, embedding similarity, and usage/decay weighting.
     if not _ensure_memory_store():
         return []
 
@@ -1003,42 +1628,57 @@ def _get_user_memory_items(user_id: str, query: str) -> list[str]:
         except Exception as err:
             print(f"LTM search warning: {err}")
             return []
-
-    if not items:
-        return []
-
-    structured = _structured_memory_from_items(items)
-    structured_texts = _structured_memory_to_sentences(structured)
-    unstructured_texts = []
-    for item in items:
-        value = getattr(item, "value", {}) or {}
-        kind = value.get("kind")
-        data = value.get("data")
-        if not data:
-            continue
-        if kind not in {"structured", "summary"}:
-            unstructured_texts.append(str(data))
-
-    unstructured_texts = _dedupe_memory_list([t for t in unstructured_texts if t])
-
-    if _is_self_query(query):
-        about_me = "about myself" in query.lower() or "about me" in query.lower()
-        if not structured_texts:
+        if not items:
             return []
-        if about_me:
-            return _dedupe_memory_list(structured_texts)
-        filtered = [item for item in structured_texts if _memory_matches_query(item, query)]
-        return _dedupe_memory_list(filtered or structured_texts)
 
-    candidates = structured_texts + unstructured_texts
-    if not candidates:
-        return []
-    if query:
-        return _search_memory_texts(candidates, query, LTM_TOP_K)
-    return candidates
+        structured_entries = _structured_entries_from_items(items)
+        unstructured_entries = _unstructured_entries_from_items(items)
+
+        intent = _classify_memory_intent(query)
+        if intent != "general" and intent != "about_user":
+            intent_fields = set(_fields_for_intent(intent))
+            structured_entries = [e for e in structured_entries if e.get("field") in intent_fields]
+
+        if _is_self_query(query):
+            about_me = "about myself" in query.lower() or "about me" in query.lower()
+            if not structured_entries:
+                return []
+            if about_me:
+                selected_entries = structured_entries
+            else:
+                selected_entries = [
+                    entry for entry in structured_entries if _memory_matches_query(entry.get("text", ""), query)
+                ]
+                if not selected_entries:
+                    selected_entries = structured_entries
+            _touch_memory_items(store, ns, [entry["item"] for entry in selected_entries])
+            return _dedupe_memory_list([entry.get("text", "") for entry in selected_entries if entry.get("text")])
+
+        candidates = structured_entries if intent != "general" else structured_entries + unstructured_entries
+        if not candidates:
+            return []
+
+        if query:
+            ranked = _rank_memory_entries(candidates, query, LTM_TOP_K)
+            _touch_memory_items(store, ns, [entry["item"] for entry in ranked])
+            return _dedupe_memory_list([entry.get("text", "") for entry in ranked if entry.get("text")])
+
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda entry: _memory_weight(
+                entry.get("value", {}),
+                entry.get("kind", ""),
+                entry.get("field", ""),
+                entry.get("text", ""),
+            ),
+            reverse=True,
+        )
+        _touch_memory_items(store, ns, [entry["item"] for entry in candidates_sorted])
+        return _dedupe_memory_list([entry.get("text", "") for entry in candidates_sorted if entry.get("text")])
 
 
 def _get_user_memory_context(user_id: str, query: str) -> str:
+    # Convert retrieved memory items into a prompt-ready bullet list.
     items = _get_user_memory_items(user_id, query)
     if not items:
         return ""
@@ -1046,6 +1686,7 @@ def _get_user_memory_context(user_id: str, query: str) -> str:
 
 
 def remember_node(state: dict):
+    # Extract structured facts from the latest user message and persist them into LTM.
     tools_count = 0
 
     if not _ensure_memory_store():
@@ -1107,6 +1748,7 @@ def remember_node(state: dict):
     has_facts = _memory_has_facts(parsed.get("memory", {}))
     should_write = bool(parsed.get("should_write")) or explicit_requested or has_facts
     incoming = parsed.get("memory", {}) if should_write else {}
+    incoming = _filter_by_importance(existing_structured, incoming, explicit_requested)
     merged = _merge_structured_memory(existing_structured, incoming)
 
     if merged and merged != existing_structured:
@@ -1118,6 +1760,7 @@ def remember_node(state: dict):
 
 
 def get_user_memory(user_id: str) -> list[str]:
+    # Return a combined list of structured and unstructured memory sentences.
     if not _ensure_memory_store():
         return []
 
@@ -1144,6 +1787,7 @@ def get_user_memory(user_id: str) -> list[str]:
 
 
 def get_user_memory_count(user_id: str) -> int:
+    # Count total stored memory items for a user.
     if not _ensure_memory_store():
         return 0
 
@@ -1161,6 +1805,7 @@ def get_user_memory_count(user_id: str) -> int:
 
 
 def cleanup_user_memory(user_id: str) -> int:
+    # Remove duplicate unstructured memory entries.
     if not _ensure_memory_store():
         return 0
 
@@ -1194,6 +1839,7 @@ def cleanup_user_memory(user_id: str) -> int:
 
 
 def clear_user_memory(user_id: str) -> int:
+    # Delete all memory items for a user.
     if not _ensure_memory_store():
         return 0
 
@@ -1218,6 +1864,7 @@ def clear_user_memory(user_id: str) -> int:
 
 
 def get_memory_status() -> dict:
+    # Report LTM availability and connection details.
     return {
         "available": _ensure_memory_store(),
         "last_error": memory_store_last_error,
