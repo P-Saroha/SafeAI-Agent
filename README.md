@@ -27,80 +27,79 @@ A beginner-friendly AI agent that combines deterministic tool routing, document-
 ```mermaid
 flowchart TD
     Start([User sends message]) --> Graph[LangGraph Entry]
-    Graph --> Remember[remember_node<br/>Extract facts with LLM]
-    
-    Remember --> Postgres{Postgres<br/>available?}
-    Postgres -->|Yes| SaveFacts[Save facts to<br/>PostgresStore LTM]
+    Graph --> Remember[remember_node\nExtract facts with LLM]
+
+    Remember --> Postgres{Postgres\navailable?}
+    Postgres -->|Yes| SaveFacts[Save facts to\nPostgresStore LTM]
     Postgres -->|No| Skip1[Skip LTM save]
     SaveFacts --> Chat
     Skip1 --> Chat
-    
-    Chat[chat_node<br/>Route & respond]
-    
+
+    Chat[chat_node\nRoute and respond]
+
     Chat --> CheckGreeting{is_greeting?}
-    CheckGreeting -->|Yes| ReturnGreeting[Return: Hello!]
+    CheckGreeting -->|Yes| ReturnGreeting[Reply: Hello!]
     CheckGreeting -->|No| CheckHITL
-    
-    CheckHITL{HITL pending<br/>& decision set?}
-    CheckHITL -->|Yes - Approve| HITLApprove[Retrieve weak context<br/>Answer anyway with LLM]
-    CheckHITL -->|Yes - Skip| HITLSkip[Return: Not enough info]
+
+    CheckHITL{HITL pending\nand decision set?}
+    CheckHITL -->|Approve| HITLApprove[Answer with weak\nRAG context]
+    CheckHITL -->|Skip| HITLSkip[Reply: Not enough info]
     CheckHITL -->|No| CheckSelf
-    
+
     CheckSelf{is_self_query?}
-    CheckSelf -->|Yes| LoadLTM[Load facts from<br/>PostgresStore]
-    LoadLTM --> ReturnMemory[Return: Here's what I know]
+    CheckSelf -->|Yes| LoadLTM[Load facts from\nPostgresStore]
+    LoadLTM --> ReturnMemory[Reply: Here is what I know]
     CheckSelf -->|No| CheckWeather
-    
+
     CheckWeather{is_weather_query?}
     CheckWeather -->|Yes| ExtractLoc[extract_weather_location]
-    ExtractLoc --> HasLoc{Location<br/>found?}
-    HasLoc -->|No| AskLoc[Return: Which city?]
-    HasLoc -->|Yes| CallWeather[call_weather<br/>OpenWeather API]
-    CallWeather --> WeatherFail{API success?}
-    WeatherFail -->|No| FallbackSearch[call_search<br/>DuckDuckGo fallback]
-    WeatherFail -->|Yes| FormatWeather[format_weather_response]
-    FallbackSearch --> ReturnWeather[Return: Weather + Sources]
+    ExtractLoc --> HasLoc{Location\nfound?}
+    HasLoc -->|No| AskLoc[Reply: Which city?]
+    HasLoc -->|Yes| CallWeather[call_weather\nOpenWeather API]
+    CallWeather --> WeatherOK{API success?}
+    WeatherOK -->|No| FallbackSearch[call_search\nDuckDuckGo fallback]
+    WeatherOK -->|Yes| FormatWeather[format_weather_response]
+    FallbackSearch --> ReturnWeather[Reply: Weather plus Sources]
     FormatWeather --> ReturnWeather
     CheckWeather -->|No| CheckTime
-    
+
     CheckTime{is_time_query?}
-    CheckTime -->|Yes| CallTime[call_datetime<br/>System clock]
-    CallTime --> ReturnTime[Return: Date/Time + Sources]
+    CheckTime -->|Yes| CallTime[call_datetime\nSystem clock]
+    CallTime --> ReturnTime[Reply: Date and Time]
     CheckTime -->|No| CheckNews
-    
+
     CheckNews{is_news_query?}
-    CheckNews -->|Yes| CallNews[call_search<br/>DuckDuckGo]
-    CallNews --> FormatNews[format_search_response]
-    FormatNews --> ReturnNews[Return: Top results + Sources]
+    CheckNews -->|Yes| CallNews[call_search\nDuckDuckGo]
+    CallNews --> ReturnNews[Reply: Top results plus Sources]
     CheckNews -->|No| CheckStock
-    
+
     CheckStock{is_stock_query?}
     CheckStock -->|Yes| ExtractSymbol[extract_stock_symbol]
-    ExtractSymbol --> HasSymbol{Symbol<br/>found?}
-    HasSymbol -->|No| AskSymbol[Return: Need ticker/company]
-    HasSymbol -->|Yes| CallStock[call_stock<br/>Yahoo Finance]
-    CallStock --> ReturnStock[Return: Price + Sources]
+    ExtractSymbol --> HasSymbol{Symbol\nfound?}
+    HasSymbol -->|No| AskSymbol[Reply: Need ticker or company]
+    HasSymbol -->|Yes| CallStock[call_stock\nYahoo Finance]
+    CallStock --> ReturnStock[Reply: Price plus Sources]
     CheckStock -->|No| CheckDocs
-    
-    CheckDocs{has_documents<br/>in thread?}
-    CheckDocs -->|Yes| GetRAG[get_rag_context<br/>FAISS retrieval]
-    GetRAG --> CheckDocIntent{is_document_question<br/>& context < 200 chars?}
-    CheckDocIntent -->|Yes - Low confidence| PauseHITL[Set awaiting_hitl=True<br/>Save to SqliteSaver]
-    PauseHITL --> ReturnHITL[Return: Warning + Ask approval]
-    CheckDocIntent -->|No - Good context| BuildRAGPrompt[Build system prompt<br/>with RAG context + citations]
-    BuildRAGPrompt --> GetSTM1[get_recent_messages<br/>Last 12 messages STM]
-    GetSTM1 --> InvokeLLM1[llm.invoke with<br/>RAG context]
-    InvokeLLM1 --> ReturnRAG[Return: Answer with [1][2] cites]
-    
-    CheckDocs -->|No| GetLTM[get_memory_as_text<br/>Load user facts from Postgres]
-    GetLTM --> HasMemory{Memory<br/>exists?}
-    HasMemory -->|Yes| BuildMemPrompt[Build system prompt<br/>with LTM context]
-    HasMemory -->|No| BuildBasicPrompt[Build basic<br/>system prompt]
-    BuildMemPrompt --> GetSTM2[get_recent_messages<br/>Last 12 messages STM]
+
+    CheckDocs{has_documents\nin thread?}
+    CheckDocs -->|Yes| GetRAG[get_rag_context\nFAISS retrieval top-4 chunks]
+    GetRAG --> CheckConf{Document question\nand context under 200 chars?}
+    CheckConf -->|Yes - Low confidence| PauseHITL[Set awaiting_hitl = True\nSave state to SqliteSaver]
+    PauseHITL --> ReturnHITL[Reply: Warning plus Ask approval]
+    CheckConf -->|No - Good context| BuildRAGPrompt[Build prompt with\nRAG context and citations]
+    BuildRAGPrompt --> GetSTM1[get_recent_messages\nLast 12 messages STM]
+    GetSTM1 --> InvokeLLM1[llm.invoke\nGemini 2.5 Flash]
+    InvokeLLM1 --> ReturnRAG[Reply: Answer with citations]
+
+    CheckDocs -->|No| GetLTM[get_memory_as_text\nLoad user facts from Postgres]
+    GetLTM --> HasMemory{Memory\nexists?}
+    HasMemory -->|Yes| BuildMemPrompt[Build prompt with\nLTM context]
+    HasMemory -->|No| BuildBasicPrompt[Build basic\nsystem prompt]
+    BuildMemPrompt --> GetSTM2[get_recent_messages\nLast 12 messages STM]
     BuildBasicPrompt --> GetSTM2
-    GetSTM2 --> InvokeLLM2[llm.invoke<br/>Gemini 2.5 Flash]
-    InvokeLLM2 --> ReturnLLM[Return: Plain LLM answer]
-    
+    GetSTM2 --> InvokeLLM2[llm.invoke\nGemini 2.5 Flash]
+    InvokeLLM2 --> ReturnLLM[Reply: Plain LLM answer]
+
     ReturnGreeting --> End([END])
     HITLApprove --> End
     HITLSkip --> End
@@ -111,53 +110,51 @@ flowchart TD
     ReturnNews --> End
     AskSymbol --> End
     ReturnStock --> End
-    ReturnHITL --> FrontendHITL[Streamlit Frontend<br/>Shows Approve/Skip buttons]
-    FrontendHITL -.Human clicks.-> ResumeGraph[Graph resumes with<br/>hitl_decision]
+    ReturnHITL --> FrontendHITL[Streamlit shows\nApprove and Skip buttons]
+    FrontendHITL -. Human clicks .-> ResumeGraph[Graph resumes\nwith hitl_decision set]
     ResumeGraph --> CheckHITL
     ReturnRAG --> End
     ReturnLLM --> End
-    
-    End --> SaveCheckpoint[(SqliteSaver<br/>Save conversation state)]
+
+    End --> SaveCheckpoint[(SqliteSaver\nSave full conversation state)]
     SaveCheckpoint --> Done([Response shown to user])
-    
-    style Remember fill:#e1f5ff
-    style Chat fill:#fff4e1
-    style PauseHITL fill:#ffe1e1
-    style FrontendHITL fill:#ffe1e1
-    style Postgres fill:#e8f5e9
-    style SaveFacts fill:#e8f5e9
-    style LoadLTM fill:#e8f5e9
-    style GetLTM fill:#e8f5e9
-    style GetRAG fill:#f3e5f5
-    style SaveCheckpoint fill:#f3e5f5
+
+    style Remember fill:#dbeafe
+    style Chat fill:#fef9c3
+    style PauseHITL fill:#fee2e2
+    style FrontendHITL fill:#fee2e2
+    style ResumeGraph fill:#fee2e2
+    style Postgres fill:#dcfce7
+    style SaveFacts fill:#dcfce7
+    style LoadLTM fill:#dcfce7
+    style GetLTM fill:#dcfce7
+    style GetRAG fill:#f3e8ff
+    style SaveCheckpoint fill:#f3e8ff
 ```
 
 ---
 
 ## What is HITL (Human-In-The-Loop)?
 
-Normally the bot answers automatically. But what if your uploaded document doesn't actually contain the answer? The bot could hallucinate a wrong answer confidently.
+Normally the bot answers automatically. But what if the uploaded document doesn't actually contain the answer? The bot could give a confidently wrong answer — that's called hallucination.
 
-**HITL prevents this:**
+**HITL prevents this by pausing the agent when it is not confident:**
 
-```
-User asks a document question
-        ↓
-Bot searches the document → finds very little context (< 200 chars)
-        ↓
-Instead of guessing → Bot PAUSES and asks:
-"I found very little in your document. Should I try anyway?"
-        ↓
-Human clicks "Yes, try to answer" or "No, skip"
-        ↓
-Bot resumes with the human's decision
-```
+1. User asks a question about an uploaded document
+2. Bot searches the document with FAISS and finds very little context (under 200 characters)
+3. Instead of guessing, the bot **pauses** and shows a warning in the UI
+4. Human clicks **"Yes, try to answer"** or **"No, skip"**
+5. Bot resumes with the human's decision
 
-**How it works technically:**
-- `chat_node` sets `awaiting_hitl = True` in the LangGraph state.
-- The SqliteSaver checkpointer saves this state to disk.
-- The Streamlit frontend reads the state, hides the chat input, and shows approval buttons.
-- When the human clicks, the graph resumes with `hitl_decision = "approve"` or `"skip"`.
+**How it works in the code:**
+
+| Step | What happens |
+|---|---|
+| Low context detected | `chat_node` sets `awaiting_hitl = True` in `ChatState` |
+| State saved | `SqliteSaver` writes the full state (including the flag) to SQLite on disk |
+| UI detects the pause | `get_thread_hitl_state()` reads the state — frontend hides chat input, shows buttons |
+| Human decides | Clicking a button sends `hitl_decision = "approve"` or `"skip"` back to the graph |
+| Graph resumes | `chat_node` reads `hitl_decision` and acts accordingly |
 
 ---
 
