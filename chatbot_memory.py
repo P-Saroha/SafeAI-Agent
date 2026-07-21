@@ -271,6 +271,49 @@ def get_memory_status() -> dict:
     }
 
 
+def generate_recap_greeting(user_id: str) -> str:
+    """
+    Generate a personalized welcome-back message using the user's stored LTM facts.
+
+    Example output:
+      "Welcome back, Sara! Last time you were working on your AI chatbot project.
+       What are we working on today?"
+
+    Returns an empty string if no facts are stored (so we can skip showing it
+    for first-time users).
+    """
+    facts = _load_memory(user_id)
+    if not facts:
+        return ""  # First-time user — no recap to show
+
+    # Build a short readable summary of what we know
+    fact_lines = "\n".join(f"- {k}: {v}" for k, v in facts.items() if v)
+
+    try:
+        response = _memory_llm.invoke([
+            SystemMessage(content=(
+                "You are a friendly AI assistant greeting a returning user. "
+                "Using the stored facts below, write a short warm welcome-back message "
+                "(2-3 sentences max). "
+                "Mention their name if known, reference something specific like their "
+                "current project, goals, or interests. "
+                "End with a question like 'What are we working on today?' or "
+                "'What can I help you with today?'. "
+                "Do NOT list all facts — just pick 1-2 natural highlights. "
+                "Keep it conversational, not robotic."
+            )),
+            HumanMessage(content=f"User facts:\n{fact_lines}"),
+        ])
+        greeting = str(response.content).strip()
+        return greeting if greeting else ""
+    except Exception:
+        # Fallback to a simple name-based greeting if LLM call fails
+        name = facts.get("name", "")
+        if name:
+            return f"Welcome back, {name}! What can I help you with today?"
+        return "Welcome back! What can I help you with today?"
+
+
 def is_self_query(query: str) -> bool:
     """Return True if the user is asking about themselves or their stored info."""
     q = query.lower().strip()

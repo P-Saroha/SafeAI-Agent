@@ -30,6 +30,7 @@ from chatbotBackend import (
 )
 from chatbot_memory import (
     clear_memory,
+    generate_recap_greeting,
     get_memory_count,
     get_memory_list,
     get_memory_status,
@@ -196,6 +197,30 @@ if st.sidebar.button("🔄 Rebuild RAG Index"):
         msg = rebuild_rag_index(st.session_state["thread_id"])
     st.sidebar.success(msg)
 
+# ── Export Chat ──────────────────────────────────────────────────────────
+# Converts the current conversation into a Markdown file the user can download.
+# Each message is formatted as "**user:** ..." or "**assistant:** ..."
+st.sidebar.header("Export")
+if st.session_state.get("messages"):
+    # Build the markdown content
+    title = st.session_state["thread_titles"].get(
+        st.session_state["thread_id"], "Chat Export"
+    )
+    lines = [f"# {title}\n"]
+    for msg in st.session_state["messages"]:
+        role_label = "**You**" if msg["role"] == "user" else "**Assistant**"
+        lines.append(f"{role_label}:\n{msg['content']}\n")
+    export_text = "\n---\n".join(lines)
+
+    st.sidebar.download_button(
+        label="⬇️ Download chat as .md",
+        data=export_text,
+        file_name=f"{title.replace(' ', '_')}.md",
+        mime="text/markdown",
+    )
+else:
+    st.sidebar.caption("No messages to export yet.")
+
 # ── Memory section ──────────────────────────────────────────────────────
 st.sidebar.header("Long-Term Memory")
 mem_status = get_memory_status()
@@ -264,6 +289,29 @@ st.caption("Upload PDF, TXT, or MD files using the paperclip icon in the chat in
 for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+
+# ── Memory recap greeting ────────────────────────────────────────────────
+# When a chat is empty (new chat) and the user has stored LTM facts,
+# show a personalized welcome-back message so they know the bot remembers them.
+# We store it in session_state so it only generates once per new chat,
+# not on every page re-render.
+if not st.session_state["messages"]:
+    if "recap_shown_for" not in st.session_state:
+        st.session_state["recap_shown_for"] = None
+
+    current_tid = st.session_state["thread_id"]
+
+    # Only generate once per thread (avoid re-running on every Streamlit rerun)
+    if st.session_state["recap_shown_for"] != current_tid:
+        recap = generate_recap_greeting(user_id)
+        st.session_state["recap_shown_for"] = current_tid
+        st.session_state["recap_greeting"] = recap
+    else:
+        recap = st.session_state.get("recap_greeting", "")
+
+    if recap:
+        with st.chat_message("assistant"):
+            st.markdown(recap)
 
 # ── HITL Approval UI ────────────────────────────────────────────────────
 # When the bot is not confident about a document answer, it pauses and
