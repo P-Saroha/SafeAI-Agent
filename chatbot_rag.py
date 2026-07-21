@@ -36,6 +36,11 @@ try:
 except ImportError:
     GOOGLE_EMBEDDINGS_AVAILABLE = False
 
+try:
+    from langchain_core.embeddings import Embeddings
+except ImportError:
+    from langchain.embeddings.base import Embeddings
+
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
@@ -85,22 +90,22 @@ def _get_embeddings():
     return _HashEmbeddings()
 
 
-class _HashEmbeddings:
+class _HashEmbeddings(Embeddings):
     """
-    A very simple embedding model that works offline with no API key.
-    It converts text into a vector using word hashes.
-    Good enough for small document sets.
+    A simple offline embedding model — no API key needed.
+    Inherits from LangChain's Embeddings base class so FAISS accepts it.
+    Converts text to a fixed-size vector using word hashes.
     """
 
-    DIM = 384  # vector size
+    DIM = 384
 
     def _embed(self, text: str) -> list[float]:
-        import hashlib, numpy as np
+        import hashlib
+        import numpy as np
         vec = [0.0] * self.DIM
         for word in text.lower().split():
             idx = int(hashlib.sha256(word.encode()).hexdigest(), 16) % self.DIM
             vec[idx] += 1.0
-        # Normalize so all vectors have length 1
         norm = sum(v * v for v in vec) ** 0.5
         return [v / norm for v in vec] if norm > 0 else vec
 
