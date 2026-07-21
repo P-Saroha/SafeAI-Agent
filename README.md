@@ -21,6 +21,8 @@ A beginner-friendly AI agent that combines deterministic tool routing, document-
 | **Multi-thread chats** | Each conversation is isolated with its own documents and history |
 | **Chat export** | Download any conversation as a Markdown file |
 | **Memory recap** | Personalized welcome-back greeting on every new chat using your stored facts |
+| **Query Rewriting** | Detects vague queries ("what about that") and rewrites them to be specific ("What is the main topic?") using LLM |
+| **RAG Metrics** | Tracks retrieval quality with Hit Rate@K and Mean Reciprocal Rank (MRR) for production monitoring |
 
 ---
 
@@ -34,7 +36,11 @@ flowchart TD
     C -->|Greeting| G[Reply: Hello!]
     C -->|Self query| M[Read LTM from Postgres\nReturn stored facts]
     C -->|Weather / Time\nNews / Stock| T[Tool Call\nOpenWeather · DuckDuckGo\nYahoo Finance · Clock]
-    C -->|Has documents| D{RAG Retrieval\nFAISS top-4 chunks}
+    C -->|Has documents| QR[Query Rewriting\nis_ambiguous_query?]
+
+    QR -->|Ambiguous| RW[rewrite_query\nUse LLM to clarify]
+    QR -->|Clear| D{RAG Retrieval\nFAISS top-4 chunks}
+    RW --> D
 
     D -->|Low confidence| H[HITL Pause\nAsk human to Approve or Skip]
     H -->|Approved| L[LLM Answer with citations]
@@ -102,18 +108,107 @@ Instead of the LLM making up an answer, the bot first searches your uploaded doc
 
 ---
 
+## Query Rewriting explained
+
+Raw user queries can be ambiguous or vague. The chatbot automatically detects and clarifies them before RAG retrieval.
+
+**Examples:**
+- "what about it" → "What is the main topic discussed in the document?"
+- "tell me about that" → "Provide a detailed explanation of the key concepts"
+- "what does it say" → "What information is available in the document?"
+
+**How it works:**
+1. User query comes in
+2. `is_ambiguous_query()` checks for vague pronouns (it, that, this), vague verbs (tell, say, show), or very short queries
+3. If ambiguous → `rewrite_query()` uses Gemini to clarify it
+4. Rewritten query is used for RAG retrieval
+5. Better retrieval = better answers
+
+**Integration:**
+- Happens transparently in `chatbotBackend.py` line 318 via `get_rag_context_with_rewriting()`
+- Console shows: `[Rewrite] original → rewritten`
+
+---
+
+## RAG Metrics explained
+
+The chatbot tracks retrieval quality using industry-standard metrics:
+
+**Hit Rate@K** — What percentage of queries found the relevant document in the top-K results?
+- Hit Rate@5: 87% means 87% of test queries found the answer in top-5 chunks
+- Hit Rate@10: 95% includes larger result set
+- Shows retriever health
+
+**Mean Reciprocal Rank (MRR)** — On average, how high in the ranking does the relevant document appear?
+- MRR = 1.0 → perfect (relevant doc always at rank 1)
+- MRR = 0.5 → good (relevant doc typically at rank 2)
+- MRR = 0.33 → okay (relevant doc typically at rank 3)
+
+**Usage:**
+```python
+from chatbotBackend import run_rag_evaluation
+
+metrics = run_rag_evaluation(
+    thread_id="conversation-123",
+    test_queries=["What is Python?", "Explain machine learning"],
+    expected_sources=["python_guide.pdf", "ml_basics.pdf"]
+)
+# Outputs:
+# Hit Rate@5:  100.0%
+# Hit Rate@10: 100.0%
+# MRR:         0.50
+# Queries:     2
+```
+
+---
+
+## Complete Chat Flow Diagram
+
+```mermaid
+flowchart TD
+    U[User Query] --> R[remember_node<br/>Auto-save facts to LTM]
+    R --> C{chat_node<br/>Route Intent}
+
+    C -->|Greeting| G["Reply: Hello!"]
+    C -->|Self query| M["Read LTM from Postgres<br/>Return stored facts"]
+    C -->|Weather / Time<br/>News / Stock| T["Tool Call<br/>OpenWeather · DuckDuckGo<br/>Yahoo Finance · Clock"]
+    C -->|Has documents| QR["Query Rewriting<br/>is_ambiguous_query?"]
+
+    QR -->|Ambiguous| RW["rewrite_query<br/>Use LLM to clarify"]
+    QR -->|Clear| D["D{RAG Retrieval<br/>FAISS top-4 chunks}"]
+    RW --> D
+
+    D -->|Low confidence| H["HITL Pause<br/>Ask human to Approve or Skip"]
+    H -->|Approved| L["LLM Answer<br/>with citations"]
+    H -->|Skipped| S["Reply: Not enough context"]
+    D -->|Good context| L
+
+    C -->|No match| L
+
+    T --> F["Formatted Answer<br/>with Sources"]
+    L --> F
+    G --> F
+    M --> F
+    S --> F
+    F --> DB[("SqliteSaver<br/>Save state to SQLite")]
+```
+
+---
+
 ## Project structure
 
 ```
 Chatbot/
-├── chatbotBackend.py     # Agent graph, chat_node, HITL logic, thread utilities
-├── chatbotFrontend.py    # Streamlit UI — chat, sidebar, HITL buttons, export, recap
-├── chatbot_memory.py     # STM + LTM memory — remember_node, recap greeting, Postgres store
-├── chatbot_rag.py        # FAISS index building, document loading, RAG retrieval
-├── chatbot_tools.py      # Tool functions (weather, search, stock, time) + intent detectors
-├── docker-compose.yml    # Postgres container for long-term memory
-├── knowledge_base/       # Uploaded documents, one subfolder per thread
-└── faiss_index/          # FAISS indexes, one subfolder per thread
+├── chatbotBackend.py            # Agent graph, chat_node, HITL logic, thread utilities
+├── chatbotFrontend.py           # Streamlit UI — chat, sidebar, HITL buttons, export, recap
+├── chatbot_memory.py            # STM + LTM memory — remember_node, recap greeting, Postgres store
+├── chatbot_rag.py               # FAISS index building, document loading, RAG retrieval
+├── chatbot_rag_metrics.py       # RAG evaluation metrics (Hit Rate@K, MRR)
+├── chatbot_query_rewriter.py    # Query ambiguity detection and LLM-based rewriting
+├── chatbot_tools.py             # Tool functions (weather, search, stock, time) + intent detectors
+├── docker-compose.yml           # Postgres container for long-term memory
+├── knowledge_base/              # Uploaded documents, one subfolder per thread
+└── faiss_index/                 # FAISS indexes, one subfolder per thread
 ```
 
 ---
@@ -197,9 +292,15 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 - **LangGraph agent design** — multi-node graph with stateful checkpointing
 - **Deterministic routing** — keyword-based intent detection before any LLM call
 - **RAG pipeline** — per-thread FAISS indexes, chunking, citation-aware retrieval
+- **Query rewriting** — ambiguity detection via heuristics, LLM-based clarification
+- **RAG evaluation** — Hit Rate@K and MRR metrics for production monitoring
 - **Memory architecture** — STM vs LTM design, auto-extraction via LLM
 - **HITL pattern** — graph interruption, state persistence, human approval flow
 - **Personalization** — LTM-powered recap greeting on every new session
 - **User experience** — chat export to Markdown, streaming responses, file upload
 - **Error handling** — API fallbacks (OpenWeather → DuckDuckGo), graceful degradation
 - **Streamlit UI** — multi-thread management, sidebar controls, download button
+
+---
+
+

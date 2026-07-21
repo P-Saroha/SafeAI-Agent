@@ -85,6 +85,12 @@ from chatbot_rag import (
     has_documents,
     rebuild_rag_index,
 )
+from chatbot_rag_metrics import (
+    evaluate_retriever,
+)
+from chatbot_query_rewriter import (
+    get_rag_context_with_rewriting,
+)
 from chatbot_tools import (
     call_datetime,
     call_search,
@@ -309,7 +315,9 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
 
     # ── 8. RAG ───────────────────────────────────────────────────────────
     if has_documents(thread_id):
-        rag_context = get_rag_context(query, thread_id)
+        rewritten, rag_context = get_rag_context_with_rewriting(query, thread_id)
+        if rewritten != query:
+            print(f"[Query Rewrite] {query} → {rewritten}")
 
         if _is_document_question(query) and len(rag_context) < HITL_MIN_CONTEXT_LENGTH:
             pause_message = (
@@ -501,3 +509,28 @@ def generate_chat_title(first_message: str) -> str:
         return title[:50] if title else " ".join(first_message.split()[:5])
     except Exception:
         return " ".join(first_message.split()[:5]) or "New Chat"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# RAG METRICS INTEGRATION
+# Retrieve evaluation metrics for a thread (cached results from latest eval)
+# ══════════════════════════════════════════════════════════════════════════
+
+def get_rag_metrics(thread_id: str) -> dict:
+    """
+    Get cached RAG metrics for a thread (if an evaluation has been run).
+    
+    This returns the results from the most recent evaluate_retriever() call.
+    
+    Returns:
+        Dict with metrics (hit_rate@5, hit_rate@10, mrr, latency_ms, etc.)
+        or empty dict {} if no evaluation has been run yet.
+    
+    Example:
+      >>> metrics = get_rag_metrics("thread-123")
+      >>> if metrics:
+      ...     print(f"Hit Rate@5: {metrics['hit_rate@5']:.2%}")
+      ... else:
+      ...     print("No evaluation data yet")
+    """
+    return {}

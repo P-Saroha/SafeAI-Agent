@@ -171,7 +171,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
             vectorstore = FAISS.load_local(
                 str(index_dir), embeddings, allow_dangerous_deserialization=True
             )
-            return vectorstore.as_retriever(search_kwargs={"k": 4})
+            return vectorstore.as_retriever(search_kwargs={"k": 10})
         except Exception as e:
             print(f"Could not load FAISS index, rebuilding: {e}")
 
@@ -195,7 +195,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     index_dir.mkdir(parents=True, exist_ok=True)
     vectorstore.save_local(str(index_dir))
 
-    return vectorstore.as_retriever(search_kwargs={"k": 4})
+    return vectorstore.as_retriever(search_kwargs={"k": 10})
 
 
 def rebuild_rag_index(thread_id: str) -> str:
@@ -210,13 +210,37 @@ def rebuild_rag_index(thread_id: str) -> str:
     return "RAG index rebuild failed — no documents found or load error."
 
 
-def get_rag_context(query: str, thread_id: str) -> str:
+def _extract_filename_from_query(query: str, thread_id: str) -> str:
+    """
+    Check if the user mentioned a specific filename in their query.
+    Returns the matching filename if found, empty string otherwise.
+
+    Examples:
+      "give me summary of A2_Solution.pdf"  -> "A2_Solution.pdf"
+      "what does notes.txt say"             -> "notes.txt"
+      "summarize everything"                -> ""
+    """
+    files = _get_supported_files(_safe_id(thread_id))
+    q_lower = query.lower()
+    for f in files:
+        # Match full filename (e.g. "a2_solution.pdf") or stem only (e.g. "a2_solution")
+        if f.name.lower() in q_lower or f.stem.lower() in q_lower:
+            return f.name
+    return ""
+
+
+def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> str:
     """
     Search the document index and return the most relevant text chunks.
 
+    If the user mentioned a specific filename (e.g. "summarize A2_Solution.pdf"),
+    only chunks from that file are returned — so the answer won't mix in other docs.
+
+    If no filename is mentioned, returns the top-4 most relevant chunks from all docs.
+
     The result is formatted like:
       [1] filename.pdf (page 1): ... chunk text ...
-      [2] notes.txt: ... chunk text ...
+      [2] filename.pdf (page 2): ... chunk text ...
 
     These [1], [2] tags are used as citations in the final answer.
     Returns an empty string if no documents are indexed.
@@ -225,6 +249,13 @@ def get_rag_context(query: str, thread_id: str) -> str:
         return ""
 
     tid = _safe_id(thread_id)
+
+    # Auto-detect filename from query if not explicitly passed
+    if not filename_filter:
+        filename_filter = _extract_filename_from_query(query, tid)
+
+    if filename_filter:
+        print(f"[RAG] filename filter active: {filename_filter}")
 
     # Build or reuse the cached retriever
     if tid not in _retriever_cache:
@@ -242,6 +273,17 @@ def get_rag_context(query: str, thread_id: str) -> str:
 
     if not docs:
         return ""
+
+    # Filter to only the requested file if one was detected
+    if filename_filter:
+        filtered = [
+            doc for doc in docs
+            if Path(str(doc.metadata.get("source", ""))).name.lower() == filename_filter.lower()
+        ]
+        # Keep top 4 from filtered; fall back to all docs only if filter returned nothing
+        docs = filtered[:4] if filtered else docs[:4]
+    else:
+        docs = docs[:4]
 
     snippets = []
     for i, doc in enumerate(docs, start=1):
