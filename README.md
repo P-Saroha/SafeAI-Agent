@@ -1,164 +1,200 @@
-# AI Chatbot (LangGraph + RAG + Tools)
+# AI Agent Chatbot
 
-A production-style chatbot that blends deterministic tool routing, LLM responses, and document-based RAG. It supports memory (short-term + long-term), real-time tools (weather, news, stock, time), and a Streamlit UI.
+**Stack:** Python · LangGraph · LangChain · Gemini 2.5 Flash · FAISS · PostgreSQL · Streamlit
 
-## Highlights
+A beginner-friendly AI agent that combines deterministic tool routing, document-based RAG, short/long-term memory, and Human-In-The-Loop (HITL) approval — all wired together with LangGraph.
 
-- Hybrid agent flow (rules + LLM tool gate) to choose the right tool at the right time
-- RAG over local documents with per-thread knowledge bases
-- Long-term memory backed by Postgres + short-term conversation memory
-- Deterministic formatting with sources for tool-driven answers
-- Real-time weather via OpenWeather API
-- Built-in HITL gating for low-confidence RAG answers
+---
 
-## Features
+## What it can do
 
-- **Tool routing**: rules for weather/news/stock/time, plus LLM-based fallback
-- **Weather tool**: OpenWeather current conditions, clean output format
-- **Search tool**: DuckDuckGo search with structured results + sources
-- **Stock tool**: Yahoo Finance pricing via `yfinance`
-- **Time tool**: local system time
-- **Memory**:
-  - Structured long-term memory (Postgres)
-  - Explicit remember support for user requests
-  - Short-term memory summary + last-N messages for active chat
-- **RAG**:
-  - Upload docs to `knowledge_base/`
-  - Per-thread FAISS index
-  - Citations for retrieved context
-- **Streamlit UI**:
-  - Conversation threads
-  - Tool trace
-  - RAG controls
+| Feature | Description |
+|---|---|
+| **Weather** | Real-time conditions via OpenWeather API, falls back to web search |
+| **News** | Latest headlines via DuckDuckGo |
+| **Stock price** | Live prices via Yahoo Finance |
+| **Date / Time** | Current system time |
+| **Document Q&A (RAG)** | Ask questions about your uploaded PDFs, TXT, or MD files |
+| **Long-term memory** | Remembers your name, skills, goals across sessions (Postgres) |
+| **Short-term memory** | Keeps the last 12 messages as conversation context |
+| **HITL approval** | Pauses and asks you before answering with low-confidence document context |
+| **Multi-thread chats** | Each conversation is isolated with its own documents and history |
 
-## Agent Workflow
+---
 
-The agent follows a deterministic flow with an LLM gate for tool usage:
+## How the agent works
 
-1) **Input normalization**: extract latest user query and thread context.
-2) **Memory prep**: load STM and LTM (skip memory injection for greetings).
-3) **RAG routing**: if document intent is detected, fetch RAG context.
-4) **Rule-based intent**: detect weather/news/stock/time quickly.
-5) **LLM tool gate**: decide if external data is required.
-6) **LLM router**: select the best tool when rules do not match.
-7) **Tool execution**: call one tool and stop in the same turn.
-8) **Fallbacks**: degrade gracefully if tool fails (weather -> search).
-9) **Response formatting**: structured bullets + Sources.
+Every user message flows through this graph:
 
-### Routing Logic (Simplified)
-
-- If weather/news/stock/time is detected -> call the specific tool.
-- Else if LLM says tools are needed -> route to best tool.
-- Else -> answer directly with the LLM.
-
-## Tools
-
-- `get_weather`: OpenWeather current conditions
-- `search_tool`: DuckDuckGo search for latest info
-- `get_stock_price`: Yahoo Finance via `yfinance`
-- `get_current_date_time`: local system time
-- `rag_search`: local knowledge base retrieval
-
-## Memory Flow
-
-- **STM (short-term memory)**: summary of older chat + last-N recent messages
-- **LTM (long-term memory)**: Postgres-backed structured user facts
-- **Explicit memory**: always saved when the user asks to remember
-
-The agent merges STM + LTM as context, but avoids memory injection for greetings.
-Self-queries like "about me" also include STM summary and last-N messages alongside LTM facts.
-
-## Mini Diagram
-
-```mermaid
-flowchart TD
-  U[User Query] --> N[Normalize and Thread Context]
-  N --> M[STM and LTM Memory Prep]
-  M --> D{Document Intent}
-  D -->|Yes| RAG[RAG Retrieval]
-  D -->|No| R[Rule-based Intent]
-  R -->|Weather News Stock Time| T[Tool Call]
-  R -->|No match| G[LLM Tool Gate]
-  G -->|No tool| L[LLM Answer]
-  G -->|Tool needed| RT[LLM Router]
-  RT --> T
-  T --> F[Formatted Answer with Sources]
-  RAG --> L
+```
+START → remember_node → chat_node → END
 ```
 
-## Quick Start
+- **remember_node** — runs first on every message. Asks the LLM to extract any new facts (name, skills, goals, etc.) and saves them to Postgres.
+- **chat_node** — decides how to respond, following this routing order:
 
-### 1) Install dependencies
+```
+1. Greeting?           → "Hello! How can I help?"
+2. HITL resume?        → act on human's approve/skip decision
+3. Self-query?         → return stored memory facts
+4. Weather question?   → call OpenWeather API
+5. Time question?      → return system clock
+6. News question?      → DuckDuckGo search
+7. Stock question?     → Yahoo Finance
+8. Has documents?
+   └─ Low confidence?  → PAUSE (HITL) and ask human to approve
+   └─ Good context?    → LLM answer with [1][2] citations
+9. Default             → plain LLM answer
+```
+
+---
+
+## What is HITL (Human-In-The-Loop)?
+
+Normally the bot answers automatically. But what if your uploaded document doesn't actually contain the answer? The bot could hallucinate a wrong answer confidently.
+
+**HITL prevents this:**
+
+```
+User asks a document question
+        ↓
+Bot searches the document → finds very little context (< 200 chars)
+        ↓
+Instead of guessing → Bot PAUSES and asks:
+"I found very little in your document. Should I try anyway?"
+        ↓
+Human clicks "Yes, try to answer" or "No, skip"
+        ↓
+Bot resumes with the human's decision
+```
+
+**How it works technically:**
+- `chat_node` sets `awaiting_hitl = True` in the LangGraph state.
+- The SqliteSaver checkpointer saves this state to disk.
+- The Streamlit frontend reads the state, hides the chat input, and shows approval buttons.
+- When the human clicks, the graph resumes with `hitl_decision = "approve"` or `"skip"`.
+
+---
+
+## Memory explained
+
+### Short-Term Memory (STM)
+The last 12 messages in the current conversation. Passed directly to the LLM so it remembers what was said earlier in the same chat. Gone when the session ends.
+
+### Long-Term Memory (LTM)
+User facts (name, education, interests, goals, skills, etc.) stored in Postgres. The `remember_node` runs on every message — it asks the LLM to extract any facts from the message and saves them. Persists across app restarts and different chat sessions.
+
+### SqliteSaver (conversation checkpointing)
+Every conversation's full state (messages, HITL flags, thread ID) is saved to a local SQLite file. This is what makes HITL possible — the `awaiting_hitl` flag survives page reloads.
+
+---
+
+## RAG (Retrieval-Augmented Generation) explained
+
+Instead of the LLM making up an answer, the bot first searches your uploaded document for relevant text, then passes that text to the LLM as context.
+
+- Each chat thread has its own `knowledge_base/<thread_id>/` folder.
+- Documents are chunked (1000 chars, 150 overlap) and indexed into a FAISS vector store.
+- Top-4 most relevant chunks are retrieved and formatted as `[1] filename.pdf (page 1): ...`
+- The LLM is instructed to cite `[1]`, `[2]`, etc. in its answer.
+- Embedding backend: Google `text-embedding-004` (or local hash embeddings as fallback — no API key needed).
+
+---
+
+## Project structure
+
+```
+Chatbot/
+├── chatbotBackend.py     # Agent graph, chat_node, HITL logic, thread utilities
+├── chatbotFrontend.py    # Streamlit UI — chat interface, sidebar, HITL buttons
+├── chatbot_memory.py     # STM + LTM memory — remember_node, Postgres store
+├── chatbot_rag.py        # FAISS index building, document loading, RAG retrieval
+├── chatbot_tools.py      # Tool functions (weather, search, stock, time) + intent detectors
+├── docker-compose.yml    # Postgres container for long-term memory
+├── knowledge_base/       # Uploaded documents, one subfolder per thread
+└── faiss_index/          # FAISS indexes, one subfolder per thread
+```
+
+---
+
+## Quick start
+
+### 1. Install dependencies
 
 ```bash
 pip install -r ../requirements.txt
 ```
 
-### 2) Configure environment
+### 2. Set up environment variables
 
-Create or update `.env` in the project root:
+Create a `.env` file in the project root:
 
-```
-GOOGLE_API_KEY=your_gemini_key
-OPENWEATHER_API_KEY=your_openweather_key
+```env
+GOOGLE_API_KEY=your_gemini_api_key
+OPENWEATHER_API_KEY=your_openweather_api_key
+
+# Optional — only needed for long-term memory
 LTM_POSTGRES_URI=postgresql://postgres:postgres@localhost:5442/postgres?sslmode=disable
+
+# Optional — use "google" for better RAG quality, "hash" works offline (default)
+RAG_EMBEDDING_BACKEND=hash
 ```
 
-### 3) Start Postgres (for long-term memory)
+### 3. Start Postgres (for long-term memory)
+
+Long-term memory requires Docker. If you skip this step, the app still works — LTM is just disabled.
 
 ```bash
 docker compose up -d
 ```
 
-### 4) Run the app
+### 4. Run the app
 
 ```bash
 streamlit run chatbotFrontend.py
 ```
 
-## Example Queries
+---
 
-- Weather: "today weather of Delhi"
-- News: "latest tech news"
-- Stock: "stock price of ORCL"
-- Time: "what is the time now"
-- RAG: "summarize the PDF I uploaded"
-- Memory: "tell me about myself"
-
-## Project Structure
+## Example queries
 
 ```
-Chatbot/
-  chatbotBackend.py       # Agent logic and routing
-  chatbotFrontend.py      # Streamlit UI
-  chatbot_memory.py       # LTM + STM memory logic
-  chatbot_rag.py          # RAG retrieval and index helpers
-  chatbot_tools.py        # Tool routing and tool helpers
-  knowledge_base/         # Uploaded docs for RAG
-  faiss_index/            # Per-thread FAISS indexes
-  docker-compose.yml      # Postgres for long-term memory
+"hello"                          → greeting
+"weather in Mumbai"              → OpenWeather tool
+"what time is it"                → system clock
+"latest AI news"                 → DuckDuckGo search
+"stock price of Apple"           → Yahoo Finance
+"what do you know about me"      → reads your stored LTM facts
+"my name is Sara, I like Python" → saves to LTM automatically
+"summarize the PDF I uploaded"   → RAG over your document
 ```
 
+---
 
+## Tech stack
 
-## This project demonstrates:
+| Layer | Technology |
+|---|---|
+| Agent framework | LangGraph |
+| LLM | Gemini 2.5 Flash (Google) |
+| UI | Streamlit |
+| Vector search | FAISS |
+| Embeddings | Google text-embedding-004 / Hash fallback |
+| Long-term memory | PostgreSQL via `langgraph.store.postgres` |
+| Short-term memory | Last-N messages (in-context) |
+| Conversation state | SqliteSaver (LangGraph) |
+| Web search | DuckDuckGo (`ddgs`) |
+| Stock data | Yahoo Finance (`yfinance`) |
+| Weather | OpenWeather API |
 
-- Applied LLM engineering (routing + tool usage + structured outputs)
-- RAG design with local docs and citations
-- Memory management (short-term vs long-term, auto-memory)
-- Production concerns (tool errors, fallbacks, HITL gating)
+---
 
-## Tech Stack
+## Skills demonstrated
 
-- LangGraph, LangChain
-- Streamlit UI
-- FAISS for vector search
-- Postgres for long-term memory
-- OpenWeather API for real-time weather
-- DuckDuckGo Search + Yahoo Finance
-
-## Roadmap Ideas
-
-- Add unit tests for tool routing and memory
-- Add deployment recipe (Docker + Streamlit Cloud)
-- Add structured evals for RAG correctness
+- **LangGraph agent design** — multi-node graph with stateful checkpointing
+- **Deterministic routing** — keyword-based intent detection before any LLM call
+- **RAG pipeline** — per-thread FAISS indexes, chunking, citation-aware retrieval
+- **Memory architecture** — STM vs LTM design, auto-extraction via LLM
+- **HITL pattern** — graph interruption, state persistence, human approval flow
+- **Error handling** — API fallbacks (OpenWeather → DuckDuckGo), graceful degradation
+- **Streamlit UI** — streaming responses, file upload, multi-thread management
