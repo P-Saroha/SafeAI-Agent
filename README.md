@@ -22,114 +22,31 @@ A beginner-friendly AI agent that combines deterministic tool routing, document-
 
 ---
 
-## Architecture Flowchart
+## Agent Workflow
 
 ```mermaid
 flowchart TD
-    Start([User sends message]) --> Graph[LangGraph Entry]
-    Graph --> Remember[remember_node\nExtract facts with LLM]
+    U[User Query] --> R[remember_node\nAuto-save facts to LTM]
+    R --> C{chat_node\nRoute Intent}
 
-    Remember --> Postgres{Postgres\navailable?}
-    Postgres -->|Yes| SaveFacts[Save facts to\nPostgresStore LTM]
-    Postgres -->|No| Skip1[Skip LTM save]
-    SaveFacts --> Chat
-    Skip1 --> Chat
+    C -->|Greeting| G[Reply: Hello!]
+    C -->|Self query| M[Read LTM from Postgres\nReturn stored facts]
+    C -->|Weather / Time\nNews / Stock| T[Tool Call\nOpenWeather · DuckDuckGo\nYahoo Finance · Clock]
+    C -->|Has documents| D{RAG Retrieval\nFAISS top-4 chunks}
 
-    Chat[chat_node\nRoute and respond]
+    D -->|Low confidence| H[HITL Pause\nAsk human to Approve or Skip]
+    H -->|Approved| L[LLM Answer with citations]
+    H -->|Skipped| S[Reply: Not enough context]
+    D -->|Good context| L
 
-    Chat --> CheckGreeting{is_greeting?}
-    CheckGreeting -->|Yes| ReturnGreeting[Reply: Hello!]
-    CheckGreeting -->|No| CheckHITL
+    C -->|No match| L[LLM Answer\nwith STM + LTM context]
 
-    CheckHITL{HITL pending\nand decision set?}
-    CheckHITL -->|Approve| HITLApprove[Answer with weak\nRAG context]
-    CheckHITL -->|Skip| HITLSkip[Reply: Not enough info]
-    CheckHITL -->|No| CheckSelf
-
-    CheckSelf{is_self_query?}
-    CheckSelf -->|Yes| LoadLTM[Load facts from\nPostgresStore]
-    LoadLTM --> ReturnMemory[Reply: Here is what I know]
-    CheckSelf -->|No| CheckWeather
-
-    CheckWeather{is_weather_query?}
-    CheckWeather -->|Yes| ExtractLoc[extract_weather_location]
-    ExtractLoc --> HasLoc{Location\nfound?}
-    HasLoc -->|No| AskLoc[Reply: Which city?]
-    HasLoc -->|Yes| CallWeather[call_weather\nOpenWeather API]
-    CallWeather --> WeatherOK{API success?}
-    WeatherOK -->|No| FallbackSearch[call_search\nDuckDuckGo fallback]
-    WeatherOK -->|Yes| FormatWeather[format_weather_response]
-    FallbackSearch --> ReturnWeather[Reply: Weather plus Sources]
-    FormatWeather --> ReturnWeather
-    CheckWeather -->|No| CheckTime
-
-    CheckTime{is_time_query?}
-    CheckTime -->|Yes| CallTime[call_datetime\nSystem clock]
-    CallTime --> ReturnTime[Reply: Date and Time]
-    CheckTime -->|No| CheckNews
-
-    CheckNews{is_news_query?}
-    CheckNews -->|Yes| CallNews[call_search\nDuckDuckGo]
-    CallNews --> ReturnNews[Reply: Top results plus Sources]
-    CheckNews -->|No| CheckStock
-
-    CheckStock{is_stock_query?}
-    CheckStock -->|Yes| ExtractSymbol[extract_stock_symbol]
-    ExtractSymbol --> HasSymbol{Symbol\nfound?}
-    HasSymbol -->|No| AskSymbol[Reply: Need ticker or company]
-    HasSymbol -->|Yes| CallStock[call_stock\nYahoo Finance]
-    CallStock --> ReturnStock[Reply: Price plus Sources]
-    CheckStock -->|No| CheckDocs
-
-    CheckDocs{has_documents\nin thread?}
-    CheckDocs -->|Yes| GetRAG[get_rag_context\nFAISS retrieval top-4 chunks]
-    GetRAG --> CheckConf{Document question\nand context under 200 chars?}
-    CheckConf -->|Yes - Low confidence| PauseHITL[Set awaiting_hitl = True\nSave state to SqliteSaver]
-    PauseHITL --> ReturnHITL[Reply: Warning plus Ask approval]
-    CheckConf -->|No - Good context| BuildRAGPrompt[Build prompt with\nRAG context and citations]
-    BuildRAGPrompt --> GetSTM1[get_recent_messages\nLast 12 messages STM]
-    GetSTM1 --> InvokeLLM1[llm.invoke\nGemini 2.5 Flash]
-    InvokeLLM1 --> ReturnRAG[Reply: Answer with citations]
-
-    CheckDocs -->|No| GetLTM[get_memory_as_text\nLoad user facts from Postgres]
-    GetLTM --> HasMemory{Memory\nexists?}
-    HasMemory -->|Yes| BuildMemPrompt[Build prompt with\nLTM context]
-    HasMemory -->|No| BuildBasicPrompt[Build basic\nsystem prompt]
-    BuildMemPrompt --> GetSTM2[get_recent_messages\nLast 12 messages STM]
-    BuildBasicPrompt --> GetSTM2
-    GetSTM2 --> InvokeLLM2[llm.invoke\nGemini 2.5 Flash]
-    InvokeLLM2 --> ReturnLLM[Reply: Plain LLM answer]
-
-    ReturnGreeting --> End([END])
-    HITLApprove --> End
-    HITLSkip --> End
-    ReturnMemory --> End
-    AskLoc --> End
-    ReturnWeather --> End
-    ReturnTime --> End
-    ReturnNews --> End
-    AskSymbol --> End
-    ReturnStock --> End
-    ReturnHITL --> FrontendHITL[Streamlit shows\nApprove and Skip buttons]
-    FrontendHITL -. Human clicks .-> ResumeGraph[Graph resumes\nwith hitl_decision set]
-    ResumeGraph --> CheckHITL
-    ReturnRAG --> End
-    ReturnLLM --> End
-
-    End --> SaveCheckpoint[(SqliteSaver\nSave full conversation state)]
-    SaveCheckpoint --> Done([Response shown to user])
-
-    style Remember fill:#dbeafe
-    style Chat fill:#fef9c3
-    style PauseHITL fill:#fee2e2
-    style FrontendHITL fill:#fee2e2
-    style ResumeGraph fill:#fee2e2
-    style Postgres fill:#dcfce7
-    style SaveFacts fill:#dcfce7
-    style LoadLTM fill:#dcfce7
-    style GetLTM fill:#dcfce7
-    style GetRAG fill:#f3e8ff
-    style SaveCheckpoint fill:#f3e8ff
+    T --> F[Formatted Answer with Sources]
+    L --> F
+    G --> F
+    M --> F
+    S --> F
+    F --> DB[(SqliteSaver\nSave state to SQLite)]
 ```
 
 ---
