@@ -61,6 +61,7 @@ import sqlite3
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -159,16 +160,23 @@ class ChatState(TypedDict, total=False):
 
 def _is_document_question(query: str) -> bool:
     """
-    Return True if the user is asking about an uploaded document.
-    We check for keywords that suggest the user means "from the file I uploaded".
+    Return True only for specific document questions where HITL makes sense.
+    Broad queries like 'summarize' or 'what does it say' should ALWAYS go
+    straight to RAG — never trigger HITL — because the user clearly wants
+    the bot to try regardless of context length.
     """
     q = query.lower()
-    doc_keywords = [
-        "pdf", "document", "doc", "file", "upload",
-        "in this", "from this", "according to", "summarize",
-        "what does it say", "the report", "the paper",
-    ]
-    return any(kw in q for kw in doc_keywords)
+
+    # These broad queries mean "try with whatever you have" — never pause
+    broad_queries = ["summarize", "summary", "overview", "what does it say",
+                     "what is in", "tell me about", "explain this", "describe"]
+    if any(kw in q for kw in broad_queries):
+        return False
+
+    # Only trigger HITL for specific targeted questions about document content
+    specific_keywords = ["according to", "in this pdf", "in this document",
+                         "from this file", "the report says", "the paper says"]
+    return any(kw in q for kw in specific_keywords)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -176,7 +184,7 @@ def _is_document_question(query: str) -> bool:
 # The main function that handles every user message.
 # ══════════════════════════════════════════════════════════════════════════
 
-def chat_node(state: ChatState) -> dict:
+def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     """
     Decide how to respond to the user's latest message.
 
@@ -184,8 +192,22 @@ def chat_node(state: ChatState) -> dict:
     The first matching condition wins and returns immediately.
     """
     query = get_latest_user_message(state["messages"])
-    thread_id = _safe_id(state.get("thread_id", "default"))
-    user_id = _safe_id(state.get("user_id") or state.get("thread_id", "default"))
+
+    # Read thread_id and user_id from the LangGraph config (always reliable)
+    # Fall back to state fields if config doesn't have them
+    configurable = config.get("configurable", {})
+    thread_id = _safe_id(
+        configurable.get("thread_id")
+        or state.get("thread_id")
+        or "default"
+    )
+    user_id = _safe_id(
+        configurable.get("user_id")
+        or state.get("user_id")
+        or thread_id
+    )
+
+    print(f"[RAG] thread_id={thread_id} | has_docs={has_documents(thread_id)}")
 
     # ── 1. Greeting ─────────────────────────────────────────────────────
     if is_greeting(query):
@@ -198,15 +220,16 @@ def chat_node(state: ChatState) -> dict:
 
         if decision == "approve":
             rag_context = get_rag_context(original_question, thread_id)
+            # NOTE: Gemini requires at least one HumanMessage in the messages list.
+            # We combine the system instructions + context into the HumanMessage.
             prompt = (
-                "The user approved answering from limited document context. "
-                "Do your best using the context below. "
-                "Be honest if the answer is not clearly in the document. "
+                "You are answering from limited document context — the user approved this.\n"
+                "Do your best with the context below. Be honest if the answer is unclear.\n"
                 "Cite sources like [1], [2] where possible.\n\n"
-                f"Context:\n{rag_context}\n\n"
+                f"Document context:\n{rag_context if rag_context else 'No context found.'}\n\n"
                 f"Question: {original_question}"
             )
-            response = llm.invoke([SystemMessage(content=prompt)])
+            response = llm.invoke(prompt)  # plain string prompt works for Gemini
             content = f"{response.content}\n\n{_cite('FAISS + Gemini 2.5 Flash (low-confidence approval)')}"
             return {
                 "messages": [AIMessage(content=content)],

@@ -51,9 +51,10 @@ _retriever_cache: dict[str, object] = {}
 # ══════════════════════════════════════════════════════════════════════════
 
 def _safe_id(thread_id: str) -> str:
-    """Remove unsafe characters from a thread ID so it can be used as a folder name."""
+    """Remove unsafe characters from a thread ID so it can be used as a folder name.
+    Hyphens are kept since UUIDs use them and they are safe on all filesystems."""
     value = str(thread_id or "default").strip()
-    return re.sub(r"[^A-Za-z0-9._-]", "_", value) or "default"
+    return re.sub(r"[^A-Za-z0-9._\-]", "_", value) or "default"
 
 
 def get_docs_dir(thread_id: str) -> Path:

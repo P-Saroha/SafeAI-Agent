@@ -334,8 +334,9 @@ if st.session_state.get("hitl_pending"):
         }
         with st.chat_message("assistant"):
             with st.spinner("Answering with available context..."):
-                def _stream_hitl():
-                    for chunk, metadata in chatbot.stream(
+                ai_response = ""
+                try:
+                    for state_snapshot in chatbot.stream(
                         {
                             "messages": [],
                             "thread_id": st.session_state["thread_id"],
@@ -344,16 +345,21 @@ if st.session_state.get("hitl_pending"):
                             "awaiting_hitl": True,
                         },
                         config=config,
-                        stream_mode="messages",
+                        stream_mode="values",
                     ):
-                        if (
-                            isinstance(chunk, AIMessage)
-                            and isinstance(chunk.content, str)
-                            and chunk.content.strip()
-                        ):
-                            yield chunk.content
-
-                ai_response = st.write_stream(_stream_hitl())
+                        messages = state_snapshot.get("messages", [])
+                        for msg in reversed(messages):
+                            if (
+                                isinstance(msg, AIMessage)
+                                and isinstance(msg.content, str)
+                                and msg.content.strip()
+                            ):
+                                ai_response = msg.content.strip()
+                                break
+                except Exception as e:
+                    ai_response = f"Error: {e}"
+                ai_response = ai_response or "No response generated."
+                st.markdown(ai_response)
 
         st.session_state["messages"].append({"role": "assistant", "content": ai_response})
         st.session_state["hitl_pending"] = False
@@ -369,8 +375,9 @@ if st.session_state.get("hitl_pending"):
         }
         with st.chat_message("assistant"):
             with st.spinner("Skipping..."):
-                def _stream_hitl_skip():
-                    for chunk, metadata in chatbot.stream(
+                ai_response = ""
+                try:
+                    for state_snapshot in chatbot.stream(
                         {
                             "messages": [],
                             "thread_id": st.session_state["thread_id"],
@@ -379,16 +386,21 @@ if st.session_state.get("hitl_pending"):
                             "awaiting_hitl": True,
                         },
                         config=config,
-                        stream_mode="messages",
+                        stream_mode="values",
                     ):
-                        if (
-                            isinstance(chunk, AIMessage)
-                            and isinstance(chunk.content, str)
-                            and chunk.content.strip()
-                        ):
-                            yield chunk.content
-
-                ai_response = st.write_stream(_stream_hitl_skip())
+                        messages = state_snapshot.get("messages", [])
+                        for msg in reversed(messages):
+                            if (
+                                isinstance(msg, AIMessage)
+                                and isinstance(msg.content, str)
+                                and msg.content.strip()
+                            ):
+                                ai_response = msg.content.strip()
+                                break
+                except Exception as e:
+                    ai_response = f"Error: {e}"
+                ai_response = ai_response or "No response generated."
+                st.markdown(ai_response)
 
         st.session_state["messages"].append({"role": "assistant", "content": ai_response})
         st.session_state["hitl_pending"] = False
@@ -452,30 +464,37 @@ if user_text:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            def _stream():
-                for chunk, metadata in chatbot.stream(
+            # Use stream_mode="values" to get the final state after all nodes run.
+            # This avoids the {} from remember_node and the double-response from
+            # Gemini streaming multiple chunks that get concatenated twice.
+            ai_response = ""
+            try:
+                for state_snapshot in chatbot.stream(
                     {
                         "messages": [HumanMessage(content=user_text)],
                         "thread_id": st.session_state["thread_id"],
                         "user_id": user_id,
                     },
                     config=config,
-                    stream_mode="messages",
+                    stream_mode="values",
                 ):
-                    # Only yield real AI message content — skip empty chunks
-                    # and internal node outputs (like remember_node's empty return)
-                    if (
-                        isinstance(chunk, AIMessage)
-                        and isinstance(chunk.content, str)
-                        and chunk.content.strip()
-                    ):
-                        yield chunk.content
-
-            try:
-                ai_response = st.write_stream(_stream())
+                    # "values" mode gives us the full state after each node.
+                    # We want the last AIMessage from the final state.
+                    messages = state_snapshot.get("messages", [])
+                    for msg in reversed(messages):
+                        if (
+                            isinstance(msg, AIMessage)
+                            and isinstance(msg.content, str)
+                            and msg.content.strip()
+                        ):
+                            ai_response = msg.content.strip()
+                            break
             except Exception as e:
                 ai_response = f"Sorry, something went wrong: {e}"
-                st.error(ai_response)
+
+            if not ai_response:
+                ai_response = "I couldn't generate a response. Please try again."
+            st.markdown(ai_response)
 
     # Save the assistant response to history
     st.session_state["messages"].append({"role": "assistant", "content": ai_response})
