@@ -26,38 +26,6 @@ A beginner-friendly AI agent that combines deterministic tool routing, document-
 
 ---
 
-## Agent Workflow
-
-```mermaid
-flowchart TD
-    U[User Query] --> R[remember_node\nAuto-save facts to LTM]
-    R --> C{chat_node\nRoute Intent}
-
-    C -->|Greeting| G[Reply: Hello!]
-    C -->|Self query| M[Read LTM from Postgres\nReturn stored facts]
-    C -->|Weather / Time\nNews / Stock| T[Tool Call\nOpenWeather · DuckDuckGo\nYahoo Finance · Clock]
-    C -->|Has documents| QR[Query Rewriting\nis_ambiguous_query?]
-
-    QR -->|Ambiguous| RW[rewrite_query\nUse LLM to clarify]
-    QR -->|Clear| D{RAG Retrieval\nFAISS top-4 chunks}
-    RW --> D
-
-    D -->|Low confidence| H[HITL Pause\nAsk human to Approve or Skip]
-    H -->|Approved| L[LLM Answer with citations]
-    H -->|Skipped| S[Reply: Not enough context]
-    D -->|Good context| L
-
-    C -->|No match| L[LLM Answer\nwith STM + LTM context]
-
-    T --> F[Formatted Answer with Sources]
-    L --> F
-    G --> F
-    M --> F
-    S --> F
-    F --> DB[(SqliteSaver\nSave state to SQLite)]
-```
-
----
 
 ## What is HITL (Human-In-The-Loop)?
 
