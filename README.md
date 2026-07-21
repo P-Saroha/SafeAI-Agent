@@ -19,6 +19,8 @@ A beginner-friendly AI agent that combines deterministic tool routing, document-
 | **Short-term memory** | Keeps the last 12 messages as conversation context |
 | **HITL approval** | Pauses and asks you before answering with low-confidence document context |
 | **Multi-thread chats** | Each conversation is isolated with its own documents and history |
+| **Chat export** | Download any conversation as a Markdown file |
+| **Memory recap** | Personalized welcome-back greeting on every new chat using your stored facts |
 
 ---
 
@@ -105,8 +107,8 @@ Instead of the LLM making up an answer, the bot first searches your uploaded doc
 ```
 Chatbot/
 ├── chatbotBackend.py     # Agent graph, chat_node, HITL logic, thread utilities
-├── chatbotFrontend.py    # Streamlit UI — chat interface, sidebar, HITL buttons
-├── chatbot_memory.py     # STM + LTM memory — remember_node, Postgres store
+├── chatbotFrontend.py    # Streamlit UI — chat, sidebar, HITL buttons, export, recap
+├── chatbot_memory.py     # STM + LTM memory — remember_node, recap greeting, Postgres store
 ├── chatbot_rag.py        # FAISS index building, document loading, RAG retrieval
 ├── chatbot_tools.py      # Tool functions (weather, search, stock, time) + intent detectors
 ├── docker-compose.yml    # Postgres container for long-term memory
@@ -158,7 +160,7 @@ streamlit run chatbotFrontend.py
 ## Example queries
 
 ```
-"hello"                          → greeting
+"hello"                          → greeting + memory recap if returning user
 "weather in Mumbai"              → OpenWeather tool
 "what time is it"                → system clock
 "latest AI news"                 → DuckDuckGo search
@@ -167,6 +169,8 @@ streamlit run chatbotFrontend.py
 "my name is Sara, I like Python" → saves to LTM automatically
 "summarize the PDF I uploaded"   → RAG over your document
 ```
+
+Use the **⬇️ Download chat as .md** button in the sidebar to export any conversation.
 
 ---
 
@@ -195,5 +199,7 @@ streamlit run chatbotFrontend.py
 - **RAG pipeline** — per-thread FAISS indexes, chunking, citation-aware retrieval
 - **Memory architecture** — STM vs LTM design, auto-extraction via LLM
 - **HITL pattern** — graph interruption, state persistence, human approval flow
+- **Personalization** — LTM-powered recap greeting on every new session
+- **User experience** — chat export to Markdown, streaming responses, file upload
 - **Error handling** — API fallbacks (OpenWeather → DuckDuckGo), graceful degradation
-- **Streamlit UI** — streaming responses, file upload, multi-thread management
+- **Streamlit UI** — multi-thread management, sidebar controls, download button
