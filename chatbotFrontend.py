@@ -1,559 +1,431 @@
-import streamlit as st
-from chatbotBackend import (
-    chatbot,
-    unique_thread_pointer,
-    generate_chat_title,
-    rebuild_rag_index,
-    delete_thread_history,
-    get_thread_rag_docs_dir,
-    get_user_memory,
-    get_memory_status,
-    get_user_memory_count,
-    cleanup_user_memory,
-    clear_user_memory,
-)
-from langchain_core.messages import HumanMessage, AIMessage
-import uuid
+"""
+chatbotFrontend.py
+------------------
+The Streamlit UI for the chatbot.
+
+What this file does:
+1. Shows a chat interface where the user can type messages.
+2. Displays the conversation history.
+3. Lets the user manage multiple chat threads from the sidebar.
+4. Lets the user upload documents (PDF, TXT, MD) for RAG.
+5. Shows long-term memory info in the sidebar.
+
+Run with:
+    streamlit run chatbotFrontend.py
+"""
+
 import os
-import re
+import uuid
 from pathlib import Path
 
-os.environ['LANGSMITH_PROJECT'] = 'ChatBot-Project'
+import streamlit as st
+from langchain_core.messages import AIMessage, HumanMessage
+
+from chatbotBackend import (
+    chatbot,
+    delete_thread,
+    generate_chat_title,
+    get_thread_hitl_state,
+    list_all_threads,
+)
+from chatbot_memory import (
+    clear_memory,
+    get_memory_count,
+    get_memory_list,
+    get_memory_status,
+)
+from chatbot_rag import get_docs_dir, rebuild_rag_index
+
+os.environ["LANGSMITH_PROJECT"] = "ChatBot-Project"
 
 
-# ==============================
-# UTIL FUNCTIONS
-# ==============================
-def generate_thread_id():
-    # Create a new random thread identifier.
+# ══════════════════════════════════════════════════════════════════════════
+# SESSION HELPERS
+# Small utilities for managing user/thread IDs across page reloads.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _user_id_file() -> Path:
+    """Path to a file that stores this user's stable ID."""
+    return Path(__file__).resolve().parent / ".user_id"
+
+
+def get_or_create_user_id() -> str:
+    """
+    Load the user ID from disk, or create a new one.
+    This keeps the same user ID even after restarting the app.
+    """
+    if "user_id" in st.session_state:
+        return st.session_state["user_id"]
+
+    path = _user_id_file()
+    if path.exists():
+        uid = path.read_text(encoding="utf-8").strip()
+        if uid:
+            st.session_state["user_id"] = uid
+            return uid
+
+    uid = str(uuid.uuid4())
+    path.write_text(uid, encoding="utf-8")
+    st.session_state["user_id"] = uid
+    return uid
+
+
+def new_thread_id() -> str:
+    """Generate a fresh unique thread ID."""
     return str(uuid.uuid4())
 
 
-def deduplicate_message_history(messages):
-    # Remove duplicate chat messages before rendering.
-    """Remove exact duplicate messages from history."""
-    seen = set()
-    deduped = []
-    for msg in messages:
-        key = f"{msg['role']}:{msg['content'][:200]}"
-        if key not in seen:
-            seen.add(key)
-            deduped.append(msg)
-    return deduped
+# ══════════════════════════════════════════════════════════════════════════
+# CONVERSATION HELPERS
+# ══════════════════════════════════════════════════════════════════════════
 
-
-def get_or_create_user_id():
-    # Load or create a stable user id for LTM scoping.
-    if 'user_id' in st.session_state:
-        return st.session_state['user_id']
-
-    user_id_path = Path(__file__).resolve().parent / ".user_id"
-    if user_id_path.exists():
-        stored = user_id_path.read_text(encoding="utf-8").strip()
-        if stored:
-            st.session_state['user_id'] = stored
-            return stored
-
-    user_id = str(uuid.uuid4())
-    user_id_path.write_text(user_id, encoding="utf-8")
-    st.session_state['user_id'] = user_id
-    return user_id
-
-
-def _active_thread_file(user_id: str) -> Path:
-    # Map a user id to a file that stores the last active thread.
-    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", user_id or "")
-    return Path(__file__).resolve().parent / f".active_thread_{safe_id}"
-
-
-def get_active_thread_id(user_id: str) -> str | None:
-    # Read the last active thread id from disk.
-    path = _active_thread_file(user_id)
-    if not path.exists():
-        return None
-    value = path.read_text(encoding="utf-8").strip()
-    return value or None
-
-
-def set_active_thread_id(user_id: str, thread_id: str) -> None:
-    # Persist the last active thread id for reloads.
-    if not user_id or not thread_id:
-        return
-    _active_thread_file(user_id).write_text(thread_id, encoding="utf-8")
-
-
-def reset_chat():
-    # Start a new chat thread and clear in-memory message history.
-    # Start a new chat thread and clear in-memory message history.
-    thread_id = generate_thread_id()
-    st.session_state['thread_id'] = thread_id
-    add_thread(thread_id)
-    st.session_state['message_history'] = []
-    set_active_thread_id(get_or_create_user_id(), thread_id)
-
-
-def add_thread(thread_id):
-    # Add a thread to the sidebar list if missing.
-    if thread_id not in st.session_state['chat_threads']:
-        st.session_state['chat_threads'].append(thread_id)
-
-
-def delete_thread(thread_id):
-    # Delete a thread's history and remove it from the UI.
-    delete_status = delete_thread_history(thread_id)
-
-    if thread_id in st.session_state['chat_threads']:
-        st.session_state['chat_threads'].remove(thread_id)
-        if st.session_state['thread_id'] == thread_id:
-            reset_chat()
-
-    if thread_id in st.session_state.get('thread_titles', {}):
-        del st.session_state['thread_titles'][thread_id]
-
-    if st.session_state.get('thread_id') == thread_id:
-        st.session_state['pending_approval'] = None
-
-    return delete_status
-
-
-def load_conversation(thread_id):
-    # Load thread history from the LangGraph checkpointer into the UI.
-    # Load thread history from the LangGraph checkpointer into the UI.
+def load_thread_messages(thread_id: str) -> list[dict]:
+    """
+    Load the saved messages for a thread from the LangGraph checkpointer.
+    Returns a list of {"role": "user"/"assistant", "content": "..."} dicts
+    that Streamlit's st.chat_message can display.
+    """
+    user_id = get_or_create_user_id()
     state = chatbot.get_state(
-        config={'configurable': {'thread_id': thread_id, 'user_id': get_or_create_user_id()}}
+        config={"configurable": {"thread_id": thread_id, "user_id": user_id}}
     )
-    messages = state.values.get('messages', [])
-    
-    # Deduplicate messages by content to prevent duplicates from appearing
+    messages = state.values.get("messages", [])
+
+    result = []
     seen = set()
-    deduped = []
     for msg in messages:
-        # Skip ToolMessage and FunctionMessage - only show user and AI messages
-        if hasattr(msg, '__class__'):
-            msg_type = msg.__class__.__name__
-            if msg_type in {'ToolMessage', 'FunctionMessage'}:
-                continue
-        
-        # Create unique key for deduplication
-        msg_content = str(getattr(msg, 'content', '')).strip()
-        msg_type = 'user' if isinstance(msg, HumanMessage) else 'assistant'
-        key = f"{msg_type}:{msg_content[:200]}"  # Use first 200 chars as key
-        
-        if key not in seen:
-            seen.add(key)
-            deduped.append(msg)
-    
-    return deduped
+        # Skip non-human/AI messages
+        if not isinstance(msg, (HumanMessage, AIMessage)):
+            continue
+        role = "user" if isinstance(msg, HumanMessage) else "assistant"
+        content = str(msg.content or "").strip()
+        # Deduplicate by content
+        key = f"{role}:{content[:200]}"
+        if key in seen or not content:
+            continue
+        seen.add(key)
+        result.append({"role": role, "content": content})
+
+    return result
 
 
-def refresh_pending_approval(thread_id):
-    # Pull HITL approval state from the graph into session state.
-    """Load HITL pending request from graph state for the active thread."""
-    state = chatbot.get_state(
-        config={'configurable': {'thread_id': thread_id, 'user_id': get_or_create_user_id()}}
-    )
-    values = state.values or {}
-
-    if values.get('awaiting_approval'):
-        st.session_state['pending_approval'] = {
-            'request': values.get('approval_request', 'Approval required.'),
-            'type': values.get('approval_type', ''),
-        }
-    else:
-        st.session_state['pending_approval'] = None
+def start_new_chat():
+    """Reset session state and start a fresh chat thread."""
+    tid = new_thread_id()
+    st.session_state["thread_id"] = tid
+    st.session_state["messages"] = []
+    # Add to thread list if not already there
+    if tid not in st.session_state["thread_ids"]:
+        st.session_state["thread_ids"].append(tid)
 
 
-def save_uploaded_docs(uploaded_files, thread_id):
-    # Save uploaded files and rebuild the per-thread RAG index.
-    """Save uploaded docs to knowledge folder and rebuild index."""
-    if not uploaded_files:
+def save_uploaded_files(files, thread_id: str) -> tuple[int, str]:
+    """
+    Save uploaded files to the thread's knowledge_base folder,
+    then rebuild the FAISS index.
+    Returns (number_of_files_saved, status_message).
+    """
+    if not files:
         return 0, ""
 
-    docs_dir = get_thread_rag_docs_dir(thread_id)
-    Path(docs_dir).mkdir(parents=True, exist_ok=True)
-    saved_count = 0
+    docs_dir = get_docs_dir(thread_id)
+    docs_dir.mkdir(parents=True, exist_ok=True)
 
-    for uploaded in uploaded_files:
-        file_path = Path(docs_dir) / uploaded.name
-        with open(file_path, 'wb') as f:
-            f.write(uploaded.getbuffer())
-        saved_count += 1
+    for f in files:
+        dest = docs_dir / f.name
+        dest.write_bytes(f.getbuffer())
 
     status = rebuild_rag_index(thread_id)
-    return saved_count, status
+    return len(files), status
 
 
-def extract_tool_names(message_chunk):
-    # Parse tool names from streamed model/tool messages.
-    """Extract tool names from model/tool message chunks."""
-    tool_names = set()
-
-    # AI tool calls (common for function-calling models)
-    tool_calls = getattr(message_chunk, 'tool_calls', None)
-    if tool_calls:
-        for call in tool_calls:
-            name = call.get('name') if isinstance(call, dict) else None
-            if name:
-                tool_names.add(name)
-
-    # Tool message may carry tool name directly
-    name = getattr(message_chunk, 'name', None)
-    if isinstance(name, str) and name:
-        tool_names.add(name)
-
-    return tool_names
-
-
-# ==============================
-# SESSION INIT
-# ==============================
-if 'message_history' not in st.session_state:
-    st.session_state['message_history'] = []
-
-if 'thread_id' not in st.session_state:
-    st.session_state['thread_id'] = generate_thread_id()
+# ══════════════════════════════════════════════════════════════════════════
+# SESSION STATE INIT
+# Runs once when the app first loads.
+# ══════════════════════════════════════════════════════════════════════════
 
 user_id = get_or_create_user_id()
 
-if 'chat_threads' not in st.session_state:
-    st.session_state['chat_threads'] = unique_thread_pointer()
+if "thread_ids" not in st.session_state:
+    # Load all existing threads from checkpointer on first run
+    st.session_state["thread_ids"] = list_all_threads()
 
-if 'thread_titles' not in st.session_state:
-    st.session_state['thread_titles'] = {}
-
-if 'pending_approval' not in st.session_state:
-    st.session_state['pending_approval'] = None
-
-stored_thread = get_active_thread_id(user_id)
-if stored_thread and stored_thread in st.session_state['chat_threads']:
-    st.session_state['thread_id'] = stored_thread
-elif st.session_state['chat_threads']:
-    st.session_state['thread_id'] = st.session_state['chat_threads'][-1]
-    set_active_thread_id(user_id, st.session_state['thread_id'])
-else:
-    set_active_thread_id(user_id, st.session_state['thread_id'])
-
-add_thread(st.session_state['thread_id'])
-if not st.session_state['message_history']:
-    messages = load_conversation(st.session_state['thread_id'])
-    st.session_state['message_history'] = [
-        {'role': 'user' if isinstance(msg, HumanMessage) else 'assistant', 'content': msg.content}
-        for msg in messages
-    ]
-refresh_pending_approval(st.session_state['thread_id'])
-
-
-# ==============================
-# SIDEBAR
-# ==============================
-st.sidebar.title('LangGraph AI Agent')
-
-if st.sidebar.button('New Chat'):
-    reset_chat()
-
-st.sidebar.header('RAG Controls')
-current_docs_dir = get_thread_rag_docs_dir(st.session_state['thread_id'])
-knowledge_files = [
-    p for p in Path(current_docs_dir).rglob('*')
-    if p.is_file() and p.suffix.lower() in {'.pdf', '.txt', '.md'}
-]
-auto_mode_label = 'Smart Auto (Documents + Tools)' if knowledge_files else 'Agent Only (No RAG files found)'
-st.sidebar.caption(f'Auto Mode: {auto_mode_label}')
-st.sidebar.caption(f'Current chat documents: {len(knowledge_files)}')
-
-if st.sidebar.button('Rebuild RAG Index'):
-    with st.sidebar:
-        with st.spinner('Rebuilding RAG index...'):
-            status = rebuild_rag_index(st.session_state['thread_id'])
-    st.sidebar.success(status)
-
-st.sidebar.caption("Upload PDF, TXT, or MD files here to add chatbot knowledge.")
-st.sidebar.caption('Attach files directly from chat input (paperclip) for GPT-like flow.')
-
-st.sidebar.header('My Conversations')
-
-st.sidebar.header('Memory (Debug)')
-st.sidebar.caption(f"User ID: {get_or_create_user_id()}")
-status = get_memory_status()
-if status.get("available"):
-    st.sidebar.success("LTM connected")
-    st.sidebar.caption(f"Entries: {get_user_memory_count(get_or_create_user_id())}")
-else:
-    st.sidebar.warning("LTM not connected")
-    if status.get("last_error"):
-        st.sidebar.caption(status["last_error"])
-if st.sidebar.button('Show Memory'):
-    memories = get_user_memory(get_or_create_user_id())
-    if memories:
-        st.sidebar.write("\n".join(f"- {m}" for m in memories))
+if "thread_id" not in st.session_state:
+    if st.session_state["thread_ids"]:
+        st.session_state["thread_id"] = st.session_state["thread_ids"][-1]
     else:
-        st.sidebar.info('No LTM entries found for this user.')
+        st.session_state["thread_id"] = new_thread_id()
+        st.session_state["thread_ids"].append(st.session_state["thread_id"])
 
-if st.sidebar.button('Clean Memory Duplicates'):
-    removed = cleanup_user_memory(get_or_create_user_id())
-    st.sidebar.success(f"Removed {removed} duplicate entries.")
+if "messages" not in st.session_state:
+    st.session_state["messages"] = load_thread_messages(st.session_state["thread_id"])
 
-if st.sidebar.button('Clear All LTM (This User)'):
-    removed = clear_user_memory(get_or_create_user_id())
+if "thread_titles" not in st.session_state:
+    st.session_state["thread_titles"] = {}
+
+if "hitl_pending" not in st.session_state:
+    st.session_state["hitl_pending"] = False
+
+# Check if an HITL approval was already pending when the page loads
+# (e.g. user refreshed the browser mid-approval)
+_hitl = get_thread_hitl_state(st.session_state["thread_id"], user_id)
+if _hitl["awaiting"] and not st.session_state["hitl_pending"]:
+    st.session_state["hitl_pending"] = True
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════
+
+st.sidebar.title("LangGraph AI Agent")
+
+# ── New Chat button ─────────────────────────────────────────────────────
+if st.sidebar.button("➕ New Chat"):
+    start_new_chat()
+    st.rerun()
+
+# ── RAG section ─────────────────────────────────────────────────────────
+st.sidebar.header("Documents (RAG)")
+current_docs_dir = get_docs_dir(st.session_state["thread_id"])
+doc_files = list(current_docs_dir.rglob("*")) if current_docs_dir.exists() else []
+doc_count = sum(1 for p in doc_files if p.is_file() and p.suffix.lower() in {".pdf", ".txt", ".md"})
+st.sidebar.caption(f"Uploaded documents in this chat: {doc_count}")
+
+if st.sidebar.button("🔄 Rebuild RAG Index"):
+    with st.spinner("Rebuilding..."):
+        msg = rebuild_rag_index(st.session_state["thread_id"])
+    st.sidebar.success(msg)
+
+# ── Memory section ──────────────────────────────────────────────────────
+st.sidebar.header("Long-Term Memory")
+mem_status = get_memory_status()
+if mem_status["available"]:
+    st.sidebar.success("✅ Connected to Postgres")
+    st.sidebar.caption(f"Stored facts: {get_memory_count(user_id)}")
+else:
+    st.sidebar.warning("⚠️ Postgres not connected (LTM disabled)")
+    if mem_status.get("last_error"):
+        st.sidebar.caption(f"Error: {mem_status['last_error']}")
+
+if st.sidebar.button("🧠 Show Memory"):
+    facts = get_memory_list(user_id)
+    if facts:
+        for fact in facts:
+            st.sidebar.write(f"- {fact}")
+    else:
+        st.sidebar.info("No memory stored yet.")
+
+if st.sidebar.button("🗑️ Clear All Memory"):
+    removed = clear_memory(user_id)
     st.sidebar.success(f"Cleared {removed} memory entries.")
 
-for thread_id in st.session_state['chat_threads'][::-1]:
-    col1, col2 = st.sidebar.columns([4,1])
+# ── Conversation list ────────────────────────────────────────────────────
+st.sidebar.header("My Conversations")
 
-    # Get or generate title
-    if thread_id not in st.session_state['thread_titles']:
-        messages = load_conversation(thread_id)
-        first_user_msg = None
-        
-        # Find first human message in conversation
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                first_user_msg = msg.content
-                break
-        
-        if first_user_msg:
-            generated_title = generate_chat_title(first_user_msg)
-            st.session_state['thread_titles'][thread_id] = generated_title
-        else:
-            st.session_state['thread_titles'][thread_id] = "New Chat"
-    
-    title = st.session_state['thread_titles'][thread_id]
+for tid in reversed(st.session_state["thread_ids"]):
+    # Generate and cache a title for each thread
+    if tid not in st.session_state["thread_titles"]:
+        msgs = load_thread_messages(tid)
+        first_user = next((m["content"] for m in msgs if m["role"] == "user"), None)
+        title = generate_chat_title(first_user) if first_user else "New Chat"
+        st.session_state["thread_titles"][tid] = title
+
+    title = st.session_state["thread_titles"][tid]
+    col1, col2 = st.sidebar.columns([4, 1])
 
     with col1:
-        if st.button(title, key=f"load_{thread_id}"):
-            st.session_state['thread_id'] = thread_id
-            set_active_thread_id(get_or_create_user_id(), thread_id)
-            messages = load_conversation(thread_id)
-
-            temp_messages = []
-            for msg in messages:
-                role = 'user' if isinstance(msg, HumanMessage) else 'assistant'
-                temp_messages.append({'role': role, 'content': msg.content})
-
-            st.session_state['message_history'] = temp_messages
-            refresh_pending_approval(thread_id)
+        # Highlight the active thread
+        label = f"**{title}**" if tid == st.session_state["thread_id"] else title
+        if st.button(label, key=f"load_{tid}"):
+            st.session_state["thread_id"] = tid
+            st.session_state["messages"] = load_thread_messages(tid)
+            st.rerun()
 
     with col2:
-        if st.button("🗑", key=f"delete_{thread_id}"):
-            status = delete_thread(thread_id)
-            if status.lower().startswith('delete failed'):
-                st.sidebar.warning(status)
-            else:
-                st.sidebar.success(status)
+        if st.button("🗑", key=f"del_{tid}"):
+            result = delete_thread(tid)
+            st.session_state["thread_ids"].remove(tid)
+            st.session_state["thread_titles"].pop(tid, None)
+            # If we deleted the active thread, start a new one
+            if st.session_state["thread_id"] == tid:
+                start_new_chat()
+            st.sidebar.success(result)
+            st.rerun()
 
 
-# ==============================
+# ══════════════════════════════════════════════════════════════════════════
 # MAIN CHAT UI
-# ==============================
-st.title(" AI Agent Chatbot")
-st.caption('Attach PDF/TXT/MD with the chat input paperclip. Uploaded docs are indexed automatically.')
+# ══════════════════════════════════════════════════════════════════════════
 
-# Deduplicate and display messages
-deduped_messages = deduplicate_message_history(st.session_state['message_history'])
-for message in deduped_messages:
-    with st.chat_message(message['role']):
-        st.markdown(message['content'])
+st.title("🤖 AI Agent Chatbot")
+st.caption("Upload PDF, TXT, or MD files using the paperclip icon in the chat input.")
 
+# Display all messages in the current thread
+for msg in st.session_state["messages"]:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-pending = st.session_state.get('pending_approval')
-if pending:
-    st.warning(f"HITL: {pending['request']}")
-    col_a, col_b = st.columns(2)
+# ── HITL Approval UI ────────────────────────────────────────────────────
+# When the bot is not confident about a document answer, it pauses and
+# stores awaiting_hitl=True in the graph state. We detect that here and
+# show Approve / Skip buttons instead of the normal chat input.
+if st.session_state.get("hitl_pending"):
+    st.warning(
+        "⚠️ **Approval needed:** The bot found limited context in your document. "
+        "Choose what to do:"
+    )
+    col_approve, col_skip = st.columns(2)
 
-    if col_a.button('Approve', key=f"approve_{st.session_state['thread_id']}"):
-        CONFIG = {
-            'configurable': {
-                'thread_id': st.session_state['thread_id'],
-                'user_id': get_or_create_user_id(),
-            }
+    if col_approve.button("✅ Yes, try to answer", key="hitl_approve"):
+        config = {
+            "configurable": {
+                "thread_id": st.session_state["thread_id"],
+                "user_id": user_id,
+            },
+            "recursion_limit": 25,
         }
-        with st.chat_message('user'):
-            st.markdown('[HITL] Approve')
+        with st.chat_message("assistant"):
+            with st.spinner("Answering with available context..."):
+                def _stream_hitl():
+                    for chunk, _ in chatbot.stream(
+                        # Pass empty messages + the approval decision
+                        {
+                            "messages": [],
+                            "thread_id": st.session_state["thread_id"],
+                            "user_id": user_id,
+                            "hitl_decision": "approve",
+                            "awaiting_hitl": True,
+                        },
+                        config=config,
+                        stream_mode="messages",
+                    ):
+                        if isinstance(chunk, AIMessage) and chunk.content:
+                            yield chunk.content
 
-        with st.chat_message('assistant'):
-            with st.spinner('Resuming after approval...'):
-                ai_response = st.write_stream(
-                    (
-                        chunk.content
-                        for chunk, _ in chatbot.stream(
-                            {
-                                'messages': [],
-                                'mode': 'auto',
-                                'thread_id': st.session_state['thread_id'],
-                                'user_id': get_or_create_user_id(),
-                                'approval_decision': 'approve',
-                            },
-                            config={**CONFIG, "recursion_limit": 50},
-                            stream_mode='messages',
-                        )
-                        if isinstance(chunk, AIMessage) and chunk.content
-                    )
-                )
+                ai_response = st.write_stream(_stream_hitl())
 
-        st.session_state['message_history'].append({'role': 'assistant', 'content': ai_response})
-        refresh_pending_approval(st.session_state['thread_id'])
+        st.session_state["messages"].append({"role": "assistant", "content": ai_response})
+        st.session_state["hitl_pending"] = False
         st.rerun()
 
-    if col_b.button('Regenerate', key=f"regen_{st.session_state['thread_id']}"):
-        CONFIG = {
-            'configurable': {
-                'thread_id': st.session_state['thread_id'],
-                'user_id': get_or_create_user_id(),
-            }
+    if col_skip.button("❌ No, skip", key="hitl_skip"):
+        config = {
+            "configurable": {
+                "thread_id": st.session_state["thread_id"],
+                "user_id": user_id,
+            },
+            "recursion_limit": 25,
         }
-        with st.chat_message('user'):
-            st.markdown('[HITL] Regenerate')
+        with st.chat_message("assistant"):
+            with st.spinner("Skipping..."):
+                def _stream_hitl_skip():
+                    for chunk, _ in chatbot.stream(
+                        {
+                            "messages": [],
+                            "thread_id": st.session_state["thread_id"],
+                            "user_id": user_id,
+                            "hitl_decision": "skip",
+                            "awaiting_hitl": True,
+                        },
+                        config=config,
+                        stream_mode="messages",
+                    ):
+                        if isinstance(chunk, AIMessage) and chunk.content:
+                            yield chunk.content
 
-        with st.chat_message('assistant'):
-            with st.spinner('Regenerating...'):
-                ai_response = st.write_stream(
-                    (
-                        chunk.content
-                        for chunk, _ in chatbot.stream(
-                            {
-                                'messages': [],
-                                'mode': 'auto',
-                                'thread_id': st.session_state['thread_id'],
-                                'user_id': get_or_create_user_id(),
-                                'approval_decision': 'regenerate',
-                            },
-                            config={**CONFIG, "recursion_limit": 50},
-                            stream_mode='messages',
-                        )
-                        if isinstance(chunk, AIMessage) and chunk.content
-                    )
-                )
+                ai_response = st.write_stream(_stream_hitl_skip())
 
-        st.session_state['message_history'].append({'role': 'assistant', 'content': ai_response})
-        refresh_pending_approval(st.session_state['thread_id'])
+        st.session_state["messages"].append({"role": "assistant", "content": ai_response})
+        st.session_state["hitl_pending"] = False
         st.rerun()
 
+    st.stop()  # Don't show the chat input while HITL is pending
 
-chat_payload = st.chat_input(
+
+# ── Chat input (supports file attachments) ───────────────────────────────
+chat_input = st.chat_input(
     "Type your message...",
-    accept_file='multiple',
-    file_type=['pdf', 'txt', 'md'],
-    max_upload_size=200,
+    accept_file="multiple",
+    file_type=["pdf", "txt", "md"],
 )
 
-user_input = None
+# Parse the chat input (can be a string or an object with .text and .files)
+user_text = ""
 uploaded_files = []
 
-if chat_payload is not None:
-    if isinstance(chat_payload, str):
-        user_input = chat_payload
+if chat_input is not None:
+    if isinstance(chat_input, str):
+        user_text = chat_input
     else:
-        user_input = getattr(chat_payload, 'text', None) or getattr(chat_payload, 'message', None) or ""
-        uploaded_files = list(getattr(chat_payload, 'files', []) or [])
+        user_text = getattr(chat_input, "text", "") or getattr(chat_input, "message", "") or ""
+        uploaded_files = list(getattr(chat_input, "files", []) or [])
 
-if user_input or uploaded_files:
-    if st.session_state.get('pending_approval'):
-        st.warning('Resolve pending HITL request first using Approve or Regenerate.')
-        st.stop()
+# ── Handle file uploads ──────────────────────────────────────────────────
+if uploaded_files:
+    with st.spinner("Saving files and building RAG index..."):
+        count, status = save_uploaded_files(uploaded_files, st.session_state["thread_id"])
+    st.success(f"Uploaded {count} file(s). {status}")
 
-    saved_count = 0
-    upload_status = ""
-    if uploaded_files:
-        with st.spinner('Saving files and rebuilding RAG index...'):
-            saved_count, upload_status = save_uploaded_docs(uploaded_files, st.session_state['thread_id'])
-
-        if saved_count > 0:
-            st.success(f'Uploaded {saved_count} file(s). {upload_status}')
-
-    if not user_input:
-        uploaded_names = ', '.join(f.name for f in uploaded_files) if uploaded_files else 'No files'
+    # If no text was typed, just confirm the upload and stop here
+    if not user_text:
+        names = ", ".join(f.name for f in uploaded_files)
         confirmation = (
-            f"Uploaded files: {uploaded_names}\n\n"
-            f"{upload_status}\n\n"
-            "You can now ask questions from these documents in this chat."
+            f"Files uploaded: **{names}**\n\n"
+            f"{status}\n\n"
+            "You can now ask questions about these documents."
         )
-        with st.chat_message('assistant'):
+        with st.chat_message("assistant"):
             st.markdown(confirmation)
-
-        st.session_state['message_history'].append(
-            {'role': 'assistant', 'content': confirmation}
-        )
-        refresh_pending_approval(st.session_state['thread_id'])
+        st.session_state["messages"].append({"role": "assistant", "content": confirmation})
         st.stop()
 
-    st.session_state['message_history'].append({'role': 'user', 'content': user_input})
+# ── Handle user message ──────────────────────────────────────────────────
+if user_text:
+    # Show the user message immediately
+    st.session_state["messages"].append({"role": "user", "content": user_text})
+    with st.chat_message("user"):
+        st.markdown(user_text)
 
-    with st.chat_message('user'):
-        st.markdown(user_input)
-        if uploaded_files:
-            file_names = ', '.join(f.name for f in uploaded_files)
-            st.caption(f'Attached files: {file_names}')
-
-    CONFIG = {
-        'configurable': {
-            'thread_id': st.session_state['thread_id'],
-            'user_id': get_or_create_user_id(),
-        }
+    # Call the chatbot and stream the response
+    config = {
+        "configurable": {
+            "thread_id": st.session_state["thread_id"],
+            "user_id": user_id,
+        },
+        "recursion_limit": 25,
     }
-    selected_mode = 'auto'
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            used_tools = set()
-            tool_trace = st.empty()
+            def _stream():
+                for chunk, _ in chatbot.stream(
+                    {
+                        "messages": [HumanMessage(content=user_text)],
+                        "thread_id": st.session_state["thread_id"],
+                        "user_id": user_id,
+                    },
+                    config=config,
+                    stream_mode="messages",
+                ):
+                    if isinstance(chunk, AIMessage) and chunk.content:
+                        yield chunk.content
 
-            def stream_response():
-                try:
-                    for message_chunk, metadata in chatbot.stream(
-                        {
-                            "messages": [HumanMessage(content=user_input)],
-                            "mode": selected_mode,
-                            "thread_id": st.session_state['thread_id'],
-                            "user_id": get_or_create_user_id(),
-                        },
-                        config={**CONFIG, "recursion_limit": 50},
-                        stream_mode="messages"
-                    ):
-                        detected_tools = extract_tool_names(message_chunk)
-                        if detected_tools:
-                            used_tools.update(detected_tools)
-                            tool_trace.info(f"Tools used: {', '.join(sorted(used_tools))}")
+            try:
+                ai_response = st.write_stream(_stream())
+            except Exception as e:
+                ai_response = f"Sorry, something went wrong: {e}"
+                st.error(ai_response)
 
-                        if metadata.get("langgraph_node") == "tools" and not used_tools:
-                            tool_trace.info("Using tool...")
+    # Save the assistant response to history
+    st.session_state["messages"].append({"role": "assistant", "content": ai_response})
 
-                        if isinstance(message_chunk, AIMessage) and message_chunk.content:
-                            yield message_chunk.content
+    # Check if this response triggered an HITL pause
+    hitl = get_thread_hitl_state(st.session_state["thread_id"], user_id)
+    if hitl["awaiting"]:
+        st.session_state["hitl_pending"] = True
 
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    if "quota" in error_msg:
-                        yield " API quota exceeded. Please wait."
-                    elif "recursion limit" in error_msg:
-                        yield " The response required too many tool calls. Please try a simpler query or rephrase your question."
-                    else:
-                        yield f" Error: {str(e)}"
-
-            ai_response = st.write_stream(stream_response())
-
-            if used_tools:
-                tool_trace.success(f"Final tools used: {', '.join(sorted(used_tools))}")
-            else:
-                q = user_input.lower()
-                if "weather" in q or "aqi" in q or "temperature" in q or "temp" in q:
-                    tool_trace.success("Final tools used: get_weather")
-                elif "stock" in q or "price" in q:
-                    tool_trace.success("Final tools used: get_stock_price")
-                elif "news" in q or "headline" in q or "trending" in q or "latest" in q:
-                    tool_trace.success("Final tools used: search_tool")
-                elif "time" in q or "date" in q or "today" in q:
-                    tool_trace.success("Final tools used: get_current_date_time")
-                else:
-                    tool_trace.caption("No external tool was needed for this response.")
-
-    refresh_pending_approval(st.session_state['thread_id'])
-
-    st.session_state['message_history'].append(
-        {'role': 'assistant', 'content': ai_response}
-    )
-    
-    # Generate title for new conversation if not already set
-    if st.session_state['thread_id'] not in st.session_state['thread_titles']:
-        title = generate_chat_title(user_input)
-        st.session_state['thread_titles'][st.session_state['thread_id']] = title
+    # Generate a title for this thread after the first message
+    if st.session_state["thread_id"] not in st.session_state["thread_titles"]:
+        title = generate_chat_title(user_text)
+        st.session_state["thread_titles"][st.session_state["thread_id"]] = title
         st.rerun()

@@ -1,675 +1,443 @@
+"""
+chatbotBackend.py
+-----------------
+The main agent brain. This file wires everything together:
+
+1. Defines the ChatState — what data the agent tracks per conversation.
+2. Defines chat_node — the function that decides how to respond to the user.
+3. Builds the LangGraph graph: remember → chat → end.
+4. Sets up a SQLite checkpointer so conversations are saved to disk.
+
+Routing logic inside chat_node (in order):
+  1. Greeting            → reply "Hello! How can I help?"
+  2. HITL resume         → continue after human approved/rejected
+  3. Self-query          → return facts from long-term memory
+  4. Weather question    → call OpenWeather (or DuckDuckGo as fallback)
+  5. Time/date question  → return system clock
+  6. News question       → DuckDuckGo search
+  7. Stock question      → Yahoo Finance
+  8. Has documents?      → RAG retrieval
+     - Low confidence    → PAUSE and ask human to approve
+     - Good context      → answer with citations
+  9. Default             → plain LLM answer
+
+──────────────────────────────────────────────────────────────────────────
+WHAT IS HITL (Human-In-The-Loop)?
+──────────────────────────────────────────────────────────────────────────
+Normally the chatbot answers automatically. But what if the uploaded
+document doesn't really contain the answer? The bot might hallucinate
+or give a wrong answer confidently.
+
+HITL solves this by PAUSING the agent when it is not confident:
+
+  User asks a document question
+       ↓
+  Bot finds very little context in the document (low confidence)
+       ↓
+  Instead of guessing → Bot PAUSES and asks the human:
+  "I don't have enough info. Should I try to answer anyway?"
+       ↓
+  Human clicks "Yes, answer" or "No, skip"
+       ↓
+  Bot resumes with the human's decision
+
+This is implemented using LangGraph's interrupt mechanism:
+- The graph stores `awaiting_hitl = True` in its state.
+- The frontend detects this and shows Approve / Skip buttons.
+- When the human clicks, a new graph invocation resumes with the decision.
+
+Why is this useful?
+- It keeps humans in control when the AI is uncertain.
+- It prevents confidently wrong answers on document questions.
+- It is a real pattern used in production AI systems.
+──────────────────────────────────────────────────────────────────────────
+"""
+
 from __future__ import annotations
 
 import os
-import re
-import sqlite3
 import shutil
+import sqlite3
 from typing import Annotated, TypedDict
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from chatbot_memory import (
-    LTM_STM_MAX_MESSAGES,
-    _extract_name_from_memory,
-    _extract_stm_facts,
-    _filter_messages_for_llm,
-    _format_memory_item,
-    _get_user_memory_context,
-    _get_user_memory_items,
-    _is_self_query,
-    _memory_display_key,
-    _memory_namespace,
-    _open_memory_store,
-    _safe_thread_id,
-    _ensure_memory_store,
-    cleanup_user_memory,
-    clear_user_memory,
+    clear_memory,
+    get_latest_user_message,
+    get_memory_as_text,
+    get_memory_count,
+    get_memory_list,
     get_memory_status,
-    get_user_memory,
-    get_user_memory_count,
+    get_recent_messages,
+    is_self_query,
     remember_node,
 )
 from chatbot_rag import (
-    active_thread_id,
-    get_thread_rag_docs_dir,
-    get_thread_rag_index_dir,
+    _safe_id,
+    get_docs_dir,
+    get_index_dir,
+    get_rag_context,
+    has_documents,
     rebuild_rag_index,
-    rag_retriever_cache,
-    rag_status_cache,
-    _collect_rag_files,
-    _ensure_rag_citations,
-    _rag_context_for_query,
 )
 from chatbot_tools import (
+    call_datetime,
+    call_search,
+    call_stock,
+    call_weather,
+    extract_stock_symbol,
+    extract_weather_location,
+    format_search_response,
+    format_weather_response,
+    is_greeting,
+    is_news_query,
+    is_stock_query,
+    is_time_query,
+    is_weather_query,
     llm,
-    _call_search_tool,
-    _call_stock_tool,
-    _call_time_tool,
-    _call_weather_tool,
-    _collapse_duplicate_phrase,
-    _extract_first_url,
-    _extract_stock_symbol,
-    _extract_urls_from_text,
-    _extract_weather_location,
-    _format_search_results,
-    _format_sources,
-    _is_greeting,
-    _is_news_query,
-    _is_simple_question,
-    _is_stock_query,
-    _is_time_query,
-    _is_weather_query,
-    _llm_needs_tool,
-    _needs_external_tools,
-    _parse_weather_payload,
-    _route_tool_with_llm,
 )
 
 
-# ==============================
+# ══════════════════════════════════════════════════════════════════════════
+# HITL CONFIG
+# If the RAG context is shorter than this, we consider it "low confidence"
+# and pause to ask the human whether to proceed.
+# ══════════════════════════════════════════════════════════════════════════
+HITL_MIN_CONTEXT_LENGTH = 200  # characters
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # STATE
-# ==============================
+# This dictionary is passed through every node in the graph.
+# LangGraph merges the messages list automatically using add_messages.
+# ══════════════════════════════════════════════════════════════════════════
+
 class ChatState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
-    mode: str
-    thread_id: str
-    user_id: str
-    allow_tools: bool
-    pending_weather: bool
-    last_weather_link: str
-    awaiting_approval: bool
-    approval_request: str
-    approval_type: str
-    approval_tool_calls: list[dict]
-    approval_decision: str
-    tools_called_in_turn: int
+    thread_id: str        # unique ID for this conversation
+    user_id: str          # unique ID for this user (for long-term memory)
+
+    # ── HITL fields ──────────────────────────────────────────────────────
+    # These three fields control the Human-In-The-Loop approval flow.
+    awaiting_hitl: bool   # True = bot is paused, waiting for human decision
+    hitl_question: str    # The original question that triggered the pause
+    hitl_decision: str    # Human's answer: "approve" or "skip"
 
 
-# HITL settings: keep only low-confidence RAG approval.
-LOW_CONFIDENCE_RAG_MIN_CHARS = 220
+# ══════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════
 
-
-def _is_document_intent(query: str) -> bool:
-    # Detect if a query is asking about uploaded documents.
-    q = query.lower().strip()
-    if not q:
-        return False
-
-    doc_markers = [
-        "pdf",
-        "document",
-        "doc",
-        "file",
-        "upload",
-        "resume",
-        "letter",
-        "in this",
-        "from this",
-        "according to",
-        "provided",
-        "page",
+def _is_document_question(query: str) -> bool:
+    """
+    Return True if the user is asking about an uploaded document.
+    We check for keywords that suggest the user means "from the file I uploaded".
+    """
+    q = query.lower()
+    doc_keywords = [
+        "pdf", "document", "doc", "file", "upload",
+        "in this", "from this", "according to", "summarize",
+        "what does it say", "the report", "the paper",
     ]
-    return any(marker in q for marker in doc_markers)
+    return any(kw in q for kw in doc_keywords)
 
 
-def _approval_reset_state() -> dict:
-    # Reset HITL approval state in the graph.
-    return {
-        "awaiting_approval": False,
-        "approval_request": "",
-        "approval_type": "",
-        "approval_tool_calls": [],
-        "approval_decision": "",
-    }
-
-
-def _resolve_hitl_decision(state: ChatState, latest_query: str, rag_context: str) -> dict | None:
-    # Apply a human approval decision to continue or refine the response.
-    decision = str(state.get("approval_decision", "")).lower().strip()
-    if not decision:
-        return None
-
-    approval_type = str(state.get("approval_type", ""))
-    if approval_type == "low_confidence_rag":
-        if decision == "approve":
-            forced_prompt = [
-                SystemMessage(
-                    content=(
-                        "Human approved answering from weak document context. "
-                        "Answer only from the provided context and cite sources like [1], [2]."
-                    )
-                ),
-                HumanMessage(content=f"Question: {latest_query}\n\nContext:\n{rag_context}"),
-            ]
-            forced_answer = llm.invoke(forced_prompt)
-            content = _ensure_rag_citations(getattr(forced_answer, "content", ""), rag_context)
-            if content != getattr(forced_answer, "content", ""):
-                forced_answer = AIMessage(content=content)
-            return {**_approval_reset_state(), "messages": [forced_answer]}
-
-        clarify = AIMessage(
-            content=(
-                "I need a little more direction before answering. "
-                "Please refine your question or upload a clearer/more relevant document."
-            )
-        )
-        return {**_approval_reset_state(), "messages": [clarify]}
-
-    return _approval_reset_state()
-
-
-# ==============================
+# ══════════════════════════════════════════════════════════════════════════
 # CHAT NODE
-# ==============================
-def chat_node(state: ChatState):
-    # Main response pipeline: decide routing, apply memory/RAG/tool logic, and return an answer.
-    # Main response pipeline: decide routing, apply memory/RAG/tool logic, and return an answer.
-    latest_query = _latest_user_query(state["messages"])
-    thread_id = _safe_thread_id(state.get("thread_id", "default"))
-    user_id = _safe_thread_id(state.get("user_id") or state.get("thread_id", "default"))
-    memory_context = "" if _is_greeting(latest_query) else _get_user_memory_context(user_id, latest_query)
-    last_weather_link = str(state.get("last_weather_link") or "")
+# The main function that handles every user message.
+# ══════════════════════════════════════════════════════════════════════════
 
-    if _is_greeting(latest_query):
-        return {"messages": [AIMessage(content="Hello! How can I help you today?")], "allow_tools": False}
+def chat_node(state: ChatState) -> dict:
+    """
+    Decide how to respond to the user's latest message.
 
-    if latest_query and _link_request(latest_query):
-        if last_weather_link:
-            return {
-                "messages": [AIMessage(content=last_weather_link)],
-                "allow_tools": False,
-            }
+    The function follows a simple top-to-bottom routing order.
+    The first matching condition wins and returns immediately.
+    """
+    query = get_latest_user_message(state["messages"])
+    thread_id = _safe_id(state.get("thread_id", "default"))
+    user_id = _safe_id(state.get("user_id") or state.get("thread_id", "default"))
 
-    if state.get("pending_weather") and latest_query:
-        raw_weather = _call_weather_tool(latest_query)
-        payload = _parse_weather_payload(raw_weather)
-        if payload:
-            response_text = (
-                "Weather:\n"
-                f"- Location: {payload.get('location', latest_query).strip()}\n"
-                f"- Condition: {payload.get('description', '').strip() or 'Unavailable'}\n"
-                f"- Temperature: {payload.get('temp_c')} C\n"
-                f"- Feels like: {payload.get('feels_like_c')} C\n"
-                f"- Humidity: {payload.get('humidity')}%\n"
-                f"- Wind: {payload.get('wind_mps')} m/s\n\n"
-                f"{_format_sources(['https://openweathermap.org/'], fallback='OpenWeather')}"
+    # ── 1. Greeting ─────────────────────────────────────────────────────
+    if is_greeting(query):
+        return {"messages": [AIMessage(content="Hello! How can I help you today?")]}
+
+    # ── 2. HITL resume: human has made a decision ────────────────────────
+    # When awaiting_hitl is True and hitl_decision is set, the human has
+    # responded to our pause. We now act on their choice.
+    if state.get("awaiting_hitl") and state.get("hitl_decision"):
+        decision = str(state["hitl_decision"]).lower().strip()
+        original_question = str(state.get("hitl_question", query))
+
+        if decision == "approve":
+            # Human said "yes, try to answer even with weak context"
+            rag_context = get_rag_context(original_question, thread_id)
+            prompt = (
+                "The user approved answering from limited document context. "
+                "Do your best using the context below. "
+                "Be honest if the answer is not clearly in the document. "
+                "Cite sources like [1], [2] where possible.\n\n"
+                f"Context:\n{rag_context}\n\n"
+                f"Question: {original_question}"
             )
+            response = llm.invoke([SystemMessage(content=prompt)])
             return {
-                "messages": [AIMessage(content=response_text)],
-                "allow_tools": False,
-                "pending_weather": False,
-                "last_weather_link": "https://openweathermap.org/",
+                "messages": [response],
+                "awaiting_hitl": False,
+                "hitl_question": "",
+                "hitl_decision": "",
             }
-
-        weather_answer = _call_search_tool(f"weather in {latest_query}")
-        if weather_answer:
-            weather_link = _extract_first_url(weather_answer)
-            summary_prompt = (
-                "Summarize the weather in 1-2 short sentences using the provided snippet. "
-                "If the snippet lacks a clear forecast, say that only a link is available."
-            )
-            summary = llm.invoke(
-                [
-                    SystemMessage(content=summary_prompt),
-                    HumanMessage(content=weather_answer),
-                ]
-            ).content.strip()
-            summary = _collapse_duplicate_phrase(summary, "Only a link to the weather forecast is available.")
-            sources = [weather_link] if weather_link else _extract_urls_from_text(weather_answer)
-            response_text = (
-                f"Weather:\n- Location: {latest_query.strip()}\n- Summary: {summary or weather_answer}\n\n"
-                f"{_format_sources(sources, fallback='Web search')}"
-            )
-            return {
-                "messages": [AIMessage(content=response_text)],
-                "allow_tools": False,
-                "pending_weather": False,
-                "last_weather_link": weather_link or last_weather_link,
-            }
-
-        return {
-            "messages": [
-                AIMessage(
-                    content="Weather:\n- Summary: Could not fetch weather data.\n\n"
-                    + _format_sources([], fallback="Web search")
-                )
-            ],
-            "allow_tools": False,
-            "pending_weather": False,
-        }
-
-    if state.get("awaiting_approval") and not state.get("approval_decision"):
-        pending_request = state.get("approval_request", "Approval required. Please choose Approve or Regenerate.")
-        return {"messages": [AIMessage(content=pending_request)]}
-
-    mode = str(state.get("mode", "auto")).lower()
-    if mode not in {"auto", "hybrid", "agent_only", "rag_only"}:
-        mode = "auto"
-
-    if mode == "auto":
-        has_knowledge_files = len(_collect_rag_files(thread_id)) > 0
-        if not has_knowledge_files:
-            mode = "agent_only"
         else:
-            mode = "rag_only" if _is_document_intent(latest_query) else "hybrid"
-
-    rag_context = _rag_context_for_query(latest_query, thread_id) if mode in {"hybrid", "rag_only"} else ""
-
-    decision_result = _resolve_hitl_decision(state, latest_query, rag_context)
-    if decision_result is not None:
-        return decision_result
-
-    route_hint = "none"
-    if latest_query:
-        has_rule_match = any(
-            [
-                _is_weather_query(latest_query),
-                _is_time_query(latest_query),
-                _is_news_query(latest_query),
-                _is_stock_query(latest_query),
-            ]
-        )
-        if not has_rule_match and not _is_simple_question(latest_query):
-            if _llm_needs_tool(latest_query):
-                route_hint = _route_tool_with_llm(latest_query)
-
-    if _is_self_query(latest_query):
-        memory_items = _get_user_memory_items(user_id, latest_query)
-        stm_items = _extract_stm_facts(state.get("messages", []), exclude_latest=True)
-        stm_summary = ""
-        for item in stm_items:
-            if item.lower().startswith("summary of earlier chat:"):
-                stm_summary = item
-                break
-
-        combined_items = memory_items + ([stm_summary] if stm_summary else [])
-        if combined_items:
-            greeting = "Sure, "
-            seen = set()
-            lines = []
-            for item in combined_items:
-                formatted = _format_memory_item(item, "")
-                if not formatted.lower().startswith(("you ", "your ")):
-                    continue
-                key = _memory_display_key(formatted, "")
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                lines.append(f"- {formatted}")
-
-            response_text = f"{greeting}here is what I remember about you:\n" + "\n".join(lines)
-            return {"messages": [AIMessage(content=response_text)]}
-
-        response_text = (
-            "I do not have any saved details about you yet. "
-            "Tell me your name, school, or interests and I will remember them."
-        )
-        return {"messages": [AIMessage(content=response_text)]}
-
-    if mode in {"hybrid", "rag_only"} and _is_document_intent(latest_query):
-        if not rag_context or len(rag_context) < LOW_CONFIDENCE_RAG_MIN_CHARS:
-            request = (
-                "HITL approval needed: document context confidence is low. "
-                "Choose Approve to answer from available context or Regenerate to refine the request."
-            )
+            # Human said "no, skip" — give a polite decline
             return {
-                "awaiting_approval": True,
-                "approval_request": request,
-                "approval_type": "low_confidence_rag",
-                "approval_tool_calls": [],
-                "approval_decision": "",
-                "messages": [AIMessage(content=request)],
-            }
-
-    if _is_weather_query(latest_query) or route_hint == "weather":
-        location = _extract_weather_location(latest_query)
-        if not location:
-            return {
-                "messages": [AIMessage(content="Which city are you asking about?")],
-                "allow_tools": False,
-                "pending_weather": True,
-            }
-        location = location or latest_query
-        raw_weather = _call_weather_tool(location)
-        payload = _parse_weather_payload(raw_weather)
-        if payload:
-            response_text = (
-                "Weather:\n"
-                f"- Location: {payload.get('location', location).strip()}\n"
-                f"- Condition: {payload.get('description', '').strip() or 'Unavailable'}\n"
-                f"- Temperature: {payload.get('temp_c')} C\n"
-                f"- Feels like: {payload.get('feels_like_c')} C\n"
-                f"- Humidity: {payload.get('humidity')}%\n"
-                f"- Wind: {payload.get('wind_mps')} m/s\n\n"
-                f"{_format_sources(['https://openweathermap.org/'], fallback='OpenWeather')}"
-            )
-            return {
-                "messages": [AIMessage(content=response_text)],
-                "allow_tools": False,
-                "pending_weather": False,
-                "last_weather_link": "https://openweathermap.org/",
-            }
-
-        aqi_hint = " AQI" if "aqi" in latest_query.lower() else ""
-        raw_weather = _call_search_tool(f"weather{aqi_hint} in {location}")
-        weather_link = _extract_first_url(raw_weather)
-        summary_prompt = (
-            "Summarize the weather in 1-2 short sentences using the provided snippet. "
-            "If the snippet lacks a clear forecast, say that only a link is available."
-        )
-        summary = llm.invoke(
-            [
-                SystemMessage(content=summary_prompt),
-                HumanMessage(content=raw_weather),
-            ]
-        ).content.strip()
-        summary = _collapse_duplicate_phrase(summary, "Only a link to the weather forecast is available.")
-        sources = [weather_link] if weather_link else _extract_urls_from_text(raw_weather)
-        response_text = (
-            f"Weather:\n- Location: {location}\n- Summary: {summary or raw_weather}\n\n"
-            f"{_format_sources(sources, fallback='Web search')}"
-        )
-        return {
-            "messages": [AIMessage(content=response_text)],
-            "allow_tools": False,
-            "pending_weather": False,
-            "last_weather_link": weather_link or last_weather_link,
-        }
-
-    if _is_time_query(latest_query) or route_hint == "time":
-        now_text = _call_time_tool()
-        response_text = f"Date/Time:\n- {now_text}\n\n" + _format_sources([], fallback="System clock")
-        return {"messages": [AIMessage(content=response_text)], "allow_tools": False}
-
-    if _is_news_query(latest_query) or route_hint == "news":
-        raw_news = _call_search_tool(latest_query)
-        response_text = "Top results:\n" + _format_search_results(raw_news)
-        return {"messages": [AIMessage(content=response_text)], "allow_tools": False}
-
-    if _is_stock_query(latest_query) or route_hint == "stock":
-        symbol = _extract_stock_symbol(latest_query)
-        if symbol:
-            stock_text = _call_stock_tool(symbol)
-            response_text = f"Stock:\n- {stock_text}\n\n" + _format_sources([], fallback="Yahoo Finance")
-            return {
-                "messages": [AIMessage(content=response_text)],
-                "allow_tools": False,
-            }
-        return {
-            "messages": [
-                AIMessage(
+                "messages": [AIMessage(
                     content=(
-                        "Stock:\n- I need a ticker or company name I can match. "
-                        "Try something like 'stock price of Oracle (ORCL)'.\n\n"
-                        + _format_sources([], fallback="Market data")
+                        "Understood. I don't have enough information in the "
+                        "uploaded document to answer confidently. "
+                        "Try uploading a more relevant document or rephrase your question."
                     )
-                )
-            ],
-            "allow_tools": False,
-        }
+                )],
+                "awaiting_hitl": False,
+                "hitl_question": "",
+                "hitl_decision": "",
+            }
 
-    if _needs_external_tools(latest_query) or route_hint == "search":
-        raw = _call_search_tool(latest_query)
-        response_text = "Top results:\n" + _format_search_results(raw)
-        return {"messages": [AIMessage(content=response_text)], "allow_tools": False}
+    # ── 3. Self-query: user asking about their stored info ───────────────
+    if is_self_query(query):
+        facts = get_memory_as_text(user_id)
+        if facts:
+            response = f"Here is what I remember about you:\n{facts}"
+        else:
+            response = (
+                "I don't have any saved details about you yet. "
+                "Tell me your name, interests, or goals and I'll remember them!"
+            )
+        return {"messages": [AIMessage(content=response)]}
 
-    rag_instructions = (
-        f"RAG Context (highest priority if relevant):\n{rag_context}\n\n"
-        "If RAG context clearly answers the question, answer from it and cite source tags like [1], [2]. "
-        "If context is not relevant, then use tools as needed."
-    ) if rag_context else "No RAG context available for this query."
+    # ── 4. Weather ───────────────────────────────────────────────────────
+    if is_weather_query(query):
+        location = extract_weather_location(query)
+        if not location:
+            return {"messages": [AIMessage(content="Which city would you like the weather for?")]}
+        raw = call_weather(location)
+        return {"messages": [AIMessage(content=format_weather_response(raw, location))]}
 
-    allow_tools = False
+    # ── 5. Date / Time ───────────────────────────────────────────────────
+    if is_time_query(query):
+        now = call_datetime()
+        return {"messages": [AIMessage(content=f"Current date and time:\n- {now}\n\nSources:\n- System clock")]}
 
-    system_prompt = f"""
-You are a smart AI assistant.
+    # ── 6. News ──────────────────────────────────────────────────────────
+    if is_news_query(query):
+        raw = call_search(query)
+        return {"messages": [AIMessage(content=format_search_response(raw))]}
 
-CRITICAL INSTRUCTION: After receiving results from a tool, STOP immediately. 
-Generate your final answer from those results. DO NOT call any tools again in the same conversation turn.
+    # ── 7. Stock price ───────────────────────────────────────────────────
+    if is_stock_query(query):
+        symbol = extract_stock_symbol(query)
+        if symbol:
+            result = call_stock(symbol)
+            return {"messages": [AIMessage(content=f"Stock price:\n- {result}\n\nSources:\n- Yahoo Finance")]}
+        return {"messages": [AIMessage(content="Please include a company name or ticker, e.g. 'stock price of ORCL'.")]}
 
-Rules:
-- Current response mode: {mode}
-- Use get_current_date_time for date/time questions
-- If mode is rag_only: answer only from RAG context and clearly say when answer is not found in context
-- If mode is agent_only: use tools for web/stock/math and do not rely on RAG context
-- If mode is hybrid: prefer RAG context when relevant, otherwise use tools
-- When you call a tool and receive results: synthesize them into a clear, concise answer immediately
-- Do not request the same tool again in this turn
-- Do not call multiple tools sequentially unless absolutely necessary
-- Format responses with short bullet points and clear labels
-- Always include a "Sources:" section at the end
-- Keep responses concise and useful
+    # ── 8. RAG: user has uploaded documents ─────────────────────────────
+    if has_documents(thread_id):
+        rag_context = get_rag_context(query, thread_id)
 
-{rag_instructions}
-"""
+        # ── HITL: low-confidence check ───────────────────────────────────
+        # If the retrieved context is very short, the document probably
+        # doesn't contain a good answer. Instead of guessing, we PAUSE
+        # and ask the human whether they want us to try anyway.
+        if _is_document_question(query) and len(rag_context) < HITL_MIN_CONTEXT_LENGTH:
+            pause_message = (
+                "⚠️ I found very little relevant content in your uploaded document "
+                "for this question.\n\n"
+                "Do you want me to try answering with what I found, "
+                "or should I skip and let you rephrase / upload a better document?"
+            )
+            return {
+                "messages": [AIMessage(content=pause_message)],
+                "awaiting_hitl": True,
+                "hitl_question": query,
+                "hitl_decision": "",
+            }
 
-    if memory_context:
-        system_prompt += f"\n\nUser memory (use only if relevant):\n{memory_context}\n"
+        # Good context — answer with citations
+        if rag_context:
+            system_prompt = (
+                "Answer the question using ONLY the document context below. "
+                "Cite sources like [1], [2]. "
+                "If the answer is not in the context, say so clearly.\n\n"
+                f"Document context:\n{rag_context}"
+            )
+            recent = get_recent_messages(state["messages"])
+            response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
+            return {"messages": [response]}
 
-    short_term_messages = state["messages"][-LTM_STM_MAX_MESSAGES:]
-    safe_messages = _filter_messages_for_llm(short_term_messages)
-    if not safe_messages and latest_query:
-        safe_messages = [HumanMessage(content=latest_query)]
-    if not safe_messages:
-        return {
-            "messages": [AIMessage(content="I need a question to answer. Please ask again.")],
-            "allow_tools": False,
-            "tools_called_in_turn": state.get("tools_called_in_turn", 0),
-        }
-    messages = [SystemMessage(content=system_prompt)] + safe_messages
+    # ── 9. Default LLM answer (with memory context if available) ─────────
+    memory_text = get_memory_as_text(user_id)
 
-    token = active_thread_id.set(thread_id)
-    try:
-        response = llm.invoke(messages)
-    finally:
-        active_thread_id.reset(token)
-    if rag_context:
-        content = _ensure_rag_citations(getattr(response, "content", ""), rag_context)
-        if content != getattr(response, "content", ""):
-            response = AIMessage(content=content)
+    system_parts = ["You are a helpful AI assistant. Answer clearly and concisely."]
+    if memory_text:
+        system_parts.append(f"\nFacts about the user (use only if relevant):\n{memory_text}")
 
-    if not str(getattr(response, "content", "") or "").strip():
-        messages = state.get("messages", [])
-        last_human_idx = None
-        for idx in range(len(messages) - 1, -1, -1):
-            if isinstance(messages[idx], HumanMessage):
-                last_human_idx = idx
-                break
-        last_tool = None
-        if last_human_idx is not None:
-            for msg in reversed(messages[last_human_idx + 1:]):
-                if isinstance(msg, ToolMessage):
-                    last_tool = msg
-                    break
-        if last_tool and str(getattr(last_tool, "content", "") or "").strip():
-            response = AIMessage(content=str(getattr(last_tool, "content", "")).strip())
-
-    return {"messages": [response], "allow_tools": allow_tools, "tools_called_in_turn": state.get("tools_called_in_turn", 0)}
-
-
-def _latest_user_query(messages: list[BaseMessage]) -> str:
-    # Return the most recent user text message.
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
-            return msg.content
-    return ""
-
-
-def _link_request(text: str) -> bool:
-    # Detect requests that ask for a previously shared link.
-    return bool(re.search(r"\b(link|that link|the link|share link|give me that link)\b", text.lower()))
+    system_prompt = "\n".join(system_parts)
+    recent = get_recent_messages(state["messages"])
+    response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
+    return {"messages": [response]}
 
 
-def route_after_chat(state: ChatState):
-    # Determine whether to pause for HITL approval or finish the turn.
-    if state.get("awaiting_approval"):
-        return "wait_for_human"
-    return "__end__"
+# ══════════════════════════════════════════════════════════════════════════
+# ROUTING FUNCTION
+# After chat_node runs, this decides which node comes next.
+# If we are waiting for human input, we go to END (graph pauses).
+# Otherwise, we also go to END (graph is done for this turn).
+#
+# The key difference: when awaiting_hitl=True, the graph state is SAVED
+# but the conversation is considered "incomplete". The frontend detects
+# this and shows the Approve/Skip buttons to the user.
+# ══════════════════════════════════════════════════════════════════════════
+
+def route_after_chat(state: ChatState) -> str:
+    """Return 'end' always — the graph pauses naturally via checkpointing."""
+    return END
 
 
-# ==============================
-# DATABASE (MEMORY)
-# ==============================
-def init_checkpointer():
-    # Initialize the SqliteSaver checkpointer for chat state persistence.
-    # Initialize the SqliteSaver checkpointer for chat state persistence.
+# ══════════════════════════════════════════════════════════════════════════
+# SQLITE CHECKPOINTER
+# Saves conversation state to a local SQLite file so chats persist
+# across app restarts. This is also what makes HITL possible —
+# the graph state (including awaiting_hitl=True) is saved here,
+# so the frontend can read it and show the approval buttons.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _init_checkpointer():
+    """Create (or recover) the SQLite checkpointer."""
     db_path = "chatbot_db"
-
     try:
         conn = sqlite3.connect(db_path, check_same_thread=False)
         conn.execute("SELECT 1")
-        checkpointer = SqliteSaver(conn=conn)
-        return checkpointer, conn
-    except Exception as err:
-        print(f"Checkpoint error detected: {err}. Recovering...")
-
+        return SqliteSaver(conn=conn), conn
+    except Exception as e:
+        print(f"Checkpoint DB error: {e}. Creating a fresh one.")
         if os.path.exists(db_path):
-            backup_path = f"{db_path}.backup_{os.getpid()}"
-            try:
-                os.rename(db_path, backup_path)
-                print(f"Backed up corrupted database to {backup_path}")
-            except Exception as backup_err:
-                print(f"Backup failed: {backup_err}")
-
+            os.rename(db_path, f"{db_path}.bak")
         conn = sqlite3.connect(db_path, check_same_thread=False)
-        checkpointer = SqliteSaver(conn=conn)
-        print("Fresh checkpoint database created")
-        return checkpointer, conn
+        return SqliteSaver(conn=conn), conn
 
 
-checkpointer, conn = init_checkpointer()
+checkpointer, _db_conn = _init_checkpointer()
 
 
-def delete_thread_history(thread_id: str) -> str:
-    # Delete all stored checkpoints and RAG artifacts for a thread.
+# ══════════════════════════════════════════════════════════════════════════
+# LANGGRAPH — BUILD THE AGENT GRAPH
+#
+# Flow:  START → remember → chat → END
+#
+#   remember : extract facts from the user message and save to LTM
+#   chat     : decide the response (may set awaiting_hitl=True to pause)
+# ══════════════════════════════════════════════════════════════════════════
+
+_builder = StateGraph(ChatState)
+_builder.add_node("remember", remember_node)
+_builder.add_node("chat", chat_node)
+_builder.add_edge(START, "remember")
+_builder.add_edge("remember", "chat")
+_builder.add_edge("chat", END)
+
+chatbot = _builder.compile(checkpointer=checkpointer)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# THREAD UTILITIES
+# Helper functions used by the Streamlit frontend.
+# ══════════════════════════════════════════════════════════════════════════
+
+def list_all_threads() -> list[str]:
+    """Return all thread IDs that have saved checkpoints."""
+    threads = set()
+    for checkpoint in checkpointer.list(None):
+        threads.add(checkpoint.config["configurable"]["thread_id"])
+    return list(threads)
+
+
+def get_thread_hitl_state(thread_id: str, user_id: str) -> dict:
+    """
+    Read the current graph state for a thread and return the HITL fields.
+    The frontend calls this on page load to check if an approval is pending.
+
+    Returns a dict like:
+      {"awaiting": True, "question": "What does the PDF say about X?"}
+    or
+      {"awaiting": False}
+    """
+    try:
+        state = chatbot.get_state(
+            config={"configurable": {"thread_id": thread_id, "user_id": user_id}}
+        )
+        values = state.values or {}
+        if values.get("awaiting_hitl"):
+            return {
+                "awaiting": True,
+                "question": values.get("hitl_question", ""),
+            }
+    except Exception:
+        pass
+    return {"awaiting": False}
+
+
+def delete_thread(thread_id: str) -> str:
+    """
+    Delete a conversation thread:
+    - Remove its checkpoints from SQLite.
+    - Delete its uploaded documents.
+    - Delete its FAISS index.
+    """
     if not thread_id or not thread_id.strip():
-        return "Delete failed: invalid thread id."
+        return "Delete failed: invalid thread ID."
 
-    thread_key = _safe_thread_id(thread_id)
+    tid = _safe_id(thread_id)
+    deleted_rows = 0
 
     try:
-        cur = conn.cursor()
+        cur = _db_conn.cursor()
         tables = [
-            row[0]
-            for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            r[0] for r in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
         ]
-
-        total_deleted = 0
         for table in tables:
             columns = [r[1] for r in cur.execute(f'PRAGMA table_info("{table}")').fetchall()]
             if "thread_id" not in columns:
                 continue
+            cur.execute(f'DELETE FROM "{table}" WHERE thread_id = ?', (tid,))
+            deleted_rows += cur.rowcount or 0
+        _db_conn.commit()
+    except Exception as e:
+        return f"Delete failed: {e}"
 
-            cur.execute(f'DELETE FROM "{table}" WHERE thread_id = ?', (thread_key,))
-            if cur.rowcount and cur.rowcount > 0:
-                total_deleted += cur.rowcount
+    for folder in [get_docs_dir(tid), get_index_dir(tid)]:
+        if folder.exists():
+            shutil.rmtree(folder, ignore_errors=True)
 
-        conn.commit()
-
-        for folder in [get_thread_rag_docs_dir(thread_key), get_thread_rag_index_dir(thread_key)]:
-            if folder.exists():
-                shutil.rmtree(folder, ignore_errors=True)
-
-        rag_retriever_cache.pop(thread_key, None)
-        rag_status_cache.pop(thread_key, None)
-
-        if _ensure_memory_store():
-            try:
-                ns = _memory_namespace(thread_key)
-                with _open_memory_store() as store:
-                    if store is not None:
-                        items = store.search(ns)
-                        for item in items:
-                            key = getattr(item, "key", None)
-                            if key is not None:
-                                store.delete(ns, key)
-            except Exception:
-                pass
-
-        if total_deleted == 0:
-            return "Chat deleted permanently (no checkpoints found, local docs/index removed)."
-
-        return f"Chat deleted permanently ({total_deleted} checkpoint rows removed)."
-    except Exception as err:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return f"Delete failed: {err}"
+    return f"Chat deleted ({deleted_rows} checkpoint rows removed)."
 
 
-# ==============================
-# GRAPH (AGENT)
-# ==============================
-builder = StateGraph(ChatState)
-
-builder.add_node("remember", remember_node)
-builder.add_node("chat_node", chat_node)
-
-builder.add_edge(START, "remember")
-builder.add_edge("remember", "chat_node")
-
-builder.add_conditional_edges(
-    "chat_node",
-    route_after_chat,
-    {
-        "wait_for_human": END,
-        "__end__": END,
-    },
-)
-
-chatbot = builder.compile(checkpointer=checkpointer)
-
-
-# ==============================
-# CHAT TITLE GENERATION
-# ==============================
-def generate_chat_title(user_message: str) -> str:
-    # Generate a short chat title from the first user message.
-    if not user_message or not user_message.strip():
+def generate_chat_title(first_message: str) -> str:
+    """Generate a short title for a chat from the user's first message."""
+    if not first_message or not first_message.strip():
         return "New Chat"
-
-    msg = user_message.strip()[:200]
-
     try:
         prompt = (
-            "Given this user message, generate a very short chat title (2-5 words max, no punctuation).\n"
-            "Only return the title, nothing else.\n\n"
-            f"User message: {msg}\n\n"
-            "Title:"
+            "Generate a very short chat title (2-5 words, no punctuation) "
+            "for this user message. Return only the title.\n\n"
+            f"Message: {first_message[:200]}"
         )
-        title = llm.invoke(prompt).content.strip()
-        title = title.strip('"\'.!?,;:').strip()
-        if title:
-            return title[:50]
-    except Exception as err:
-        print(f"Title generation error (using fallback): {str(err)[:50]}")
-
-    words = msg.split()
-    if words:
-        fallback_title = " ".join(words[:5])
-        if len(fallback_title) > 50:
-            fallback_title = fallback_title[:47] + "..."
-        return fallback_title
-
-    return "New Chat"
-
-
-# ==============================
-# THREAD UTIL
-# ==============================
-def unique_thread_pointer():
-    # List all thread IDs stored in the checkpointer.
-    all_threads = set()
-    for checkpoint in checkpointer.list(None):
-        all_threads.add(checkpoint.config["configurable"]["thread_id"])
-    return list(all_threads)
+        title = llm.invoke(prompt).content.strip().strip('"\'.,!?')
+        return title[:50] if title else " ".join(first_message.split()[:5])
+    except Exception:
+        return " ".join(first_message.split()[:5]) or "New Chat"

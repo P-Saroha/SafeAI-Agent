@@ -1,313 +1,253 @@
-from __future__ import annotations
+"""
+chatbot_rag.py
+--------------
+RAG (Retrieval-Augmented Generation) helpers.
 
-import hashlib
-import json
+What this file does:
+1. Lets each chat thread have its own folder of uploaded documents (PDF, TXT, MD).
+2. Builds a FAISS vector index from those documents so we can search them.
+3. Given a user question, finds the most relevant chunks and returns them as context.
+
+Folder layout:
+  knowledge_base/<thread_id>/   ← uploaded documents
+  faiss_index/<thread_id>/      ← saved FAISS index for that thread
+"""
+
 import os
 import re
-from contextvars import ContextVar
 from pathlib import Path
 
-import numpy as np
 from dotenv import find_dotenv, load_dotenv
-from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-try:
-    from langchain_community.vectorstores import FAISS
-    from langchain_community.document_loaders import PyPDFLoader, TextLoader
-except Exception:
-    FAISS = None
-    PyPDFLoader = None
-    TextLoader = None
 
 load_dotenv(find_dotenv())
 
+# Optional heavy imports — the app still works without them
+try:
+    from langchain_community.document_loaders import PyPDFLoader, TextLoader
+    from langchain_community.vectorstores import FAISS
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+
+try:
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    GOOGLE_EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    GOOGLE_EMBEDDINGS_AVAILABLE = False
+
+
+# ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
-RAG_DOCS_ROOT = BASE_DIR / "knowledge_base"
-RAG_INDEX_ROOT = BASE_DIR / "faiss_index"
+DOCS_ROOT = BASE_DIR / "knowledge_base"   # uploaded files go here
+INDEX_ROOT = BASE_DIR / "faiss_index"     # FAISS indexes saved here
 
-rag_retriever_cache: dict[str, object] = {}
-rag_status_cache: dict[str, str] = {}
-
-active_thread_id = ContextVar("active_thread_id", default="default")
+# Simple in-memory caches so we don't rebuild the index on every question
+_retriever_cache: dict[str, object] = {}
 
 
-def _safe_thread_id(thread_id: str) -> str:
-    # Normalize thread IDs for safe filesystem and index usage.
+# ══════════════════════════════════════════════════════════════════════════
+# PATH HELPERS
+# ══════════════════════════════════════════════════════════════════════════
+
+def _safe_id(thread_id: str) -> str:
+    """Remove unsafe characters from a thread ID so it can be used as a folder name."""
     value = str(thread_id or "default").strip()
-    value = re.sub(r"[^A-Za-z0-9._-]", "_", value)
-    return value or "default"
+    return re.sub(r"[^A-Za-z0-9._-]", "_", value) or "default"
 
 
-def get_thread_rag_docs_dir(thread_id: str) -> Path:
-    # Return the per-thread document upload directory.
-    return RAG_DOCS_ROOT / _safe_thread_id(thread_id)
+def get_docs_dir(thread_id: str) -> Path:
+    """Return the folder where uploaded documents for this thread are stored."""
+    return DOCS_ROOT / _safe_id(thread_id)
 
 
-def get_thread_rag_index_dir(thread_id: str) -> Path:
-    # Return the per-thread FAISS index directory.
-    return RAG_INDEX_ROOT / _safe_thread_id(thread_id)
+def get_index_dir(thread_id: str) -> Path:
+    """Return the folder where the FAISS index for this thread is stored."""
+    return INDEX_ROOT / _safe_id(thread_id)
 
 
-def _get_rag_status(thread_id: str) -> str:
-    # Read the cached RAG status message for a thread.
-    return rag_status_cache.get(_safe_thread_id(thread_id), "RAG not initialized")
+# ══════════════════════════════════════════════════════════════════════════
+# EMBEDDING BACKEND
+# Uses Google embeddings if available, otherwise falls back to a simple
+# hash-based embedding that needs no API key.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _get_embeddings():
+    """Return the best available embedding model."""
+    backend = os.getenv("RAG_EMBEDDING_BACKEND", "hash").lower()
+
+    if backend == "google" and GOOGLE_EMBEDDINGS_AVAILABLE:
+        model = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/text-embedding-004")
+        return GoogleGenerativeAIEmbeddings(model=model)
+
+    # Fallback: local hash embeddings (no API key needed)
+    return _HashEmbeddings()
 
 
-def _set_rag_status(thread_id: str, status: str) -> None:
-    # Update the cached RAG status message for a thread.
-    rag_status_cache[_safe_thread_id(thread_id)] = status
+class _HashEmbeddings:
+    """
+    A very simple embedding model that works offline with no API key.
+    It converts text into a vector using word hashes.
+    Good enough for small document sets.
+    """
 
-
-class HashEmbeddings(Embeddings):
-    """Deterministic local embeddings fallback for FAISS without external API calls."""
-
-    def __init__(self, dim: int = 384):
-        self.dim = dim
-
-    def _hash_token(self, token: str) -> int:
-        # Hash a token into a fixed embedding dimension.
-        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        return int(digest, 16) % self.dim
+    DIM = 384  # vector size
 
     def _embed(self, text: str) -> list[float]:
-        # Build a simple bag-of-words embedding using token hashes.
-        vec = np.zeros(self.dim, dtype=np.float32)
-        tokens = text.lower().split()
-        if not tokens:
-            return vec.tolist()
-
-        for token in tokens:
-            vec[self._hash_token(token)] += 1.0
-
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-
-        return vec.tolist()
+        import hashlib, numpy as np
+        vec = [0.0] * self.DIM
+        for word in text.lower().split():
+            idx = int(hashlib.sha256(word.encode()).hexdigest(), 16) % self.DIM
+            vec[idx] += 1.0
+        # Normalize so all vectors have length 1
+        norm = sum(v * v for v in vec) ** 0.5
+        return [v / norm for v in vec] if norm > 0 else vec
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        # Embed a batch of documents for indexing.
         return [self._embed(t) for t in texts]
 
     def embed_query(self, text: str) -> list[float]:
-        # Embed a single query string.
         return self._embed(text)
 
 
-def _embedding_from_backend(backend: str):
-    # Choose embedding backend (Google or local hash embeddings).
-    if backend == "google":
-        model_name = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/text-embedding-004")
-        return GoogleGenerativeAIEmbeddings(model=model_name), {"backend": "google", "model": model_name}
+# ══════════════════════════════════════════════════════════════════════════
+# DOCUMENT LOADING
+# ══════════════════════════════════════════════════════════════════════════
 
-    dim = int(os.getenv("RAG_HASH_EMBEDDING_DIM", "384"))
-    return HashEmbeddings(dim=dim), {"backend": "hash", "dim": dim}
-
-
-def _save_rag_meta(meta: dict, thread_id: str) -> None:
-    # Persist RAG index metadata to disk.
-    index_dir = get_thread_rag_index_dir(thread_id)
-    try:
-        index_dir.mkdir(parents=True, exist_ok=True)
-        with open(index_dir / "meta.json", "w", encoding="utf-8") as fp:
-            json.dump(meta, fp, indent=2)
-    except Exception as err:
-        print(f"RAG meta save warning: {err}")
+def _get_supported_files(thread_id: str) -> list[Path]:
+    """Return all PDF, TXT, and MD files uploaded for this thread."""
+    docs_dir = get_docs_dir(thread_id)
+    if not docs_dir.exists():
+        return []
+    supported = {".pdf", ".txt", ".md"}
+    return sorted(p for p in docs_dir.rglob("*") if p.is_file() and p.suffix.lower() in supported)
 
 
-def _load_rag_meta(thread_id: str) -> dict:
-    # Load RAG index metadata from disk.
-    meta_path = get_thread_rag_index_dir(thread_id) / "meta.json"
-    if not meta_path.exists():
-        return {}
-    try:
-        with open(meta_path, "r", encoding="utf-8") as fp:
-            return json.load(fp)
-    except Exception:
-        return {}
-
-
-def _collect_rag_files(thread_id: str) -> list[Path]:
-    # Collect supported files from the per-thread knowledge base.
-    supported = {".txt", ".md", ".pdf"}
-    files: list[Path] = []
-
-    docs_dir = get_thread_rag_docs_dir(thread_id)
-    if docs_dir.exists():
-        files.extend([p for p in docs_dir.rglob("*") if p.is_file() and p.suffix.lower() in supported])
-
-    unique_files = list(dict.fromkeys(files))
-    return sorted(unique_files)
-
-
-def _load_documents(paths: list[Path]) -> list[Document]:
-    # Load PDF/TXT/MD files into LangChain documents.
-    documents: list[Document] = []
-
-    for path in paths:
-        suffix = path.suffix.lower()
+def _load_documents(files: list[Path]):
+    """Load each file into LangChain Document objects."""
+    docs = []
+    for path in files:
         try:
-            if suffix == ".pdf":
-                if PyPDFLoader is None:
-                    continue
+            if path.suffix.lower() == ".pdf":
                 loader = PyPDFLoader(str(path))
-                documents.extend(loader.load())
             else:
-                if TextLoader is None:
-                    continue
                 loader = TextLoader(str(path), encoding="utf-8")
-                documents.extend(loader.load())
-        except Exception as err:
-            name = getattr(path, "name", str(path))
-            print(f"RAG load warning for {name}: {err}")
-
-    return documents
+            docs.extend(loader.load())
+        except Exception as e:
+            print(f"Could not load {path.name}: {e}")
+    return docs
 
 
-def _build_rag_retriever(thread_id: str, force_rebuild: bool = False):
-    # Build or load the per-thread FAISS retriever from uploaded documents.
-    # Build or load the per-thread FAISS retriever from uploaded documents.
-    thread_key = _safe_thread_id(thread_id)
-    index_dir = get_thread_rag_index_dir(thread_key)
-    docs_dir = get_thread_rag_docs_dir(thread_key)
+# ══════════════════════════════════════════════════════════════════════════
+# INDEX BUILDING & RETRIEVAL
+# ══════════════════════════════════════════════════════════════════════════
 
-    if FAISS is None:
-        _set_rag_status(thread_key, "RAG unavailable: install faiss-cpu and document loaders")
+def _build_retriever(thread_id: str, force_rebuild: bool = False):
+    """
+    Build (or load from disk) the FAISS retriever for a thread.
+    Returns None if there are no documents or RAG is not available.
+    """
+    if not RAG_AVAILABLE:
         return None
 
-    files = _collect_rag_files(thread_key)
+    tid = _safe_id(thread_id)
+    index_dir = get_index_dir(tid)
+    files = _get_supported_files(tid)
+
     if not files:
-        _set_rag_status(thread_key, f"RAG knowledge base is empty for this chat ({docs_dir})")
-        return None
+        return None  # No documents uploaded yet
 
-    preferred_backend = os.getenv("RAG_EMBEDDING_BACKEND", "hash").lower()
+    embeddings = _get_embeddings()
 
-    try:
-        if index_dir.exists() and not force_rebuild:
-            meta = _load_rag_meta(thread_key)
-            load_backend = meta.get("backend", preferred_backend)
-            embeddings, _ = _embedding_from_backend(load_backend)
+    # Load existing index from disk if it exists and we are not forcing a rebuild
+    if index_dir.exists() and not force_rebuild:
+        try:
             vectorstore = FAISS.load_local(
-                str(index_dir),
-                embeddings,
-                allow_dangerous_deserialization=True,
+                str(index_dir), embeddings, allow_dangerous_deserialization=True
             )
-            _set_rag_status(thread_key, f"RAG ready (loaded index, {len(files)} files, backend={load_backend})")
-            return vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-    except Exception as err:
-        print(f"RAG index load warning, rebuilding: {err}")
+            return vectorstore.as_retriever(search_kwargs={"k": 4})
+        except Exception as e:
+            print(f"Could not load FAISS index, rebuilding: {e}")
 
+    # Build a fresh index from the uploaded documents
     docs = _load_documents(files)
     if not docs:
-        _set_rag_status(thread_key, "RAG could not load readable documents")
         return None
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(docs)
-
     if not chunks:
-        _set_rag_status(thread_key, "RAG found no chunks after splitting")
         return None
-
-    embeddings, meta = _embedding_from_backend(preferred_backend)
 
     try:
         vectorstore = FAISS.from_documents(chunks, embeddings)
-    except Exception as err:
-        _set_rag_status(thread_key, f"RAG embedding/index build failed: {err}")
+    except Exception as e:
+        print(f"FAISS build error: {e}")
         return None
 
+    # Save to disk so we can reload next time without rebuilding
     index_dir.mkdir(parents=True, exist_ok=True)
     vectorstore.save_local(str(index_dir))
-    meta.update({"files_indexed": len(files), "chunks": len(chunks)})
-    _save_rag_meta(meta, thread_key)
 
-    status = (
-        f"RAG ready (built index with {len(chunks)} chunks from {len(files)} files, "
-        f"backend={meta.get('backend')})"
-    )
-    _set_rag_status(thread_key, status)
-    return vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-
-
-def ensure_rag_ready(thread_id: str, force_rebuild: bool = False):
-    # Ensure the retriever is initialized and cached for a thread.
-    thread_key = _safe_thread_id(thread_id)
-
-    if thread_key not in rag_retriever_cache or force_rebuild:
-        rag_retriever_cache[thread_key] = _build_rag_retriever(thread_key, force_rebuild=force_rebuild)
-
-    return rag_retriever_cache.get(thread_key)
+    return vectorstore.as_retriever(search_kwargs={"k": 4})
 
 
 def rebuild_rag_index(thread_id: str) -> str:
-    # Force a rebuild of the FAISS index for a thread.
-    thread_key = _safe_thread_id(thread_id)
-    retriever = ensure_rag_ready(thread_key, force_rebuild=True)
-    if retriever is None:
-        return f"RAG rebuild failed: {_get_rag_status(thread_key)}"
-    return f"RAG rebuild successful: {_get_rag_status(thread_key)}"
+    """Force a full rebuild of the FAISS index and update the cache."""
+    tid = _safe_id(thread_id)
+    retriever = _build_retriever(tid, force_rebuild=True)
+    _retriever_cache[tid] = retriever
+
+    files = _get_supported_files(tid)
+    if retriever:
+        return f"RAG index rebuilt successfully with {len(files)} file(s)."
+    return "RAG index rebuild failed — no documents found or load error."
 
 
-def _rag_context_for_query(query: str, thread_id: str, k: int = 4) -> str:
-    # Fetch top-k relevant chunks and format them into a single RAG context string.
-    # Fetch top-k relevant chunks and format them into a single RAG context string.
+def get_rag_context(query: str, thread_id: str) -> str:
+    """
+    Search the document index and return the most relevant text chunks.
+
+    The result is formatted like:
+      [1] filename.pdf (page 1): ... chunk text ...
+      [2] notes.txt: ... chunk text ...
+
+    These [1], [2] tags are used as citations in the final answer.
+    Returns an empty string if no documents are indexed.
+    """
     if not query.strip():
         return ""
 
-    retriever = ensure_rag_ready(thread_id)
+    tid = _safe_id(thread_id)
+
+    # Build or reuse the cached retriever
+    if tid not in _retriever_cache:
+        _retriever_cache[tid] = _build_retriever(tid)
+
+    retriever = _retriever_cache.get(tid)
     if retriever is None:
         return ""
 
     try:
         docs = retriever.invoke(query)
-    except Exception:
+    except Exception as e:
+        print(f"RAG retrieval error: {e}")
         return ""
 
     if not docs:
         return ""
 
     snippets = []
-    for i, doc in enumerate(docs[:k], start=1):
+    for i, doc in enumerate(docs, start=1):
         source = Path(str(doc.metadata.get("source", "unknown"))).name
         page = doc.metadata.get("page")
         page_info = f" (page {page + 1})" if isinstance(page, int) else ""
-        chunk = doc.page_content.strip().replace("\n", " ")
-        snippets.append(f"[{i}] {source}{page_info}: {chunk}")
+        text = doc.page_content.strip().replace("\n", " ")
+        snippets.append(f"[{i}] {source}{page_info}: {text}")
 
     return "\n\n".join(snippets)
 
 
-def _extract_rag_source_tags(rag_context: str) -> list[str]:
-    # Extract citation tags like [1], [2] from the RAG context.
-    tags = re.findall(r"\[(\d+)\]", rag_context or "")
-    seen = set()
-    ordered = []
-    for tag in tags:
-        if tag in seen:
-            continue
-        seen.add(tag)
-        ordered.append(f"[{tag}]")
-    return ordered
-
-
-def _ensure_rag_citations(text: str, rag_context: str) -> str:
-    # Append source tags if the answer lacks citations.
-    if not rag_context:
-        return text
-
-    if re.search(r"\[\d+\]", text or ""):
-        return text
-
-    tags = _extract_rag_source_tags(rag_context)
-    if not tags:
-        return text
-
-    suffix = "Sources: " + ", ".join(tags)
-    if text.strip().endswith("."):
-        return f"{text}\n\n{suffix}"
-    return f"{text}\n\n{suffix}"
+def has_documents(thread_id: str) -> bool:
+    """Return True if this thread has any uploaded documents."""
+    return len(_get_supported_files(_safe_id(thread_id))) > 0
