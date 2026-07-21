@@ -273,10 +273,3 @@ def format_weather_response(raw_json: str, location: str) -> str:
         f"| Wind speed | {data.get('wind_mps')} m/s |\n\n"
         f"**Sources:** https://openweathermap.org/"
     )
-
-
-def format_search_response(raw: str) -> str:
-    """Wrap search results in a clean 'Top results:' block."""
-    if not raw or raw.strip() == "No results found.":
-        return "No results found."
-    return f"Top results:\n{raw}"
