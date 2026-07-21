@@ -103,6 +103,31 @@ from chatbot_tools import (
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# CITATION HELPER
+# Every response ends with a small "Powered by" footer so the user
+# always knows where the information came from.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _cite(source: str) -> str:
+    """
+    Return a markdown citation footer line.
+
+    Usage:
+        content = f"Some answer\n\n{_cite('OpenWeather API')}"
+
+    Available source labels and what they mean:
+        "OpenWeather API"  — real-time weather data
+        "Yahoo Finance"    — live stock prices
+        "DuckDuckGo"       — web search results
+        "System Clock"     — local machine date/time
+        "Gemini 2.5 Flash" — LLM-generated answer (no external data)
+        "FAISS + Gemini"   — document RAG + LLM answer with citations
+        "PostgreSQL LTM"   — facts retrieved from long-term memory store
+    """
+    return f"> 🔧 **Powered by:** {source}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # HITL CONFIG
 # If the RAG context is shorter than this, we consider it "low confidence"
 # and pause to ask the human whether to proceed.
@@ -167,14 +192,11 @@ def chat_node(state: ChatState) -> dict:
         return {"messages": [AIMessage(content="Hello! How can I help you today?")]}
 
     # ── 2. HITL resume: human has made a decision ────────────────────────
-    # When awaiting_hitl is True and hitl_decision is set, the human has
-    # responded to our pause. We now act on their choice.
     if state.get("awaiting_hitl") and state.get("hitl_decision"):
         decision = str(state["hitl_decision"]).lower().strip()
         original_question = str(state.get("hitl_question", query))
 
         if decision == "approve":
-            # Human said "yes, try to answer even with weak context"
             rag_context = get_rag_context(original_question, thread_id)
             prompt = (
                 "The user approved answering from limited document context. "
@@ -185,14 +207,14 @@ def chat_node(state: ChatState) -> dict:
                 f"Question: {original_question}"
             )
             response = llm.invoke([SystemMessage(content=prompt)])
+            content = f"{response.content}\n\n{_cite('FAISS + Gemini 2.5 Flash (low-confidence approval)')}"
             return {
-                "messages": [response],
+                "messages": [AIMessage(content=content)],
                 "awaiting_hitl": False,
                 "hitl_question": "",
                 "hitl_decision": "",
             }
         else:
-            # Human said "no, skip" — give a polite decline
             return {
                 "messages": [AIMessage(
                     content=(
@@ -206,11 +228,11 @@ def chat_node(state: ChatState) -> dict:
                 "hitl_decision": "",
             }
 
-    # ── 3. Self-query: user asking about their stored info ───────────────
+    # ── 3. Self-query ────────────────────────────────────────────────────
     if is_self_query(query):
         facts = get_memory_as_text(user_id)
         if facts:
-            response = f"Here is what I remember about you:\n{facts}"
+            response = f"Here is what I remember about you:\n\n{facts}\n\n{_cite('PostgreSQL Long-Term Memory')}"
         else:
             response = (
                 "I don't have any saved details about you yet. "
@@ -224,34 +246,48 @@ def chat_node(state: ChatState) -> dict:
         if not location:
             return {"messages": [AIMessage(content="Which city would you like the weather for?")]}
         raw = call_weather(location)
-        return {"messages": [AIMessage(content=format_weather_response(raw, location))]}
+        content = format_weather_response(raw, location)
+        # format_weather_response already adds a Sources line — append citation below it
+        content = f"{content}\n\n{_cite('OpenWeather API')}"
+        return {"messages": [AIMessage(content=content)]}
 
     # ── 5. Date / Time ───────────────────────────────────────────────────
     if is_time_query(query):
         now = call_datetime()
-        return {"messages": [AIMessage(content=f"Current date and time:\n- {now}\n\nSources:\n- System clock")]}
+        content = (
+            f"### Current Date & Time\n\n"
+            f"**{now}**\n\n"
+            f"{_cite('System Clock')}"
+        )
+        return {"messages": [AIMessage(content=content)]}
 
     # ── 6. News ──────────────────────────────────────────────────────────
     if is_news_query(query):
-        raw = call_search(query)
-        return {"messages": [AIMessage(content=format_search_response(raw))]}
+        results = call_search(query)
+        # format_search_response already appends source URLs — add powered-by below
+        content = f"{format_search_response(results, query)}\n\n{_cite('DuckDuckGo Search + Gemini 2.5 Flash')}"
+        return {"messages": [AIMessage(content=content)]}
 
     # ── 7. Stock price ───────────────────────────────────────────────────
     if is_stock_query(query):
         symbol = extract_stock_symbol(query)
         if symbol:
             result = call_stock(symbol)
-            return {"messages": [AIMessage(content=f"Stock price:\n- {result}\n\nSources:\n- Yahoo Finance")]}
-        return {"messages": [AIMessage(content="Please include a company name or ticker, e.g. 'stock price of ORCL'.")]}
+            content = (
+                f"### Stock Price — {symbol}\n\n"
+                f"**{result}**\n\n"
+                f"**Data source:** https://finance.yahoo.com/quote/{symbol}\n\n"
+                f"{_cite('Yahoo Finance via yfinance')}"
+            )
+            return {"messages": [AIMessage(content=content)]}
+        return {"messages": [AIMessage(
+            content="Please include a company name or ticker, e.g. *'stock price of ORCL'*"
+        )]}
 
-    # ── 8. RAG: user has uploaded documents ─────────────────────────────
+    # ── 8. RAG ───────────────────────────────────────────────────────────
     if has_documents(thread_id):
         rag_context = get_rag_context(query, thread_id)
 
-        # ── HITL: low-confidence check ───────────────────────────────────
-        # If the retrieved context is very short, the document probably
-        # doesn't contain a good answer. Instead of guessing, we PAUSE
-        # and ask the human whether they want us to try anyway.
         if _is_document_question(query) and len(rag_context) < HITL_MIN_CONTEXT_LENGTH:
             pause_message = (
                 "⚠️ I found very little relevant content in your uploaded document "
@@ -266,7 +302,6 @@ def chat_node(state: ChatState) -> dict:
                 "hitl_decision": "",
             }
 
-        # Good context — answer with citations
         if rag_context:
             system_prompt = (
                 "Answer the question using ONLY the document context below. "
@@ -276,9 +311,10 @@ def chat_node(state: ChatState) -> dict:
             )
             recent = get_recent_messages(state["messages"])
             response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
-            return {"messages": [response]}
+            content = f"{response.content}\n\n{_cite('FAISS Document Index + Gemini 2.5 Flash')}"
+            return {"messages": [AIMessage(content=content)]}
 
-    # ── 9. Default LLM answer (with memory context if available) ─────────
+    # ── 9. Default LLM answer ────────────────────────────────────────────
     memory_text = get_memory_as_text(user_id)
 
     system_parts = ["You are a helpful AI assistant. Answer clearly and concisely."]
@@ -288,7 +324,8 @@ def chat_node(state: ChatState) -> dict:
     system_prompt = "\n".join(system_parts)
     recent = get_recent_messages(state["messages"])
     response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
-    return {"messages": [response]}
+    content = f"{response.content}\n\n{_cite('Gemini 2.5 Flash')}"
+    return {"messages": [AIMessage(content=content)]}
 
 
 # ══════════════════════════════════════════════════════════════════════════

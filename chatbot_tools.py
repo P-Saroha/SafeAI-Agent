@@ -116,20 +116,83 @@ def extract_stock_symbol(query: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 def call_search(query: str) -> str:
-    """Search DuckDuckGo and return a short text summary of results."""
+    """Search DuckDuckGo and return structured results as a list of dicts."""
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=5))
-        lines = []
-        for r in results:
-            title = r.get("title", "").strip()
-            body = r.get("body", "").strip()[:200]
-            url = r.get("href", "").strip()
-            if title:
-                lines.append(f"{title} — {body} ({url})")
-        return "\n".join(lines) if lines else "No results found."
+        return results  # Return raw list — formatting is done in format_search_response
     except Exception as e:
-        return f"Search error: {e}"
+        return []
+
+
+def format_search_response(results, query: str = "") -> str:
+    """
+    Take raw DuckDuckGo results and use the LLM to produce a clean,
+    well-formatted summary with numbered points and source links.
+
+    Why use the LLM here?
+    Raw search results are messy — truncated sentences, duplicate info,
+    weird URLs. The LLM cleans them up into a readable answer.
+    """
+    if not results:
+        return "No results found for your query."
+
+    # Build a compact text block from the raw results to feed to the LLM
+    raw_lines = []
+    sources = []
+    for r in results:
+        title = str(r.get("title", "")).strip()
+        body  = str(r.get("body",  "")).strip()[:300]
+        url   = str(r.get("href",  "")).strip()
+        if title:
+            raw_lines.append(f"- {title}: {body}")
+        if url:
+            sources.append(url)
+
+    if not raw_lines:
+        return "No results found for your query."
+
+    raw_text = "\n".join(raw_lines)
+
+    # Ask the LLM to summarize into a clean response
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        prompt_system = (
+            "You are a helpful assistant summarizing web search results.\n"
+            "Format your response like this:\n\n"
+            "**[Topic]**\n\n"
+            "1. **[Title]** — one clear sentence summary.\n"
+            "2. **[Title]** — one clear sentence summary.\n"
+            "3. **[Title]** — one clear sentence summary.\n\n"
+            "Rules:\n"
+            "- Use the exact titles from the results as bold headers.\n"
+            "- Write one clean sentence per result — no raw URLs in the text.\n"
+            "- Keep it factual and concise.\n"
+            "- Do NOT include URLs in the numbered list.\n"
+            "- Do NOT add any intro like 'Here are the results'."
+        )
+        prompt_user = (
+            f"Search query: {query}\n\n"
+            f"Search results:\n{raw_text}"
+        )
+        response = llm.invoke([
+            SystemMessage(content=prompt_system),
+            HumanMessage(content=prompt_user),
+        ])
+        summary = str(response.content).strip()
+    except Exception:
+        # Fallback: plain numbered list if LLM fails
+        summary = "\n".join(
+            f"{i}. {line.lstrip('- ')}"
+            for i, line in enumerate(raw_lines, 1)
+        )
+
+    # Append clean source links at the bottom
+    if sources:
+        source_lines = "\n".join(f"- {url}" for url in sources[:5])
+        return f"{summary}\n\n**Sources:**\n{source_lines}"
+
+    return summary
 
 
 def call_weather(location: str) -> str:
@@ -195,17 +258,20 @@ def format_weather_response(raw_json: str, location: str) -> str:
 
     if not data or "temp_c" not in data:
         # Fallback: search the web for weather info
-        search_result = call_search(f"weather in {location}")
-        return f"Weather (via web search):\n{search_result}\n\nSources:\n- https://duckduckgo.com/"
+        results = call_search(f"weather in {location}")
+        summary = format_search_response(results, f"weather in {location}")
+        return f"### Weather for {location}\n\n{summary}"
 
     return (
-        f"Weather for {data.get('location', location)}:\n"
-        f"- Condition : {data.get('description', 'N/A')}\n"
-        f"- Temperature: {data.get('temp_c')} °C\n"
-        f"- Feels like : {data.get('feels_like_c')} °C\n"
-        f"- Humidity   : {data.get('humidity')}%\n"
-        f"- Wind speed : {data.get('wind_mps')} m/s\n\n"
-        f"Sources:\n- https://openweathermap.org/"
+        f"### Weather for {data.get('location', location)}\n\n"
+        f"| Detail | Value |\n"
+        f"|---|---|\n"
+        f"| Condition | {data.get('description', 'N/A').capitalize()} |\n"
+        f"| Temperature | {data.get('temp_c')} °C |\n"
+        f"| Feels like | {data.get('feels_like_c')} °C |\n"
+        f"| Humidity | {data.get('humidity')}% |\n"
+        f"| Wind speed | {data.get('wind_mps')} m/s |\n\n"
+        f"**Sources:** https://openweathermap.org/"
     )
 
 
