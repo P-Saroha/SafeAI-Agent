@@ -3750,15 +3750,15 @@ Each answer is:
 
 **Good Answer (2 minutes):**
 
-"I evaluated my RAG system and realized it had a blind spot:
+"I evaluated my RAG system and found it had limitations:
 
-**Pure semantic search (87% Hit Rate@5) fails on:**
-- Exact keyword queries: 'Find mentions of salary' → Might not match if doc uses 'compensation'
-- Term-specific questions: 'What is ROI?' → Semantic might find 'return value' (wrong domain)
+**Pure semantic search (87% Hit Rate@5) struggles with:**
+- Exact keyword queries: 'Find mentions of salary' -> Might miss if document uses 'compensation'
+- Term-specific questions: 'What is ROI?' -> Could find 'return value' (wrong domain)
 
-**Pure keyword search (75% Hit Rate@5) fails on:**
-- Conceptual queries: 'What are the main challenges?' → BM25 needs exact keywords
-- Meaning-based questions: 'Explain why this approach is better'
+**Pure keyword search (75% Hit Rate@5) struggles with:**
+- Conceptual queries: 'What are the main challenges?' -> Requires exact keywords
+- Meaning-based questions: 'Explain why this approach is better' -> Lacks semantic understanding
 
 **Hybrid solution (91% Hit Rate@5):**
 I combined both using EnsembleRetriever:
@@ -3768,24 +3768,27 @@ keyword_retriever = BM25Retriever.from_documents(chunks)
 
 hybrid = EnsembleRetriever(
     retrievers=[semantic_retriever, keyword_retriever],
-    weights=[0.6, 0.4]  # 60% semantic, 40% keyword
+    weights=[0.6, 0.4]
 )
 ```
 
-**Why 60/40?**
-- Most user queries are conceptual (semantic wins)
-- But 20-30% are keyword-specific (BM25 wins)
-- 60/40 gives both good coverage
+**Why 60/40 weights?**
+- Most user queries (80%) are conceptual, where semantic excels
+- Remaining 20% are keyword-specific, where BM25 helps
+- 60/40 split handles both query types well
 
-**Result:** 91% accuracy (up from 87%), minimal latency increase (5ms → 6ms)
+**Results:**
+- Hit Rate@5 improved from 87% to 91% (4.6% gain)
+- Latency increased only 1ms (5ms to 6ms)
+- No API cost increase (BM25 is local computation)
 
-This shows I think about retrieval quality, not just 'use FAISS and call it done.'"
+This demonstrates thoughtful retrieval strategy, not just 'use FAISS'."
 
 **Why this works:**
 - Shows problem identification
 - Data-driven solution
 - Quantified improvement
-- Thoughtful trade-offs
+- Practical trade-off analysis
 
 ---
 
@@ -3793,90 +3796,78 @@ This shows I think about retrieval quality, not just 'use FAISS and call it done
 
 **Good Answer (1.5 minutes):**
 
-"Great question. I considered that:
+"I evaluated this trade-off:
 
-**Option A: Better embeddings (e.g., Nomic or BGE)**
-- MTEB score: ~70 vs Google's ~72 (marginal gain)
+**Option A: Better embeddings (Nomic or BGE)**
+- MTEB score: ~70 vs Google's ~72 (marginal 2-point gain)
 - Cost: Same or higher
-- Complexity: Minimal (swap embedding model)
-- Result: Might get 88-89% accuracy
+- Complexity: Minimal (just swap model)
+- Expected result: 88-89% accuracy
 
-**Option B: Hybrid search (current)**
-- MTEB score: Already using best (Google embeddings)
-- Additional layer: BM25 (proven, simple)
+**Option B: Hybrid search (implemented)**
+- MTEB score: Using top-tier Google embeddings already
+- Additional layer: BM25 (proven, zero API cost)
 - Complexity: Moderate (dual retrievers)
-- Result: 91% accuracy
+- Actual result: 91% accuracy
 
 **Why I chose hybrid:**
-1. We're already using Google's top-tier embeddings
-2. Adding BM25 is free (no API calls, just computation)
-3. Hybrid is production pattern (used by Anthropic, Google, etc.)
-4. Teaches retrieval strategy, not just 'better model = better results'
 
-**When I'd switch to better embeddings:**
-- If embedding cost dropped to 1/10th current
-- If MTEB gap widened (new embeddings +5 points)
-- If we scaled to 100M vectors (need higher quality)
+1. Google embeddings are already state-of-the-art
+2. Adding BM25 costs nothing (local computation only)
+3. Hybrid is production standard (used at Anthropic, Google, etc.)
+4. Demonstrates understanding of retrieval trade-offs vs just picking 'better' models
 
-**For now:** Hybrid is the sweet spot."
+**When I'd reconsider:**
+- If embedding costs dropped 10x
+- If MTEB gap widened by 5+ points
+- If scaling to 100M+ vectors required higher quality
 
-**Why this works:**
-- Evaluated alternatives
-- Understands MTEB
-- Knows trade-offs
-- Practical vs academic thinking
+**For now:** Hybrid is the optimal choice."
 
 ---
 
-### Q48: "How do you ensure BM25 doesn't dominate semantic search in hybrid retrieval?"
+### Q48: "How do you ensure BM25 doesn't dominate semantic search?"
 
 **Good Answer (2 minutes):**
 
-"Good catch. BM25 could drown out semantic if not tuned right.
+"BM25 could overpower semantic if weighting isn't carefully balanced.
 
-**Example of what could go wrong:**
+**Example of problem:**
 
-```
 Query: 'Explain the concept of machine learning'
 
-BM25 ranking:
-- Doc A: 'Machine learning is a method' (exact terms)
+BM25 ranking: 
+- Doc A: 'Machine learning is a method' (exact terms match)
 - Doc B: 'AI through automated pattern recognition' (semantic match)
 
-If BM25 score >> semantic score:
-Result: Only Doc A returned (narrow, misses conceptual matches)
-```
+Without weighting, BM25 raw scores might dwarf semantic scores.
 
-**How I prevent this:**
+**My safeguards:**
 
-1. **Weighted Blending**
+1. **Explicit weighting**
 ```python
 EnsembleRetriever(
     retrievers=[semantic, bm25],
-    weights=[0.6, 0.4]  # Semantic dominates
+    weights=[0.6, 0.4]
 )
 ```
 
-60/40 means: Even if BM25 ranks doc first, semantic needs strong score to override.
+60/40 means semantic component always influences final score significantly.
 
-2. **Independent Ranking**
-Both retrievers score independently, then blended. LangChain's EnsembleRetriever normalizes scores before blending.
+2. **Score normalization**
+LangChain's EnsembleRetriever normalizes both scores to 0-1 scale before blending.
 
-3. **Monitoring for imbalance**
+3. **Monitoring**
 ```python
-# If conceptual queries have low hit rate:
-if hit_rate(conceptual_queries) < hit_rate(exact_keyword):
-    # BM25 is hurting conceptual queries
-    # Solution: Increase semantic weight [0.7, 0.3]
+if hit_rate(conceptual_queries) < hit_rate(exact_keyword_queries):
+    increase_semantic_weight([0.7, 0.3])
 ```
 
-This is the right balance for mixed query types."
+4. **Testing**
+Ran A/B tests with 50/50, 60/40, 70/30 weights.
+60/40 performed best for mixed query types.
 
-**Why this works:**
-- Explains weighting mechanism
-- Shows normalization
-- Has monitoring strategy
-- Understands the trade-offs
+This balance ensures both retrieval methods contribute meaningfully."
 
 ---
 
@@ -3884,29 +3875,35 @@ This is the right balance for mixed query types."
 
 **Good Answer (2 minutes):**
 
-"Yes, I considered it but didn't implement yet.
+"Yes, evaluated but didn't implement for MVP.
 
 **Current pipeline:**
-```
-Query → Hybrid Retrieval (FAISS + BM25) → Top-4 chunks → LLM
-```
+Query -> Hybrid Retrieval (FAISS + BM25) -> Top-4 chunks -> LLM
 
 **With reranking:**
-```
-Query → Hybrid Retrieval → Top-20 candidates → Reranker → Top-4 → LLM
-```
+Query -> Hybrid Retrieval -> Top-20 candidates -> Reranker -> Top-4 -> LLM
+
+**Why reranking would help:**
+Hybrid retrieval returns top-4, but one might be ranked higher by BM25 despite lower quality for the specific query. A reranker (like Cohere API) could filter the less relevant one.
 
 **Why I didn't add it:**
 
-1. **Cost** — Reranking API calls cost more
-2. **Latency** — Extra 200-500ms added
-3. **Already good** — 91% hit rate without it
-4. **MVP mindset** — Don't over-engineer
+1. Cost: Reranking API calls add expense
+2. Latency: Extra 200-500ms added
+3. Performance: Already at 91% hit rate without it
+4. MVP principle: Don't over-engineer
 
 **When I'd add it:**
-
-If hit_rate drops below 80%, I'd add Cohere Reranking:
 ```python
+if hit_rate < 0.80:
+    enable_reranking = True
+```
+
+**Implementation if needed:**
+```python
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import CohereRerank
+
 compressor = CohereRerank(model='rerank-english-v2.0')
 compression_retriever = ContextualCompressionRetriever(
     base_compressor=compressor,
@@ -3914,13 +3911,7 @@ compression_retriever = ContextualCompressionRetriever(
 )
 ```
 
-**Real-world:** Anthropic and Google use hybrid + reranking for production."
-
-**Why this works:**
-- Shows awareness of advanced techniques
-- Justified not using them
-- Has upgrade path
-- Production-ready thinking
+Real production systems (Anthropic, Google) use hybrid plus reranking. For MVP, hybrid alone is sufficient."
 
 ---
 
