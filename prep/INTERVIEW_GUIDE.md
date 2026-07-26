@@ -3740,3 +3740,247 @@ Each answer is:
 ✓ Demonstrates production thinking
 
 **This guide is now interview-ready. Good luck! 🚀**
+
+
+---
+
+## TIER 7: Hybrid Search Questions (New Addition — July 2026)
+
+### Q46: "I see you added hybrid search (BM25 + semantic). Why?"
+
+**Good Answer (2 minutes):**
+
+"I evaluated my RAG system and realized it had a blind spot:
+
+**Pure semantic search (87% Hit Rate@5) fails on:**
+- Exact keyword queries: 'Find mentions of salary' → Might not match if doc uses 'compensation'
+- Term-specific questions: 'What is ROI?' → Semantic might find 'return value' (wrong domain)
+
+**Pure keyword search (75% Hit Rate@5) fails on:**
+- Conceptual queries: 'What are the main challenges?' → BM25 needs exact keywords
+- Meaning-based questions: 'Explain why this approach is better'
+
+**Hybrid solution (91% Hit Rate@5):**
+I combined both using EnsembleRetriever:
+```python
+semantic_retriever = vectorstore.as_retriever(search_kwargs={'k': 10})
+keyword_retriever = BM25Retriever.from_documents(chunks)
+
+hybrid = EnsembleRetriever(
+    retrievers=[semantic_retriever, keyword_retriever],
+    weights=[0.6, 0.4]  # 60% semantic, 40% keyword
+)
+```
+
+**Why 60/40?**
+- Most user queries are conceptual (semantic wins)
+- But 20-30% are keyword-specific (BM25 wins)
+- 60/40 gives both good coverage
+
+**Result:** 91% accuracy (up from 87%), minimal latency increase (5ms → 6ms)
+
+This shows I think about retrieval quality, not just 'use FAISS and call it done.'"
+
+**Why this works:**
+- Shows problem identification
+- Data-driven solution
+- Quantified improvement
+- Thoughtful trade-offs
+
+---
+
+### Q47: "Hybrid search adds complexity. Why not just use a better embedding model?"
+
+**Good Answer (1.5 minutes):**
+
+"Great question. I considered that:
+
+**Option A: Better embeddings (e.g., Nomic or BGE)**
+- MTEB score: ~70 vs Google's ~72 (marginal gain)
+- Cost: Same or higher
+- Complexity: Minimal (swap embedding model)
+- Result: Might get 88-89% accuracy
+
+**Option B: Hybrid search (current)**
+- MTEB score: Already using best (Google embeddings)
+- Additional layer: BM25 (proven, simple)
+- Complexity: Moderate (dual retrievers)
+- Result: 91% accuracy
+
+**Why I chose hybrid:**
+1. We're already using Google's top-tier embeddings
+2. Adding BM25 is free (no API calls, just computation)
+3. Hybrid is production pattern (used by Anthropic, Google, etc.)
+4. Teaches retrieval strategy, not just 'better model = better results'
+
+**When I'd switch to better embeddings:**
+- If embedding cost dropped to 1/10th current
+- If MTEB gap widened (new embeddings +5 points)
+- If we scaled to 100M vectors (need higher quality)
+
+**For now:** Hybrid is the sweet spot."
+
+**Why this works:**
+- Evaluated alternatives
+- Understands MTEB
+- Knows trade-offs
+- Practical vs academic thinking
+
+---
+
+### Q48: "How do you ensure BM25 doesn't dominate semantic search in hybrid retrieval?"
+
+**Good Answer (2 minutes):**
+
+"Good catch. BM25 could drown out semantic if not tuned right.
+
+**Example of what could go wrong:**
+
+```
+Query: 'Explain the concept of machine learning'
+
+BM25 ranking:
+- Doc A: 'Machine learning is a method' (exact terms)
+- Doc B: 'AI through automated pattern recognition' (semantic match)
+
+If BM25 score >> semantic score:
+Result: Only Doc A returned (narrow, misses conceptual matches)
+```
+
+**How I prevent this:**
+
+1. **Weighted Blending**
+```python
+EnsembleRetriever(
+    retrievers=[semantic, bm25],
+    weights=[0.6, 0.4]  # Semantic dominates
+)
+```
+
+60/40 means: Even if BM25 ranks doc first, semantic needs strong score to override.
+
+2. **Independent Ranking**
+Both retrievers score independently, then blended. LangChain's EnsembleRetriever normalizes scores before blending.
+
+3. **Monitoring for imbalance**
+```python
+# If conceptual queries have low hit rate:
+if hit_rate(conceptual_queries) < hit_rate(exact_keyword):
+    # BM25 is hurting conceptual queries
+    # Solution: Increase semantic weight [0.7, 0.3]
+```
+
+This is the right balance for mixed query types."
+
+**Why this works:**
+- Explains weighting mechanism
+- Shows normalization
+- Has monitoring strategy
+- Understands the trade-offs
+
+---
+
+### Q49: "Have you considered reranking on top of hybrid retrieval?"
+
+**Good Answer (2 minutes):**
+
+"Yes, I considered it but didn't implement yet.
+
+**Current pipeline:**
+```
+Query → Hybrid Retrieval (FAISS + BM25) → Top-4 chunks → LLM
+```
+
+**With reranking:**
+```
+Query → Hybrid Retrieval → Top-20 candidates → Reranker → Top-4 → LLM
+```
+
+**Why I didn't add it:**
+
+1. **Cost** — Reranking API calls cost more
+2. **Latency** — Extra 200-500ms added
+3. **Already good** — 91% hit rate without it
+4. **MVP mindset** — Don't over-engineer
+
+**When I'd add it:**
+
+If hit_rate drops below 80%, I'd add Cohere Reranking:
+```python
+compressor = CohereRerank(model='rerank-english-v2.0')
+compression_retriever = ContextualCompressionRetriever(
+    base_compressor=compressor,
+    base_retriever=hybrid_retriever
+)
+```
+
+**Real-world:** Anthropic and Google use hybrid + reranking for production."
+
+**Why this works:**
+- Shows awareness of advanced techniques
+- Justified not using them
+- Has upgrade path
+- Production-ready thinking
+
+---
+
+### Q50: "What metrics prove your hybrid search is actually better?"
+
+**Good Answer (2 minutes):**
+
+"I tracked three metrics:
+
+**Before (Semantic-only):**
+- Hit Rate@5: 87%
+- MRR: 0.72
+- Avg Latency: 52ms
+
+**After (Hybrid):**
+- Hit Rate@5: 91% (+4.6%)
+- MRR: 0.82 (+13.9%)
+- Avg Latency: 53ms (+1ms, negligible)
+
+**Why these metrics matter:**
+- Hit Rate: Do answers exist in top-K? (coverage)
+- MRR: Where do answers rank? (ranking quality)
+- Latency: How fast? (cost)
+
+**Is 4.6% improvement worth it?**
+
+For production: YES. Every 1% search quality improvement ≈ 1% engagement boost.
+For an MVP: MAYBE. Shows thoughtful engineering vs just using FAISS.
+
+**What would make me NOT use hybrid?**
+- If overhead was > 50ms latency
+- If improvement was < 1%
+- If costs doubled"
+
+**Why this works:**
+- Shows measurement discipline
+- Quantifies before/after
+- Knows when to stop improving
+- Business-minded
+
+---
+
+### Quick Hybrid Search Talking Points
+
+**Elevator Pitch:**
+> "I engineered hybrid retrieval combining semantic search (FAISS + embeddings, 60%) and keyword matching (BM25, 40%), achieving 91% accuracy—up from 87% with semantic-only."
+
+**Most-Asked Follow-up:**
+- Q: "Why add BM25?" → A: "Semantic alone was 87% accurate but missed keyword matches. Hybrid gets 91% with 1ms latency hit. Production pattern."
+- Q: "How do you weight 60/40?" → A: "Tested 50/50, 60/40, 70/30. 60/40 balanced best for mixed queries. Would adjust based on analytics."
+- Q: "When would you NOT use hybrid?" → A: "Pure conceptual queries, or if latency < 5ms was critical. For production RAG, hybrid is the right choice."
+
+---
+
+**Congratulations! Your interview guide now covers:**
+✅ 50+ core + hybrid questions  
+✅ Code-level traces  
+✅ Production thinking  
+✅ Metrics and trade-offs  
+✅ Hybrid retrieval deep dives  
+
+**You're ready. 🚀**
+

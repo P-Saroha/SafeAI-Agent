@@ -25,7 +25,9 @@ load_dotenv(find_dotenv())
 try:
     from langchain_community.document_loaders import PyPDFLoader, TextLoader
     from langchain_community.vectorstores import FAISS
+    from langchain_community.retrievers import BM25Retriever
     from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain.retrievers import EnsembleRetriever
     RAG_AVAILABLE = True
 except ImportError:
     RAG_AVAILABLE = False
@@ -150,7 +152,12 @@ def _load_documents(files: list[Path]):
 
 def _build_retriever(thread_id: str, force_rebuild: bool = False):
     """
-    Build (or load from disk) the FAISS retriever for a thread.
+    Build (or load from disk) a hybrid retriever for a thread.
+    
+    Hybrid retrieval combines:
+    1. Semantic search (FAISS + embeddings) — catches meaning-based queries
+    2. BM25 keyword search — catches exact term matches
+    
     Returns None if there are no documents or RAG is not available.
     """
     if not RAG_AVAILABLE:
@@ -171,7 +178,19 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
             vectorstore = FAISS.load_local(
                 str(index_dir), embeddings, allow_dangerous_deserialization=True
             )
-            return vectorstore.as_retriever(search_kwargs={"k": 10})
+            semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+            # Rebuild BM25 from raw documents (not persisted, rebuilt on load)
+            docs = _load_documents(files)
+            if docs:
+                splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+                chunks = splitter.split_documents(docs)
+                keyword_retriever = BM25Retriever.from_documents(chunks)
+                # Combine semantic (60%) and keyword (40%)
+                return EnsembleRetriever(
+                    retrievers=[semantic_retriever, keyword_retriever],
+                    weights=[0.6, 0.4]
+                )
+            return semantic_retriever
         except Exception as e:
             print(f"Could not load FAISS index, rebuilding: {e}")
 
@@ -186,16 +205,28 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         return None
 
     try:
+        # Build FAISS for semantic search
         vectorstore = FAISS.from_documents(chunks, embeddings)
+        semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+        
+        # Build BM25 for keyword search
+        keyword_retriever = BM25Retriever.from_documents(chunks)
+        
+        # Combine both: 60% semantic, 40% keyword
+        hybrid_retriever = EnsembleRetriever(
+            retrievers=[semantic_retriever, keyword_retriever],
+            weights=[0.6, 0.4]
+        )
     except Exception as e:
-        print(f"FAISS build error: {e}")
+        print(f"Hybrid retriever build error: {e}")
         return None
 
-    # Save to disk so we can reload next time without rebuilding
+    # Save FAISS to disk so we can reload next time without rebuilding
     index_dir.mkdir(parents=True, exist_ok=True)
     vectorstore.save_local(str(index_dir))
+    print(f"[RAG] Hybrid retriever built: FAISS (semantic 60%) + BM25 (keyword 40%)")
 
-    return vectorstore.as_retriever(search_kwargs={"k": 10})
+    return hybrid_retriever
 
 
 def rebuild_rag_index(thread_id: str) -> str:

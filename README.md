@@ -70,9 +70,12 @@ Instead of the LLM making up an answer, the bot first searches your uploaded doc
 
 - Each chat thread has its own `knowledge_base/<thread_id>/` folder.
 - Documents are chunked (1000 chars, 150 overlap) and indexed into a FAISS vector store.
+- **Hybrid search** combines two retrieval methods:
+  - **Semantic search (60%):** Google `text-embedding-004` embeddings catch meaning-based queries ("What is the main concept?")
+  - **Keyword search (40%):** BM25 algorithm catches exact term matches ("Find 'salary' mentions")
 - Top-4 most relevant chunks are retrieved and formatted as `[1] filename.pdf (page 1): ...`
 - The LLM is instructed to cite `[1]`, `[2]`, etc. in its answer.
-- Embedding backend: Google `text-embedding-004` (or local hash embeddings as fallback — no API key needed).
+- Fallback embedding: Local hash embeddings (no API key needed, works offline).
 
 ---
 
@@ -244,7 +247,8 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 | Agent framework | LangGraph |
 | LLM | Gemini 2.5 Flash (Google) |
 | UI | Streamlit |
-| Vector search | FAISS |
+| Vector search (semantic) | FAISS + Google embeddings |
+| Keyword search (BM25) | rank-bm25 (hybrid retrieval) |
 | Embeddings | Google text-embedding-004 / Hash fallback |
 | Long-term memory | PostgreSQL via `langgraph.store.postgres` |
 | Short-term memory | Last-N messages (in-context) |
@@ -259,7 +263,7 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 
 - **LangGraph agent design** — multi-node graph with stateful checkpointing
 - **Deterministic routing** — keyword-based intent detection before any LLM call
-- **RAG pipeline** — per-thread FAISS indexes, chunking, citation-aware retrieval
+- **Hybrid RAG pipeline** — semantic search (FAISS + embeddings) + keyword search (BM25), per-thread indexes
 - **Query rewriting** — ambiguity detection via heuristics, LLM-based clarification
 - **RAG evaluation** — Hit Rate@K and MRR metrics for production monitoring
 - **Memory architecture** — STM vs LTM design, auto-extraction via LLM
