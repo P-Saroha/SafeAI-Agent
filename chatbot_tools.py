@@ -93,20 +93,66 @@ def extract_weather_location(query: str) -> str:
 
 
 def extract_stock_symbol(query: str) -> str:
-    """Map a company name or ticker from the query to a stock symbol."""
+    """Map a company name or ticker from the query to a stock symbol.
+    
+    Supports:
+    - US companies: Oracle, Google, Microsoft, Apple, Amazon, Tesla, Nvidia, etc.
+    - Indian companies: TCS, Infosys, Wipro, Reliance, HDFC, ICICI, LT, Bajaj, ITC, MRF, Hero, Maruti
+    - Direct tickers: Look for 1-5 uppercase letters
+    """
     q = query.lower()
-    name_map = {
+    
+    # Direct ticker mapping (US)
+    us_map = {
         "oracle": "ORCL", "google": "GOOGL", "alphabet": "GOOGL",
         "microsoft": "MSFT", "apple": "AAPL", "amazon": "AMZN",
         "meta": "META", "facebook": "META", "tesla": "TSLA", "nvidia": "NVDA",
+        "intel": "INTC", "amd": "AMD", "ibm": "IBM", "cisco": "CSCO",
     }
-    for name, symbol in name_map.items():
+    
+    # Direct ticker mapping (India) — add .NS suffix for NSE
+    india_map = {
+        "tcs": "TCS.NS",
+        "infosys": "INFY.NS",
+        "wipro": "WIPRO.NS",
+        "reliance": "RELIANCE.NS",
+        "hdfc": "HDFC.NS",
+        "hdfc bank": "HDFCBANK.NS",
+        "icici": "ICICIBANK.NS",
+        "icici bank": "ICICIBANK.NS",
+        "lt": "LT.NS",
+        "bajaj": "BAJAJFINSV.NS",
+        "itc": "ITC.NS",
+        "sbi": "SBIN.NS",
+        "axis": "AXISBANK.NS",
+        "kotak": "KOTAKBANK.NS",
+        "mrf": "MRF.NS",
+        "hero": "HEROMOTOCO.NS",
+        "maruti": "MARUTISUZUKI.NS",
+        "hul": "HINDUNILVR.NS",
+        "colgate": "COLPAL.NS",
+    }
+    
+    # Check US companies first
+    for name, symbol in us_map.items():
         if name in q:
             return symbol
-    # Try to find an uppercase ticker like ORCL or TSLA
-    match = re.search(r"\b([A-Z]{1,5})\b", query)
+    
+    # Check Indian companies
+    for name, symbol in india_map.items():
+        if name in q:
+            return symbol
+    
+    # Try to find an explicit ticker (with or without suffix)
+    # Match patterns like "AAPL" or "TCS.NS" or "BTC-USD"
+    match = re.search(r"\b([A-Z]{1,5})(?:\.NS|\.BO|-USD)?\b", query)
     if match:
-        return match.group(1)
+        ticker = match.group(1)
+        # If no suffix, check if it's an Indian stock
+        if ticker in {"TCS", "INFY", "WIPRO", "RELIANCE", "HDFC", "ICICI", "LT", "BAJAJ", "ITC", "SBIN", "AXIS", "KOTAK", "MRF", "HERO", "MARUTI"}:
+            return f"{ticker}.NS"
+        return ticker
+    
     return ""
 
 
@@ -232,13 +278,66 @@ def call_weather(location: str) -> str:
 
 
 def call_stock(symbol: str) -> str:
-    """Fetch the latest closing stock price for a ticker symbol."""
+    """Fetch the latest closing stock price for a ticker symbol.
+    
+    Supports:
+    - US stocks: AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META, ORCL
+    - Indian stocks: TCS, INFY, WIPRO, RELIANCE, HDFC, ICICI (add .NS or .BO suffix)
+    - Cryptocurrencies: BTC-USD, ETH-USD
+    """
+    if not symbol or not symbol.strip():
+        return "Please provide a stock symbol (e.g., 'AAPL', 'TCS.NS', 'BTC-USD')."
+    
+    symbol = symbol.strip().upper()
+    
     try:
+        # For Indian stocks without suffix, add .NS (NSE — National Stock Exchange)
+        if symbol and not any(suffix in symbol for suffix in [".NS", ".BO", "-USD"]):
+            # Check if it's likely an Indian stock
+            indian_stocks = {"TCS", "INFY", "WIPRO", "RELIANCE", "HDFC", "ICICI", "LT", "BAJAJ", "ITC"}
+            if symbol in indian_stocks:
+                symbol = f"{symbol}.NS"
+        
+        # Fetch data
         ticker = yf.Ticker(symbol)
-        price = ticker.history(period="1d")["Close"].iloc[-1]
-        return f"{symbol} price is {round(price, 2)} USD"
-    except Exception:
-        return f"Could not fetch stock price for '{symbol}'."
+        
+        # Get history — yfinance might return empty if ticker is invalid
+        history = ticker.history(period="1d")
+        
+        if history.empty or "Close" not in history.columns:
+            print(f"[Stock] No data returned for {symbol} — ticker may be invalid")
+            return f"Could not fetch stock price for '{symbol}'. Please check the ticker symbol.\nTip: Use .NS for Indian NSE stocks (e.g., 'TCS.NS')"
+        
+        price = history["Close"].iloc[-1]
+        
+        if price is None or price == 0:
+            print(f"[Stock] Invalid price data for {symbol}: {price}")
+            return f"Could not fetch valid price for '{symbol}'."
+        
+        # Get additional info
+        try:
+            info = ticker.info
+            currency = info.get("currency", "USD")
+            if currency == "INR":
+                currency_symbol = "₹"
+            else:
+                currency_symbol = "$" if currency == "USD" else currency
+        except:
+            currency_symbol = "$"
+        
+        price_formatted = round(price, 2)
+        print(f"[Stock] Fetched {symbol}: {price_formatted} {currency_symbol}")
+        return f"{symbol}: {currency_symbol}{price_formatted}"
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[Stock] Error fetching {symbol}: {error_msg}")
+        
+        # Provide helpful error messages
+        if "No data found" in error_msg or "no data" in error_msg.lower():
+            return f"Ticker '{symbol}' not found. Try:\n- US: AAPL, MSFT, GOOGL, AMZN, TSLA\n- India: TCS.NS, INFY.NS, WIPRO.NS\n- Crypto: BTC-USD, ETH-USD"
+        
+        return f"Error fetching '{symbol}': {error_msg}. Please verify the ticker symbol."
 
 
 def call_datetime() -> str:
