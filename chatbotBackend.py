@@ -334,15 +334,30 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             }
 
         if rag_context:
+            # IMPROVED: More detailed system prompt with structured instructions
             system_prompt = (
-                "Answer the question using ONLY the document context below. "
-                "Cite sources like [1], [2]. "
-                "If the answer is not in the context, say so clearly.\n\n"
-                f"Document context:\n{rag_context}"
+                "You are a document analysis expert. Your task is to answer the user's question "
+                "using ONLY the document context provided below.\n\n"
+                "IMPORTANT RULES:\n"
+                "1. Use ONLY information from the document context. Do NOT use external knowledge.\n"
+                "2. If the answer is not in the context, say clearly: 'This information is not found in the provided document.'\n"
+                "3. Always cite your sources using [1], [2], etc. format when referencing specific sections.\n"
+                "4. Structure your response clearly with headings and bullet points if the answer is complex.\n"
+                "5. Be specific and detailed - avoid vague or generic responses.\n"
+                "6. If the document mentions steps, processes, or stages - list them clearly in order.\n\n"
+                "═" * 60 + "\n"
+                "DOCUMENT CONTEXT:\n"
+                "═" * 60 + "\n"
+                f"{rag_context}\n"
+                "═" * 60 + "\n"
+                "USER QUESTION:\n"
+                "═" * 60 + "\n"
+                f"Question: {rewritten if rewritten != query else query}\n"
+                "═" * 60 + "\n"
             )
             recent = get_recent_messages(state["messages"])
             response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
-            content = f"{response.content}\n\n{_cite('FAISS Document Index + Gemini 2.5 Flash')}"
+            content = f"{response.content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Gemini 2.5 Flash')}"
             return {"messages": [AIMessage(content=content)]}
 
     # ── 9. Default LLM answer ────────────────────────────────────────────

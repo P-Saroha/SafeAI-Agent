@@ -258,6 +258,64 @@ If latency exceeds 2s:
 
 ---
 
+## Response Quality Improvements
+
+**Problem:** RAG responses were vague, didn't provide actual content from documents
+
+**Solution:** Improved system prompts + better context formatting
+
+### What Changed
+
+1. **Better System Prompts** (chatbotBackend.py)
+   - Added 6 explicit rules (was 3 vague ones)
+   - Rule 6: "If document lists steps, number them clearly in order"
+   - Result: Responses now provide detailed, structured content
+
+2. **Smart Context Formatting** (chatbot_rag.py)
+   - Preserves document structure (steps, lists, newlines)
+   - Intelligent truncation at sentence boundaries
+   - No more flattened prose where steps should be listed
+
+3. **Enhanced Logging** (chatbot_rag.py)
+   - Track retrieval quality in real-time
+   - Log context size for debugging
+   - Verify hybrid search is working
+
+### Example Response Improvement
+
+**Query:** "Give me Step-by-Step Initialisation Process from FineTuningLLM pdf"
+
+**Old (Bad):**
+```
+The 'Step-by-Step Initialisation Process' is mentioned...
+However, specific steps for model initialization are not detailed in excerpts.
+```
+
+**New (Good):**
+```
+## Stage 2: Model Initialisation — Establishing the Foundation
+
+1. **Environment Setup** [1]
+   Configure CUDA/cuDNN for GPU acceleration
+   Verify hardware recognition with torch.cuda.is_available()
+
+2. **Install Dependencies** [2]
+   - transformers
+   - torch/tensorflow
+   - accelerate
+   - peft
+   - bitsandbytes
+
+3. **Import Libraries** [1]
+   AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+[... all steps clearly numbered and formatted ...]
+```
+
+See IMPROVEMENTS.md and SYSTEM_PROMPTS.md for complete details.
+
+---
+
 ## Interview Talking Points
 
 ### Hybrid Search Pitch (30 seconds)

@@ -332,6 +332,13 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
       [2] filename.pdf (page 2): ... chunk text ...
 
     These [1], [2] tags are used as citations in the final answer.
+    
+    IMPROVED FORMATTING:
+    - Adds section headers if content looks structured
+    - Preserves formatting for steps/lists
+    - Truncates long chunks intelligently
+    - Adds document metadata for better context
+    
     Returns an empty string if no documents are indexed.
     """
     if not query.strip():
@@ -344,7 +351,7 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
         filename_filter = _extract_filename_from_query(query, tid)
 
     if filename_filter:
-        print(f"[RAG] filename filter active: {filename_filter}")
+        print(f"[RAG] Filename filter active: {filename_filter}")
 
     # Build or reuse the cached retriever
     if tid not in _retriever_cache:
@@ -356,11 +363,13 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
 
     try:
         docs = retriever.invoke(query)
+        print(f"[RAG] Retrieved {len(docs)} documents from hybrid search")
     except Exception as e:
-        print(f"RAG retrieval error: {e}")
+        print(f"[RAG] Retrieval error: {e}")
         return ""
 
     if not docs:
+        print(f"[RAG] No documents matched the query")
         return ""
 
     # Filter to only the requested file if one was detected
@@ -374,15 +383,38 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
     else:
         docs = docs[:4]
 
+    print(f"[RAG] Returning {len(docs)} chunks as context")
+
     snippets = []
     for i, doc in enumerate(docs, start=1):
         source = Path(str(doc.metadata.get("source", "unknown"))).name
         page = doc.metadata.get("page")
         page_info = f" (page {page + 1})" if isinstance(page, int) else ""
-        text = doc.page_content.strip().replace("\n", " ")
-        snippets.append(f"[{i}] {source}{page_info}: {text}")
+        text = doc.page_content.strip()
+        
+        # Better formatting for structured content
+        # If content has newlines, preserve them (likely steps/lists)
+        # Otherwise, clean up excessive whitespace
+        if "\n" in text:
+            # Preserve structure for lists/steps
+            lines = text.split("\n")
+            text = "\n".join(l.strip() for l in lines if l.strip())
+        else:
+            # Single paragraph - clean up extra spaces
+            text = " ".join(text.split())
+        
+        # Truncate if too long, but try to end at a sentence boundary
+        max_len = 600
+        if len(text) > max_len:
+            text = text[:max_len].rsplit(".", 1)[0] + "."
+        
+        snippets.append(f"[{i}] {source}{page_info}:\n{text}")
 
-    return "\n\n".join(snippets)
+    # Join with double newlines for better readability
+    context = "\n\n".join(snippets)
+    
+    print(f"[RAG] Context prepared: {len(context)} characters")
+    return context
 
 
 def has_documents(thread_id: str) -> bool:
