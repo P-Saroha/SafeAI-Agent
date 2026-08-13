@@ -137,12 +137,41 @@ def _load_documents(files: list[Path]):
     for path in files:
         try:
             if path.suffix.lower() == ".pdf":
-                loader = PyPDFLoader(str(path))
+                try:
+                    loader = PyPDFLoader(str(path))
+                    loaded = loader.load()
+                    if loaded:
+                        docs.extend(loaded)
+                        print(f"[RAG] Loaded PDF: {path.name} ({len(loaded)} pages)")
+                    else:
+                        print(f"[RAG] Warning: PDF loaded but no pages found: {path.name}")
+                except Exception as pdf_error:
+                    print(f"[RAG] PDF Loading Error for {path.name}: {pdf_error}")
+                    # Try alternative: read as text
+                    try:
+                        import PyPDF2
+                        with open(path, 'rb') as f:
+                            reader = PyPDF2.PdfReader(f)
+                            text = ""
+                            for page in reader.pages:
+                                text += page.extract_text() + "\n"
+                        if text.strip():
+                            from langchain_core.documents import Document
+                            docs.append(Document(page_content=text, metadata={"source": str(path.name)}))
+                            print(f"[RAG] Loaded PDF (fallback): {path.name}")
+                    except Exception as fallback_error:
+                        print(f"[RAG] Fallback also failed for {path.name}: {fallback_error}")
             else:
                 loader = TextLoader(str(path), encoding="utf-8")
-            docs.extend(loader.load())
+                loaded = loader.load()
+                docs.extend(loaded)
+                print(f"[RAG] Loaded text file: {path.name}")
         except Exception as e:
-            print(f"Could not load {path.name}: {e}")
+            print(f"[RAG] Could not load {path.name}: {e}")
+    
+    if not docs:
+        print(f"[RAG] WARNING: No documents loaded from {len(files)} file(s)")
+    
     return docs
 
 
@@ -161,6 +190,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     Returns None if there are no documents or RAG is not available.
     """
     if not RAG_AVAILABLE:
+        print("[RAG] ERROR: RAG not available (missing dependencies)")
         return None
 
     tid = _safe_id(thread_id)
@@ -168,6 +198,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     files = _get_supported_files(tid)
 
     if not files:
+        print(f"[RAG] No documents found for thread {tid}")
         return None  # No documents uploaded yet
 
     embeddings = _get_embeddings()
@@ -175,6 +206,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     # Load existing index from disk if it exists and we are not forcing a rebuild
     if index_dir.exists() and not force_rebuild:
         try:
+            print(f"[RAG] Loading existing index for thread {tid}")
             vectorstore = FAISS.load_local(
                 str(index_dir), embeddings, allow_dangerous_deserialization=True
             )
@@ -182,27 +214,38 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
             # Rebuild BM25 from raw documents (not persisted, rebuilt on load)
             docs = _load_documents(files)
             if docs:
+                print(f"[RAG] Building BM25 from {len(docs)} documents")
                 splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
                 chunks = splitter.split_documents(docs)
+                print(f"[RAG] Split into {len(chunks)} chunks")
                 keyword_retriever = BM25Retriever.from_documents(chunks)
                 # Combine semantic (60%) and keyword (40%)
+                print("[RAG] Creating hybrid retriever (FAISS 60% + BM25 40%)")
                 return EnsembleRetriever(
                     retrievers=[semantic_retriever, keyword_retriever],
                     weights=[0.6, 0.4]
                 )
             return semantic_retriever
         except Exception as e:
-            print(f"Could not load FAISS index, rebuilding: {e}")
+            print(f"[RAG] Could not load FAISS index, rebuilding: {e}")
 
     # Build a fresh index from the uploaded documents
+    print(f"[RAG] Building fresh index from {len(files)} file(s)")
     docs = _load_documents(files)
+    
     if not docs:
+        print(f"[RAG] ERROR: No documents were loaded!")
         return None
 
+    print(f"[RAG] Loaded {len(docs)} documents, splitting into chunks...")
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(docs)
+    
     if not chunks:
+        print(f"[RAG] ERROR: No chunks created from documents!")
         return None
+
+    print(f"[RAG] Created {len(chunks)} chunks, building FAISS index...")
 
     try:
         # Build FAISS for semantic search
@@ -210,35 +253,50 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
         
         # Build BM25 for keyword search
+        print("[RAG] Building BM25 keyword retriever...")
         keyword_retriever = BM25Retriever.from_documents(chunks)
         
         # Combine both: 60% semantic, 40% keyword
+        print("[RAG] Creating hybrid retriever (FAISS 60% + BM25 40%)")
         hybrid_retriever = EnsembleRetriever(
             retrievers=[semantic_retriever, keyword_retriever],
             weights=[0.6, 0.4]
         )
     except Exception as e:
-        print(f"Hybrid retriever build error: {e}")
+        print(f"[RAG] Hybrid retriever build error: {e}")
         return None
 
     # Save FAISS to disk so we can reload next time without rebuilding
-    index_dir.mkdir(parents=True, exist_ok=True)
-    vectorstore.save_local(str(index_dir))
-    print(f"[RAG] Hybrid retriever built: FAISS (semantic 60%) + BM25 (keyword 40%)")
+    try:
+        index_dir.mkdir(parents=True, exist_ok=True)
+        vectorstore.save_local(str(index_dir))
+        print(f"[RAG] Index saved to {index_dir}")
+    except Exception as e:
+        print(f"[RAG] Warning: Could not save index: {e}")
 
+    print(f"[RAG] ✓ Hybrid retriever built successfully!")
     return hybrid_retriever
 
 
 def rebuild_rag_index(thread_id: str) -> str:
     """Force a full rebuild of the FAISS index and update the cache."""
     tid = _safe_id(thread_id)
+    
+    # Check if files exist first
+    files = _get_supported_files(tid)
+    if not files:
+        return "Error: No supported files found (PDF, TXT, MD)"
+    
+    print(f"[RAG] Found {len(files)} file(s) to index")
+    for f in files:
+        print(f"[RAG]   - {f.name}")
+    
     retriever = _build_retriever(tid, force_rebuild=True)
     _retriever_cache[tid] = retriever
 
-    files = _get_supported_files(tid)
     if retriever:
         return f"RAG index rebuilt successfully with {len(files)} file(s)."
-    return "RAG index rebuild failed — no documents found or load error."
+    return "RAG index rebuild failed — check console for errors above"
 
 
 def _extract_filename_from_query(query: str, thread_id: str) -> str:
