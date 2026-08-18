@@ -458,6 +458,25 @@ streamlit run chatbotFrontend.py
 
 ---
 
+## Testing
+
+### Quick Test (5 minutes)
+
+```bash
+python test_chatbot_quick.py
+```
+
+Automated tests for intent detection, location extraction, API calls, and environment setup.
+
+### Full Testing (1-2 hours)
+
+Complete manual E2E test guide in **E2E_TESTING_GUIDE.md** covering:
+- Smoke tests · APIs · Memory · RAG · LangSmith · Multi-thread · Export · Error handling · Performance · Security
+
+Quick reference: **TESTING_SUMMARY.md**
+
+---
+
 ## Example queries
 
 ```
