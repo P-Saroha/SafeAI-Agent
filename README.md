@@ -1,6 +1,6 @@
 # AI Agent Chatbot
 
-**Stack:** Python · LangGraph · LangChain · Gemini 2.5 Flash · FAISS · BM25 · PostgreSQL · Streamlit
+**Stack:** Python · LangGraph · LangChain · Groq (gpt-oss-120b) · FAISS · BM25 · PostgreSQL · Streamlit
 
 A production-grade AI agent that combines deterministic tool routing, **hybrid RAG (semantic + keyword search)**, Human-In-The-Loop (HITL) safety approval, dual-tier memory (LTM + STM), and quality metrics — all orchestrated with LangGraph.
 
@@ -75,8 +75,8 @@ Each chat thread has its own `knowledge_base/<thread_id>/` folder. Documents are
 ```
 User Query
     ↓
-1. Semantic Search (FAISS + Google Embeddings, 60% weight)
-   • Query embedded using Google text-embedding-004
+1. Semantic Search (FAISS + Hash/Google Embeddings, 60% weight)
+   • Query embedded using hash embeddings (default) or Google text-embedding-004 (optional)
    • FAISS indexes compared, top-10 semantic matches returned
    • Catches meaning-based queries: "What is the main concept?"
    
@@ -120,7 +120,7 @@ User Query
 ### Architecture Details
 
 - Chunking: 1000 chars per chunk, 150 char overlap (prevents mid-sentence splits)
-- Embeddings: Google `text-embedding-004` (384-dim) + local hash fallback
+- Embeddings: Hash embeddings (offline default, 384-dim) + Google `text-embedding-004` (optional, set `RAG_EMBEDDING_BACKEND=google`)
 - Indexing: FAISS vector store persisted to disk per thread
 - Weighting: 60/40 (semantic/keyword) tuned via A/B testing
 - No API cost increase: BM25 is local computation
@@ -140,7 +140,7 @@ Raw user queries can be ambiguous or vague. The chatbot automatically detects an
 **How it works:**
 1. User query comes in
 2. `is_ambiguous_query()` checks for vague pronouns (it, that, this), vague verbs (tell, say, show), or very short queries
-3. If ambiguous → `rewrite_query()` uses Gemini to clarify it
+3. If ambiguous → `rewrite_query()` uses Groq LLM to clarify it
 4. Rewritten query is used for RAG retrieval
 5. Better retrieval = better answers
 
@@ -247,8 +247,8 @@ MRR = 0.82 → Excellent (our current performance)
 
 ```
 Retrieval: < 100ms (FAISS + BM25 combined)
-LLM call: ~1000ms (Gemini 2.5 Flash)
-Total: ~1100ms (acceptable for chat)
+LLM call: ~500ms (Groq gpt-oss-120b)
+Total: ~600ms (fast, lower latency than hosted models)
 ```
 
 If latency exceeds 2s:
@@ -324,7 +324,8 @@ See IMPROVEMENTS.md and SYSTEM_PROMPTS.md for complete details.
 ### Key Claims to Defend
 
 - **"Why not better embeddings?"** 
-  - Google embeddings are state-of-the-art (MTEB ~72)
+  - Hash embeddings work offline with zero API cost
+  - Optional Google embeddings available (`RAG_EMBEDDING_BACKEND=google`)
   - BM25 adds 4% accuracy for zero API cost
   - Hybrid is more valuable than marginal embedding gains
 
@@ -404,7 +405,8 @@ pip install -r ../requirements.txt
 Create a `.env` file in the project root:
 
 ```env
-GOOGLE_API_KEY=your_gemini_api_key
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=openai/gpt-oss-120b
 OPENWEATHER_API_KEY=your_openweather_api_key
 
 # Optional — only needed for long-term memory
@@ -452,12 +454,12 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 | Layer | Technology | Role |
 |---|---|---|
 | Agent framework | LangGraph | State machine orchestration + checkpointing |
-| LLM | Gemini 2.5 Flash (Google) | Response generation |
+| LLM | Groq — gpt-oss-120b | Response generation |
 | UI | Streamlit | Web interface, chat display |
-| **Semantic Search** | **FAISS + Google embeddings** | **60% weight in hybrid retrieval** |
+| **Semantic Search** | **FAISS + Hash/Google Embeddings** | **60% weight in hybrid retrieval** |
 | **Keyword Search** | **rank-bm25** | **40% weight in hybrid retrieval** |
 | Retrieval Blend | LangChain EnsembleRetriever | Score normalization + weighted combination |
-| Embeddings | Google text-embedding-004 / Hash fallback | 384-dim vectors |
+| Embeddings | Hash (offline default) / Google text-embedding-004 (optional) | 384-dim vectors |
 | Long-term memory | PostgreSQL via `langgraph.store.postgres` | User facts across sessions |
 | Short-term memory | Last-N messages (in-context) | Recent conversation context |
 | Conversation state | SqliteSaver (LangGraph) | Graph checkpointing + HITL persistence |
