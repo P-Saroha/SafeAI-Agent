@@ -60,6 +60,11 @@ import shutil
 import sqlite3
 from typing import Annotated, TypedDict
 
+from dotenv import load_dotenv
+
+# Load Chatbot/.env first so GROQ_API_KEY is available before any LLM imports
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -123,13 +128,13 @@ def _cite(source: str) -> str:
         content = f"Some answer\n\n{_cite('OpenWeather API')}"
 
     Available source labels and what they mean:
-        "OpenWeather API"  — real-time weather data
-        "Yahoo Finance"    — live stock prices
-        "DuckDuckGo"       — web search results
-        "System Clock"     — local machine date/time
-        "Gemini 2.5 Flash" — LLM-generated answer (no external data)
-        "FAISS + Gemini"   — document RAG + LLM answer with citations
-        "PostgreSQL LTM"   — facts retrieved from long-term memory store
+        "OpenWeather API"       — real-time weather data
+        "Yahoo Finance"         — live stock prices
+        "DuckDuckGo"            — web search results
+        "System Clock"          — local machine date/time
+        "Groq (gpt-oss-120b)"   — LLM-generated answer (no external data)
+        "FAISS + Groq"          — document RAG + LLM answer with citations
+        "PostgreSQL LTM"        — facts retrieved from long-term memory store
     """
     return f"> 🔧 **Powered by:** {source}"
 
@@ -226,8 +231,6 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
 
         if decision == "approve":
             rag_context = get_rag_context(original_question, thread_id)
-            # NOTE: Gemini requires at least one HumanMessage in the messages list.
-            # We combine the system instructions + context into the HumanMessage.
             prompt = (
                 "You are answering from limited document context — the user approved this.\n"
                 "Do your best with the context below. Be honest if the answer is unclear.\n"
@@ -235,8 +238,8 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 f"Document context:\n{rag_context if rag_context else 'No context found.'}\n\n"
                 f"Question: {original_question}"
             )
-            response = llm.invoke(prompt)  # plain string prompt works for Gemini
-            content = f"{response.content}\n\n{_cite('FAISS + Gemini 2.5 Flash (low-confidence approval)')}"
+            response = llm.invoke(prompt)
+            content = f"{response.content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq (low-confidence approval)')}"
             return {
                 "messages": [AIMessage(content=content)],
                 "awaiting_hitl": False,
@@ -294,7 +297,7 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     if is_news_query(query):
         results = call_search(query)
         # format_search_response already appends source URLs — add powered-by below
-        content = f"{format_search_response(results, query)}\n\n{_cite('DuckDuckGo Search + Gemini 2.5 Flash')}"
+        content = f"{format_search_response(results, query)}\n\n{_cite('DuckDuckGo Search + Groq (gpt-oss-120b)')}"
         return {"messages": [AIMessage(content=content)]}
 
     # ── 7. Stock price ───────────────────────────────────────────────────
@@ -357,7 +360,7 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             )
             recent = get_recent_messages(state["messages"])
             response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
-            content = f"{response.content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Gemini 2.5 Flash')}"
+            content = f"{response.content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq (gpt-oss-120b)')}"
             return {"messages": [AIMessage(content=content)]}
 
     # ── 9. Default LLM answer ────────────────────────────────────────────
@@ -370,7 +373,7 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     system_prompt = "\n".join(system_parts)
     recent = get_recent_messages(state["messages"])
     response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
-    content = f"{response.content}\n\n{_cite('Gemini 2.5 Flash')}"
+    content = f"{response.content}\n\n{_cite('Groq (gpt-oss-120b)')}"
     return {"messages": [AIMessage(content=content)]}
 
 

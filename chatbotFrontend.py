@@ -18,6 +18,11 @@ import os
 import uuid
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load Chatbot/.env first so all keys are available before any imports
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -465,8 +470,7 @@ if user_text:
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             # Use stream_mode="values" to get the final state after all nodes run.
-            # This avoids the {} from remember_node and the double-response from
-            # Gemini streaming multiple chunks that get concatenated twice.
+            # This avoids the {} from remember_node and double-response issues.
             ai_response = ""
             try:
                 for state_snapshot in chatbot.stream(

@@ -19,6 +19,8 @@ from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
+# Load Chatbot/.env first, then fall back to root .env
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 load_dotenv(find_dotenv())
 
 # Optional heavy imports — the app still works without them
@@ -81,14 +83,26 @@ def get_index_dir(thread_id: str) -> Path:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _get_embeddings():
-    """Return the best available embedding model."""
+    """Return the best available embedding model.
+    
+    Options (set via RAG_EMBEDDING_BACKEND in .env):
+      "hash"   — offline hash embeddings, no API key needed (default)
+      "google" — Google text-embedding-004, needs GOOGLE_API_KEY in .env
+    
+    Note: Groq does not provide an embeddings API, so we use hash by default.
+    For better RAG quality, set RAG_EMBEDDING_BACKEND=google and add GOOGLE_API_KEY.
+    """
     backend = os.getenv("RAG_EMBEDDING_BACKEND", "hash").lower()
 
     if backend == "google" and GOOGLE_EMBEDDINGS_AVAILABLE:
-        model = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/text-embedding-004")
-        return GoogleGenerativeAIEmbeddings(model=model)
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if api_key:
+            model = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/text-embedding-004")
+            return GoogleGenerativeAIEmbeddings(model=model)
+        else:
+            print("[RAG] RAG_EMBEDDING_BACKEND=google but GOOGLE_API_KEY not set, falling back to hash")
 
-    # Fallback: local hash embeddings (no API key needed)
+    # Default: local hash embeddings (no API key needed, always works)
     return _HashEmbeddings()
 
 

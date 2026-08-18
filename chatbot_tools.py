@@ -21,14 +21,18 @@ from urllib.request import Request, urlopen
 import yfinance as yf
 from ddgs import DDGS
 from dotenv import find_dotenv, load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 
+# Load Chatbot/.env first, then fall back to root .env
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 load_dotenv(find_dotenv())
 
 # ── LLM setup ──────────────────────────────────────────────────────────────
-# Main LLM used for generating responses
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+# Groq-hosted LLM via OpenAI-compatible API
+llm = ChatOpenAI(
+    model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+    api_key=os.getenv("GROQ_API_KEY"),
+    base_url="https://api.groq.com/openai/v1",
     temperature=0,
     streaming=True,
 )

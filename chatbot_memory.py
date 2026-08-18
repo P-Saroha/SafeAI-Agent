@@ -26,21 +26,21 @@ import re
 
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
+# Load Chatbot/.env first, then fall back to root .env
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 load_dotenv(find_dotenv())
 
 # ── Config ──────────────────────────────────────────────────────────────────
-# How many recent messages to include as short-term memory
 STM_MAX_MESSAGES = int(os.getenv("LTM_STM_MAX_MESSAGES", "12"))
 
-# Postgres connection string (matches docker-compose.yml defaults)
 LTM_DB_URI = os.getenv(
     "LTM_POSTGRES_URI",
     "postgresql://postgres:postgres@localhost:5442/postgres?sslmode=disable",
 )
 
 # ── Optional import ─────────────────────────────────────────────────────────
-# The app works fine without Postgres — LTM is just disabled.
 try:
     from langgraph.store.postgres import PostgresStore
     _POSTGRES_AVAILABLE = True
@@ -48,9 +48,13 @@ except ImportError:
     PostgresStore = None
     _POSTGRES_AVAILABLE = False
 
-# LLM for extracting memory facts (imported here to avoid circular imports)
-from langchain_google_genai import ChatGoogleGenerativeAI
-_memory_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+# LLM for extracting memory facts — Groq via OpenAI-compatible API
+_memory_llm = ChatOpenAI(
+    model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+    api_key=os.getenv("GROQ_API_KEY"),
+    base_url="https://api.groq.com/openai/v1",
+    temperature=0,
+)
 
 # Track whether Postgres connected successfully
 _ltm_available = False
