@@ -414,9 +414,35 @@ LTM_POSTGRES_URI=postgresql://postgres:postgres@localhost:5442/postgres?sslmode=
 
 # Optional — use "google" for better RAG quality, "hash" works offline (default)
 RAG_EMBEDDING_BACKEND=hash
+
+# Optional — LangSmith tracing for production monitoring
+# Get API key from: https://smith.langchain.com/settings/api-keys
+# LANGSMITH_API_KEY=your_langsmith_api_key_here
+# LANGSMITH_PROJECT=chatbot-dev
+# LANGSMITH_TRACING=true
 ```
 
-### 3. Start Postgres (for long-term memory)
+### 3. (Optional) Enable LangSmith Monitoring
+
+LangSmith provides production-grade observability for your LLM app:
+
+```env
+# In Chatbot/.env, uncomment and fill in:
+LANGSMITH_API_KEY=your_api_key_here
+LANGSMITH_PROJECT=SafeAI Agent
+LANGSMITH_TRACING=true
+```
+
+**What you'll see on LangSmith:**
+- All LLM calls with prompts, completions, token usage
+- Tool execution traces (weather, search, stock, etc.)
+- Graph state transitions (remember → chat flow)
+- Performance metrics: latency, errors, costs per query
+- Full conversation history for debugging
+
+**To disable:** Set `LANGSMITH_TRACING=false` or leave it blank.
+
+### 4. Start Postgres (for long-term memory)
 
 Long-term memory requires Docker. If you skip this step, the app still works — LTM is just disabled.
 
@@ -424,7 +450,7 @@ Long-term memory requires Docker. If you skip this step, the app still works —
 docker compose up -d
 ```
 
-### 4. Run the app
+### 5. Run the app
 
 ```bash
 streamlit run chatbotFrontend.py
@@ -463,6 +489,7 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 | Long-term memory | PostgreSQL via `langgraph.store.postgres` | User facts across sessions |
 | Short-term memory | Last-N messages (in-context) | Recent conversation context |
 | Conversation state | SqliteSaver (LangGraph) | Graph checkpointing + HITL persistence |
+| Production monitoring | LangSmith (optional) | Tracing, cost tracking, performance metrics |
 | Web search | DuckDuckGo (`ddgs`) | News and general queries |
 | Stock data | Yahoo Finance (`yfinance`) | Real-time prices |
 | Weather | OpenWeather API | Real-time conditions |
@@ -499,9 +526,93 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 - [x] Interview guide (50+ Q&A covering all aspects)
 - [x] Multi-thread chat isolation
 - [x] Chat export to Markdown
+- [x] LangSmith observability (optional, for production monitoring)
 - [ ] Unit tests (recommended future improvement)
-- [ ] Monitoring dashboard (for production deployment)
 - [ ] Automated backups (for production deployment)
+- [ ] API rate limiting (for production deployment)
+
+---
+
+## LangSmith Integration (Production Observability)
+
+### What is LangSmith?
+
+LangSmith is LangChain's production observability platform. It automatically traces every LLM call, tool execution, and graph state transition — giving you insights into what your agent is doing.
+
+### What You Get
+
+**With LangSmith enabled, you'll see:**
+
+1. **Execution Traces** — Full trace of every query:
+   - Which nodes executed (remember → chat → end)
+   - What went into each node (user query, context, etc.)
+   - What came out (LLM response, citations, etc.)
+   - Timestamps and latencies
+
+2. **LLM Metrics** — For every Groq call:
+   - Tokens used (input + output)
+   - Cost per query
+   - Latency
+   - Error tracking
+
+3. **Tool Tracking** — When tools fire:
+   - Weather API calls and results
+   - Search queries and results
+   - Stock price lookups
+   - Time queries
+
+4. **Performance Dashboard** — Monitor over time:
+   - Average latency per node
+   - Error rates
+   - Token usage trends
+   - Cost breakdown by tool
+
+5. **Debugging** — Reproduce any conversation:
+   - Click any trace to see exact inputs/outputs
+   - Understand why the agent made a decision
+   - Spot hallucinations or retrieval failures
+
+### How It Works (Transparent to Your Code)
+
+**No code changes needed.** LangSmith hooks into LangGraph automatically when:
+1. `LANGSMITH_API_KEY` is set in your `.env`
+2. `LANGSMITH_TRACING=true`
+
+LangGraph detects these env vars and sends traces automatically.
+
+### Setup (1 minute)
+
+1. **Get API key:**
+   - Go to https://smith.langchain.com/settings/api-keys
+   - Create a new key
+   - Copy it
+
+2. **Update Chatbot/.env:**
+   ```env
+   LANGSMITH_API_KEY=lsv2_pt_...
+   LANGSMITH_PROJECT=SafeAI Agent
+   LANGSMITH_TRACING=true
+   ```
+
+3. **Run your chatbot:**
+   ```bash
+   streamlit run chatbotFrontend.py
+   ```
+
+4. **View traces:**
+   - Open https://smith.langchain.com
+   - Click "Traces" → see all your queries
+   - Click any trace to inspect
+
+### When to Use
+
+- **Local Dev:** Leave `LANGSMITH_TRACING=false` (no API calls, faster)
+- **Debugging:** Set to `true` to capture traces for investigation
+- **Production:** Set to `true` for continuous monitoring
+
+### Interview Talking Point
+
+> "I integrated LangSmith for production observability. It traces every LLM call, tool execution, and state transition — giving ops teams visibility into costs, latency, and errors. This is production-standard for AI agents. Setting it up was zero code changes because LangGraph handles it automatically through environment variables."
 
 ---
 

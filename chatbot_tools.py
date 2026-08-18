@@ -85,14 +85,30 @@ def is_stock_query(query: str) -> bool:
 def extract_weather_location(query: str) -> str:
     """Pull the city/location name out of a weather question."""
     q = query.lower()
+    
+    # Remove common filler words to simplify extraction
+    q_clean = re.sub(r'\b(?:today|today\'s|today is|what\'s|what is|tell|me|the|show|give)\b\s*', '', q)
+    
     # Match patterns like "weather in Delhi" or "weather of Mumbai"
-    match = re.search(r"weather\s+(?:in|of|for)\s+([a-z\s]+?)(?:\s+(?:today|now|forecast))?[\?.,]?$", q)
+    match = re.search(r"weather\s+(?:in|of|for)\s+([a-z\s]+?)(?:\s+(?:today|now|forecast))?[\?.,]?$", q_clean)
     if match:
         return match.group(1).strip()
-    # Match patterns like "Delhi weather"
-    match = re.search(r"([a-z]+(?:\s+[a-z]+)?)\s+weather", q)
+    
+    # Match patterns like "Delhi weather" or "rohtak weather"
+    match = re.search(r"([a-z]+(?:\s+[a-z]+)?)\s+weather", q_clean)
     if match:
         return match.group(1).strip()
+    
+    # As fallback, try original query with common filler words removed
+    # Extract any word that looks like a city name (before or after "weather")
+    if "weather" in q_clean:
+        parts = q_clean.split("weather")
+        for part in parts:
+            # Look for capitalized words or known city patterns
+            cities = re.findall(r'\b([a-z]+(?:\s+[a-z]+)?)\b', part.strip())
+            if cities:
+                return cities[-1].strip()  # Return the last city-like word
+    
     return ""
 
 

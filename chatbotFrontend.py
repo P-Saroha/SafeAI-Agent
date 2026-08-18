@@ -42,7 +42,9 @@ from chatbot_memory import (
 )
 from chatbot_rag import get_docs_dir, rebuild_rag_index
 
-os.environ["LANGSMITH_PROJECT"] = "ChatBot-Project"
+# LangSmith configuration (optional for production monitoring)
+# Automatically enabled if LANGSMITH_API_KEY is set in .env
+# Traces all LLM calls, tool execution, and graph state transitions
 
 
 # ══════════════════════════════════════════════════════════════════════════
