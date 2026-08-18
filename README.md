@@ -75,8 +75,8 @@ Each chat thread has its own `knowledge_base/<thread_id>/` folder. Documents are
 ```
 User Query
     ↓
-1. Semantic Search (FAISS + Hash/Google Embeddings, 60% weight)
-   • Query embedded using hash embeddings (default) or Google text-embedding-004 (optional)
+1. Semantic Search (FAISS + Hash Embeddings, 60% weight)
+   • Query embedded using hash embeddings (default, offline, zero API cost)
    • FAISS indexes compared, top-10 semantic matches returned
    • Catches meaning-based queries: "What is the main concept?"
    
@@ -120,7 +120,7 @@ User Query
 ### Architecture Details
 
 - Chunking: 1000 chars per chunk, 150 char overlap (prevents mid-sentence splits)
-- Embeddings: Hash embeddings (offline default, 384-dim) + Google `text-embedding-004` (optional, set `RAG_EMBEDDING_BACKEND=google`)
+- Embeddings: Hash embeddings (offline default, 384-dim) — zero API cost, works out of box
 - Indexing: FAISS vector store persisted to disk per thread
 - Weighting: 60/40 (semantic/keyword) tuned via A/B testing
 - No API cost increase: BM25 is local computation
@@ -325,9 +325,9 @@ See IMPROVEMENTS.md and SYSTEM_PROMPTS.md for complete details.
 
 - **"Why not better embeddings?"** 
   - Hash embeddings work offline with zero API cost
-  - Optional Google embeddings available (`RAG_EMBEDDING_BACKEND=google`)
   - BM25 adds 4% accuracy for zero API cost
-  - Hybrid is more valuable than marginal embedding gains
+  - Hybrid approach is more valuable than marginal embedding gains
+  - Production-ready solution with no external dependencies
 
 - **"Why 60/40?"** 
   - Tested: 50/50 (88%), 60/40 (91%), 70/30 (89%)
@@ -456,10 +456,10 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 | Agent framework | LangGraph | State machine orchestration + checkpointing |
 | LLM | Groq — gpt-oss-120b | Response generation |
 | UI | Streamlit | Web interface, chat display |
-| **Semantic Search** | **FAISS + Hash/Google Embeddings** | **60% weight in hybrid retrieval** |
+| **Semantic Search** | **FAISS + Hash Embeddings** | **60% weight in hybrid retrieval** |
 | **Keyword Search** | **rank-bm25** | **40% weight in hybrid retrieval** |
 | Retrieval Blend | LangChain EnsembleRetriever | Score normalization + weighted combination |
-| Embeddings | Hash (offline default) / Google text-embedding-004 (optional) | 384-dim vectors |
+| Embeddings | Hash (offline default, zero API cost) | 384-dim vectors |
 | Long-term memory | PostgreSQL via `langgraph.store.postgres` | User facts across sessions |
 | Short-term memory | Last-N messages (in-context) | Recent conversation context |
 | Conversation state | SqliteSaver (LangGraph) | Graph checkpointing + HITL persistence |
