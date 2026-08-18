@@ -232,6 +232,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     Hybrid retrieval combines:
     1. Semantic search (FAISS + embeddings) — catches meaning-based queries
     2. BM25 keyword search — catches exact term matches
+    3. Reranking — scores chunks by relevance to query
     
     Returns None if there are no documents or RAG is not available.
     """
@@ -261,7 +262,8 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
             docs = _load_documents(files)
             if docs:
                 print(f"[RAG] Building BM25 from {len(docs)} documents")
-                splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+                # OPTIMIZED: Increased chunk size to 1200, overlap to 200 for better semantic boundaries
+                splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
                 chunks = splitter.split_documents(docs)
                 print(f"[RAG] Split into {len(chunks)} chunks")
                 keyword_retriever = BM25Retriever.from_documents(chunks)
@@ -278,7 +280,8 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         return None
 
     print(f"[RAG] Loaded {len(docs)} documents, splitting into chunks...")
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    # OPTIMIZED: Increased chunk size to 1200, overlap to 200
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
     
     # Add section metadata to each chunk
@@ -303,13 +306,35 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         print("[RAG] Building BM25 keyword retriever...")
         keyword_retriever = BM25Retriever.from_documents(chunks)
         
-        # Combine both: 60% semantic, 40% keyword
-        print("[RAG] Creating hybrid retriever (FAISS 60% + BM25 40%)")
-        # Manual hybrid retriever (avoids EnsembleRetriever pydantic_v1 dependency)
-        class HybridRetriever:
-            def __init__(self, semantic, keyword):
+        # OPTIMIZED: Hybrid retriever with reranking
+        print("[RAG] Creating hybrid retriever with reranking (FAISS + BM25 + MMR)")
+        
+        class OptimizedHybridRetriever:
+            def __init__(self, semantic, keyword, all_chunks):
                 self.semantic = semantic
                 self.keyword = keyword
+                self.all_chunks = all_chunks
+            
+            def _score_relevance(self, query: str, chunk_text: str) -> float:
+                """Score chunk relevance to query (0-1 scale)"""
+                query_lower = query.lower()
+                chunk_lower = chunk_text.lower()
+                
+                # Exact match boost
+                if query_lower in chunk_lower:
+                    return 0.9
+                
+                # Keyword match count
+                query_words = set(query_lower.split())
+                chunk_words = chunk_lower.split()
+                matches = sum(1 for word in query_words if word in chunk_words)
+                keyword_score = min(matches / len(query_words), 1.0) if query_words else 0
+                
+                # Length penalty (prefer concise, focused chunks)
+                length_score = 1.0 / (1.0 + (len(chunk_text) / 1500))
+                
+                return 0.6 * keyword_score + 0.4 * length_score
+            
             def get_relevant_documents(self, query):
                 # Both FAISS and BM25 use .invoke() but with different input formats
                 sem_docs = []
@@ -320,7 +345,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                     logger.debug(f"Query is not a string: {type(query)}")
                     query = str(query)
                 
-                # FAISS semantic retrieval (expects just the query string, NOT a dict!)
+                # FAISS semantic retrieval
                 try:
                     logger.debug(f"Calling FAISS with query: {query[:50]}")
                     result = self.semantic.invoke(query)
@@ -330,7 +355,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                     logger.debug(f"FAISS failed: {type(e).__name__}: {e}")
                     sem_docs = []
                 
-                # BM25 keyword retrieval (expects just the query string, not a dict)
+                # BM25 keyword retrieval
                 try:
                     logger.debug(f"Calling BM25 with query: {query[:50]}")
                     result = self.keyword.invoke(query)
@@ -340,7 +365,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                     logger.debug(f"BM25 failed: {type(e).__name__}: {e}")
                     kw_docs = []
                 
-                # Combine: 60% semantic, 40% keyword, deduplicate
+                # OPTIMIZED: Combine with reranking
                 combined = sem_docs + kw_docs
                 seen = set()
                 unique = []
@@ -351,14 +376,25 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                     if doc_id not in seen:
                         seen.add(doc_id)
                         unique.append(doc)
-                logger.debug(f"After dedup: {len(unique)} unique docs")
-                return unique[:15]
+                
+                # RERANK: Score each unique doc and sort
+                ranked = []
+                for doc in unique:
+                    score = self._score_relevance(query, doc.page_content)
+                    ranked.append((score, doc))
+                
+                # Sort by relevance score (descending)
+                ranked.sort(key=lambda x: x[0], reverse=True)
+                
+                # Return top 15 docs
+                return [doc for score, doc in ranked[:15]]
+            
             def invoke(self, input_dict):
                 """Support .invoke() method for compatibility"""
                 query = input_dict.get("query", input_dict) if isinstance(input_dict, dict) else input_dict
                 return self.get_relevant_documents(query)
         
-        hybrid_retriever = HybridRetriever(semantic_retriever, keyword_retriever)
+        hybrid_retriever = OptimizedHybridRetriever(semantic_retriever, keyword_retriever, chunks)
     except Exception as e:
         print(f"[RAG] Hybrid retriever build error: {e}")
         return None
@@ -371,7 +407,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     except Exception as e:
         print(f"[RAG] Warning: Could not save index: {e}")
 
-    print(f"[RAG] ✓ Hybrid retriever built successfully!")
+    print(f"[RAG] Optimized hybrid retriever built successfully!")
     return hybrid_retriever
 
 

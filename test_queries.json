@@ -1,0 +1,19 @@
+{
+  "queries": [
+    {"query": "Tell me about Stage 6: Deployment from Training to Production", "expected": ["Deployment", "vLLM"]},
+    {"query": "What is vLLM and PagedAttention for inference?", "expected": ["vLLM", "PagedAttention"]},
+    {"query": "Explain LoRA where W = W₀ + BA", "expected": ["LoRA", "parameter-efficient"]},
+    {"query": "Explain data preparation and tokenization", "expected": ["Data Preparation", "tokenisation"]},
+    {"query": "What is the chain rule of probability?", "expected": ["chain rule", "probability"]},
+    {"query": "Explain scaled dot-product attention", "expected": ["attention", "Attention(Q"]},
+    {"query": "How do you calculate perplexity PPL?", "expected": ["perplexity", "cross-entropy"]},
+    {"query": "List the seven stages of fine-tuning", "expected": ["Data Preparation", "Model Initialisation"]},
+    {"query": "Tell me about Stage 7: Monitoring", "expected": ["Monitoring", "retraining"]},
+    {"query": "What is Half Fine-Tuning HFT?", "expected": ["HFT", "freezing"]},
+    {"query": "What is NF4 in QLoRA?", "expected": ["NF4", "quantisation"]},
+    {"query": "SMOTE and Focal Loss for imbalance?", "expected": ["SMOTE", "Focal Loss"]},
+    {"query": "What is DoRA?", "expected": ["DoRA", "magnitude"]},
+    {"query": "Explain transformer multi-head attention", "expected": ["transformer", "attention"]},
+    {"query": "How does learning rate scheduling work?", "expected": ["learning rate", "schedule"]}
+  ]
+}
