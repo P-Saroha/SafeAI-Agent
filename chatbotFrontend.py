@@ -29,7 +29,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 from chatbotBackend import (
     chatbot,
     delete_thread,
-    generate_chat_title,
     get_thread_hitl_state,
     list_all_threads,
 )
@@ -87,11 +86,14 @@ def new_thread_id() -> str:
 # CONVERSATION HELPERS
 # ══════════════════════════════════════════════════════════════════════════
 
+@st.cache_data(ttl=300, show_spinner=False)
 def load_thread_messages(thread_id: str) -> list[dict]:
     """
     Load the saved messages for a thread from the LangGraph checkpointer.
     Returns a list of {"role": "user"/"assistant", "content": "..."} dicts
     that Streamlit's st.chat_message can display.
+    
+    CACHED for 5 minutes to avoid re-querying state on every page rerun.
     """
     user_id = get_or_create_user_id()
     state = chatbot.get_state(
@@ -125,6 +127,8 @@ def start_new_chat():
     # Add to thread list if not already there
     if tid not in st.session_state["thread_ids"]:
         st.session_state["thread_ids"].append(tid)
+    # Clear thread title so it gets generated after first message
+    st.session_state["thread_titles"].pop(tid, None)
 
 
 def save_uploaded_files(files, thread_id: str) -> tuple[int, str]:
@@ -152,11 +156,17 @@ def save_uploaded_files(files, thread_id: str) -> tuple[int, str]:
 # Runs once when the app first loads.
 # ══════════════════════════════════════════════════════════════════════════
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_cached_threads() -> list:
+    """Load all existing threads from checkpointer, cached for 5 minutes."""
+    return list_all_threads()
+
+
 user_id = get_or_create_user_id()
 
 if "thread_ids" not in st.session_state:
     # Load all existing threads from checkpointer on first run
-    st.session_state["thread_ids"] = list_all_threads()
+    st.session_state["thread_ids"] = get_cached_threads()
 
 if "thread_id" not in st.session_state:
     if st.session_state["thread_ids"]:
@@ -189,6 +199,8 @@ st.sidebar.title("LangGraph AI Agent")
 
 # ── New Chat button ─────────────────────────────────────────────────────
 if st.sidebar.button("➕ New Chat"):
+    # Clear message cache for the old thread
+    load_thread_messages.clear()
     start_new_chat()
     st.rerun()
 
@@ -239,8 +251,13 @@ else:
     if mem_status.get("last_error"):
         st.sidebar.caption(f"Error: {mem_status['last_error']}")
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_cached_memory(user_id: str):
+    """Get memory list cached for 5 minutes."""
+    return get_memory_list(user_id)
+
 if st.sidebar.button("🧠 Show Memory"):
-    facts = get_memory_list(user_id)
+    facts = get_cached_memory(user_id)
     if facts:
         for fact in facts:
             st.sidebar.write(f"- {fact}")
@@ -255,11 +272,12 @@ if st.sidebar.button("🗑️ Clear All Memory"):
 st.sidebar.header("My Conversations")
 
 for tid in reversed(st.session_state["thread_ids"]):
-    # Generate and cache a title for each thread
+    # Use cached title or extract first message as preview (NO LLM CALL!)
     if tid not in st.session_state["thread_titles"]:
         msgs = load_thread_messages(tid)
         first_user = next((m["content"] for m in msgs if m["role"] == "user"), None)
-        title = generate_chat_title(first_user) if first_user else "New Chat"
+        # Just use first 50 chars of first message as title - NO LLM CALL
+        title = (first_user[:50] + "..." if len(first_user) > 50 else first_user) if first_user else "New Chat"
         st.session_state["thread_titles"][tid] = title
 
     title = st.session_state["thread_titles"][tid]
@@ -270,6 +288,8 @@ for tid in reversed(st.session_state["thread_ids"]):
         label = f"**{title}**" if tid == st.session_state["thread_id"] else title
         if st.button(label, key=f"load_{tid}"):
             st.session_state["thread_id"] = tid
+            # Don't use cached messages when switching threads - bypass cache
+            load_thread_messages.clear()
             st.session_state["messages"] = load_thread_messages(tid)
             st.rerun()
 
@@ -278,6 +298,8 @@ for tid in reversed(st.session_state["thread_ids"]):
             result = delete_thread(tid)
             st.session_state["thread_ids"].remove(tid)
             st.session_state["thread_titles"].pop(tid, None)
+            # Clear the cache so get_cached_threads() is called again
+            get_cached_threads.clear()
             # If we deleted the active thread, start a new one
             if st.session_state["thread_id"] == tid:
                 start_new_chat()
@@ -512,6 +534,7 @@ if user_text:
 
     # Generate a title for this thread after the first message
     if st.session_state["thread_id"] not in st.session_state["thread_titles"]:
-        title = generate_chat_title(user_text)
+        # Use first 50 chars of user text as title - NO LLM CALL
+        title = user_text[:50] + "..." if len(user_text) > 50 else user_text
         st.session_state["thread_titles"][st.session_state["thread_id"]] = title
         st.rerun()

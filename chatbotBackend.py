@@ -1,56 +1,12 @@
 """
 chatbotBackend.py
 -----------------
-The main agent brain. This file wires everything together:
+Main agent orchestrator. Chains together:
+1. remember_node: Save facts to long-term memory
+2. chat_node: Route intent and generate response
+3. Graph checkpoint: Save state to SQLite
 
-1. Defines the ChatState — what data the agent tracks per conversation.
-2. Defines chat_node — the function that decides how to respond to the user.
-3. Builds the LangGraph graph: remember → chat → end.
-4. Sets up a SQLite checkpointer so conversations are saved to disk.
-
-Routing logic inside chat_node (in order):
-  1. Greeting            → reply "Hello! How can I help?"
-  2. HITL resume         → continue after human approved/rejected
-  3. Self-query          → return facts from long-term memory
-  4. Weather question    → call OpenWeather (or DuckDuckGo as fallback)
-  5. Time/date question  → return system clock
-  6. News question       → DuckDuckGo search
-  7. Stock question      → Yahoo Finance
-  8. Has documents?      → RAG retrieval
-     - Low confidence    → PAUSE and ask human to approve
-     - Good context      → answer with citations
-  9. Default             → plain LLM answer
-
-──────────────────────────────────────────────────────────────────────────
-WHAT IS HITL (Human-In-The-Loop)?
-──────────────────────────────────────────────────────────────────────────
-Normally the chatbot answers automatically. But what if the uploaded
-document doesn't really contain the answer? The bot might hallucinate
-or give a wrong answer confidently.
-
-HITL solves this by PAUSING the agent when it is not confident:
-
-  User asks a document question
-       ↓
-  Bot finds very little context in the document (low confidence)
-       ↓
-  Instead of guessing → Bot PAUSES and asks the human:
-  "I don't have enough info. Should I try to answer anyway?"
-       ↓
-  Human clicks "Yes, answer" or "No, skip"
-       ↓
-  Bot resumes with the human's decision
-
-This is implemented using LangGraph's interrupt mechanism:
-- The graph stores `awaiting_hitl = True` in its state.
-- The frontend detects this and shows Approve / Skip buttons.
-- When the human clicks, a new graph invocation resumes with the decision.
-
-Why is this useful?
-- It keeps humans in control when the AI is uncertain.
-- It prevents confidently wrong answers on document questions.
-- It is a real pattern used in production AI systems.
-──────────────────────────────────────────────────────────────────────────
+See prep/HITL_EXPLANATION.md for details on Human-In-The-Loop pausing.
 """
 
 from __future__ import annotations
@@ -72,7 +28,6 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from chatbot_memory import (
-    clear_memory,
     get_latest_user_message,
     get_memory_as_text,
     get_memory_count,
@@ -91,7 +46,7 @@ from chatbot_rag import (
     rebuild_rag_index,
 )
 from chatbot_rag_metrics import (
-    evaluate_retriever,
+    get_cached_metrics,
 )
 from chatbot_query_rewriter import (
     get_rag_context_with_rewriting,
@@ -114,44 +69,13 @@ from chatbot_tools import (
 )
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# CITATION HELPER
-# Every response ends with a small "Powered by" footer so the user
-# always knows where the information came from.
-# ══════════════════════════════════════════════════════════════════════════
-
 def _cite(source: str) -> str:
-    """
-    Return a markdown citation footer line.
-
-    Usage:
-        content = f"Some answer\n\n{_cite('OpenWeather API')}"
-
-    Available source labels and what they mean:
-        "OpenWeather API"       — real-time weather data
-        "Yahoo Finance"         — live stock prices
-        "DuckDuckGo"            — web search results
-        "System Clock"          — local machine date/time
-        "Groq (gpt-oss-120b)"   — LLM-generated answer (no external data)
-        "FAISS + Groq"          — document RAG + LLM answer with citations
-        "PostgreSQL LTM"        — facts retrieved from long-term memory store
-    """
+    """Add citation footer: > 🔧 **Powered by:** {source}"""
     return f"> 🔧 **Powered by:** {source}"
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# HITL CONFIG
-# If the RAG context is shorter than this, we consider it "low confidence"
-# and pause to ask the human whether to proceed.
-# ══════════════════════════════════════════════════════════════════════════
-HITL_MIN_CONTEXT_LENGTH = 200  # characters
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STATE
-# This dictionary is passed through every node in the graph.
-# LangGraph merges the messages list automatically using add_messages.
-# ══════════════════════════════════════════════════════════════════════════
+# Config: RAG context below this length triggers HITL approval request
+HITL_MIN_CONTEXT_LENGTH = 200
 
 class ChatState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -320,8 +244,19 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     if has_documents(thread_id):
         rewritten, rag_context = get_rag_context_with_rewriting(query, thread_id)
         if rewritten != query:
-            print(f"[Query Rewrite] {query} → {rewritten}")
+            print(f"[Query Rewrite Fallback] {query} → {rewritten}")
 
+        # Ask user to clarify if query is ambiguous with no context
+        if not rag_context and len(query) < 10:
+            from chatbot_query_rewriter import is_ambiguous_query
+            if is_ambiguous_query(query):
+                clarify_message = (
+                    "❓ Your question is unclear. Could you provide more details?\n\n"
+                    "Example: Instead of 'What is it?', try 'What is LoRA in fine-tuning?'"
+                )
+                return {"messages": [AIMessage(content=clarify_message)]}
+
+        # HITL: Low confidence retrieval
         if _is_document_question(query) and len(rag_context) < HITL_MIN_CONTEXT_LENGTH:
             pause_message = (
                 "⚠️ I found very little relevant content in your uploaded document "
@@ -337,30 +272,38 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             }
 
         if rag_context:
-            # IMPROVED: More detailed system prompt with structured instructions
-            system_prompt = (
-                "You are a document analysis expert. Your task is to answer the user's question "
-                "using ONLY the document context provided below.\n\n"
-                "IMPORTANT RULES:\n"
-                "1. Use ONLY information from the document context. Do NOT use external knowledge.\n"
-                "2. If the answer is not in the context, say clearly: 'This information is not found in the provided document.'\n"
-                "3. Always cite your sources using [1], [2], etc. format when referencing specific sections.\n"
-                "4. Structure your response clearly with headings and bullet points if the answer is complex.\n"
-                "5. Be specific and detailed - avoid vague or generic responses.\n"
-                "6. If the document mentions steps, processes, or stages - list them clearly in order.\n\n"
-                "═" * 60 + "\n"
-                "DOCUMENT CONTEXT:\n"
-                "═" * 60 + "\n"
-                f"{rag_context}\n"
-                "═" * 60 + "\n"
-                "USER QUESTION:\n"
-                "═" * 60 + "\n"
-                f"Question: {rewritten if rewritten != query else query}\n"
-                "═" * 60 + "\n"
-            )
-            recent = get_recent_messages(state["messages"])
-            response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
-            content = f"{response.content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq (gpt-oss-120b)')}"
+            # Check if context is good quality (coherent, substantial chunks)
+            chunk_count = rag_context.count("[")  # Count citations
+            context_length = len(rag_context)
+            avg_chunk_size = context_length / max(chunk_count, 1) if chunk_count > 0 else 0
+            
+            # If chunks are substantial (avg > 300 chars each), return with minimal LLM touch
+            if avg_chunk_size > 300 and context_length > 1000:
+                print(f"[RAG] High-quality context ({context_length} chars, {chunk_count} chunks) - returning directly")
+                # Return chunks directly - they already include **Sources:** section
+                content = rag_context
+            else:
+                # Fragments - use LLM to organize
+                print(f"[RAG] Fragmented context ({context_length} chars, {chunk_count} chunks) - using LLM to organize")
+                system_prompt = (
+                    "You are answering based on provided document content.\n"
+                    "**CRITICAL RULES:**\n"
+                    "1. Use EXACT quotes from the context - do NOT paraphrase or rewrite\n"
+                    "2. If the context contains bullet points, preserve them exactly\n"
+                    "3. Only combine or organize, NEVER change the wording\n"
+                    "4. Use citations [1], [2], etc. for each fact\n"
+                    "5. IMPORTANT: Include the **Sources:** section from the context at the end\n\n"
+                    "Format: Use bullet points or short paragraphs with exact quotes.\n"
+                    "Example: 'Functional Monitoring includes request volume, response times, and error rates [1].'\n\n"
+                    f"{rag_context}\n\n"
+                    f"Question: {rewritten if rewritten != query else query}\n"
+                    "Answer (use exact text with [1], [2] citations, and include **Sources:** section):"
+                )
+                recent = get_recent_messages(state["messages"])
+                response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
+                content = response.content
+            
+            content = f"{content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq (gpt-oss-120b)')}"
             return {"messages": [AIMessage(content=content)]}
 
     # ── 9. Default LLM answer ────────────────────────────────────────────
@@ -403,7 +346,7 @@ def route_after_chat(state: ChatState) -> str:
 
 def _init_checkpointer():
     """Create (or recover) the SQLite checkpointer."""
-    db_path = "chatbot_db"
+    db_path = os.path.join(os.path.dirname(__file__), "chatbot_db")
     try:
         conn = sqlite3.connect(db_path, check_same_thread=False)
         conn.execute("SELECT 1")
@@ -448,6 +391,13 @@ def list_all_threads() -> list[str]:
     threads = set()
     for checkpoint in checkpointer.list(None):
         threads.add(checkpoint.config["configurable"]["thread_id"])
+
+    docs_root = get_docs_dir("_placeholder_").parent
+    if docs_root.exists():
+        for path in docs_root.iterdir():
+            if path.is_dir():
+                threads.add(path.name)
+
     return list(threads)
 
 
@@ -551,4 +501,4 @@ def get_rag_metrics(thread_id: str) -> dict:
       ... else:
       ...     print("No evaluation data yet")
     """
-    return {}
+    return get_cached_metrics(thread_id)

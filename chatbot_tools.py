@@ -20,12 +20,11 @@ from urllib.request import Request, urlopen
 
 import yfinance as yf
 from ddgs import DDGS
-from dotenv import find_dotenv, load_dotenv
+from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-# Load Chatbot/.env first, then fall back to root .env
+# Load Chatbot/.env
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv(find_dotenv())
 
 # ── LLM setup ──────────────────────────────────────────────────────────────
 # Groq-hosted LLM via OpenAI-compatible API
@@ -113,13 +112,7 @@ def extract_weather_location(query: str) -> str:
 
 
 def extract_stock_symbol(query: str) -> str:
-    """Map a company name or ticker from the query to a stock symbol.
-    
-    Supports:
-    - US companies: Oracle, Google, Microsoft, Apple, Amazon, Tesla, Nvidia, etc.
-    - Indian companies: TCS, Infosys, Wipro, Reliance, HDFC, ICICI, LT, Bajaj, ITC, MRF, Hero, Maruti
-    - Direct tickers: Look for 1-5 uppercase letters
-    """
+    """Map company name to stock ticker (ORCL, MSFT, TCS.NS, etc)."""
     q = query.lower()
     
     # Direct ticker mapping (US)
@@ -366,10 +359,7 @@ def call_datetime() -> str:
 
 
 def format_weather_response(raw_json: str, location: str) -> str:
-    """
-    Turn the raw weather JSON string into a nicely formatted message.
-    Falls back to a web search if the JSON is empty or invalid.
-    """
+    """Format weather JSON as markdown table, or fallback to web search."""
     try:
         data = json.loads(raw_json)
     except Exception:

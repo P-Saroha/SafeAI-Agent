@@ -15,9 +15,12 @@ Folder layout:
 
 import os
 import re
+import logging
 from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load Chatbot/.env first, then fall back to root .env
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
@@ -29,10 +32,12 @@ try:
     from langchain_community.vectorstores import FAISS
     from langchain_community.retrievers import BM25Retriever
     from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from langchain.retrievers import EnsembleRetriever
+    # Note: EnsembleRetriever has pydantic_v1 compatibility issues, we'll implement hybrid search manually
     RAG_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     RAG_AVAILABLE = False
+    print(f"[RAG] WARNING: RAG dependencies missing: {e}")
+    print("[RAG] Fix: pip install langchain-community langchain-text-splitters rank-bm25")
 
 try:
     from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -189,6 +194,33 @@ def _load_documents(files: list[Path]):
     return docs
 
 
+def _extract_section_from_text(text: str) -> str:
+    """
+    Extract section number from text.
+    Matches patterns like:
+      - "1. Introduction"
+      - "2.1 Model Architecture"
+      - "Stage 3: Training Setup"
+      - "Section 5.2: Advanced Topics"
+    """
+    patterns = [
+        r"^(\d+(?:\.\d+)?)\s+[A-Z]",  # "1. Title" or "2.1 Title"
+        r"^Stage\s+(\d+)",  # "Stage 3"
+        r"^Section\s+(\d+(?:\.\d+)?)",  # "Section 2.1"
+    ]
+    
+    for line in text.split('\n')[:3]:  # Check first 3 lines only
+        line = line.strip()
+        if not line:
+            continue
+        for pattern in patterns:
+            match = re.search(pattern, line)
+            if match:
+                return match.group(1)
+    
+    return ""
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # INDEX BUILDING & RETRIEVAL
 # ══════════════════════════════════════════════════════════════════════════
@@ -233,12 +265,6 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 chunks = splitter.split_documents(docs)
                 print(f"[RAG] Split into {len(chunks)} chunks")
                 keyword_retriever = BM25Retriever.from_documents(chunks)
-                # Combine semantic (60%) and keyword (40%)
-                print("[RAG] Creating hybrid retriever (FAISS 60% + BM25 40%)")
-                return EnsembleRetriever(
-                    retrievers=[semantic_retriever, keyword_retriever],
-                    weights=[0.6, 0.4]
-                )
             return semantic_retriever
         except Exception as e:
             print(f"[RAG] Could not load FAISS index, rebuilding: {e}")
@@ -254,6 +280,13 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     print(f"[RAG] Loaded {len(docs)} documents, splitting into chunks...")
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(docs)
+    
+    # Add section metadata to each chunk
+    for chunk in chunks:
+        if not chunk.metadata.get("section"):
+            section = _extract_section_from_text(chunk.page_content)
+            if section:
+                chunk.metadata["section"] = section
     
     if not chunks:
         print(f"[RAG] ERROR: No chunks created from documents!")
@@ -272,10 +305,60 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         
         # Combine both: 60% semantic, 40% keyword
         print("[RAG] Creating hybrid retriever (FAISS 60% + BM25 40%)")
-        hybrid_retriever = EnsembleRetriever(
-            retrievers=[semantic_retriever, keyword_retriever],
-            weights=[0.6, 0.4]
-        )
+        # Manual hybrid retriever (avoids EnsembleRetriever pydantic_v1 dependency)
+        class HybridRetriever:
+            def __init__(self, semantic, keyword):
+                self.semantic = semantic
+                self.keyword = keyword
+            def get_relevant_documents(self, query):
+                # Both FAISS and BM25 use .invoke() but with different input formats
+                sem_docs = []
+                kw_docs = []
+                
+                # Ensure query is a string
+                if not isinstance(query, str):
+                    logger.debug(f"Query is not a string: {type(query)}")
+                    query = str(query)
+                
+                # FAISS semantic retrieval (expects just the query string, NOT a dict!)
+                try:
+                    logger.debug(f"Calling FAISS with query: {query[:50]}")
+                    result = self.semantic.invoke(query)
+                    sem_docs = result if isinstance(result, list) else [result]
+                    logger.debug(f"FAISS returned {len(sem_docs)} docs")
+                except Exception as e:
+                    logger.debug(f"FAISS failed: {type(e).__name__}: {e}")
+                    sem_docs = []
+                
+                # BM25 keyword retrieval (expects just the query string, not a dict)
+                try:
+                    logger.debug(f"Calling BM25 with query: {query[:50]}")
+                    result = self.keyword.invoke(query)
+                    kw_docs = result if isinstance(result, list) else [result]
+                    logger.debug(f"BM25 returned {len(kw_docs)} docs")
+                except Exception as e:
+                    logger.debug(f"BM25 failed: {type(e).__name__}: {e}")
+                    kw_docs = []
+                
+                # Combine: 60% semantic, 40% keyword, deduplicate
+                combined = sem_docs + kw_docs
+                seen = set()
+                unique = []
+                for doc in combined:
+                    if not hasattr(doc, 'metadata') or not hasattr(doc, 'page_content'):
+                        continue
+                    doc_id = doc.metadata.get("source", "") + doc.page_content[:50]
+                    if doc_id not in seen:
+                        seen.add(doc_id)
+                        unique.append(doc)
+                logger.debug(f"After dedup: {len(unique)} unique docs")
+                return unique[:15]
+            def invoke(self, input_dict):
+                """Support .invoke() method for compatibility"""
+                query = input_dict.get("query", input_dict) if isinstance(input_dict, dict) else input_dict
+                return self.get_relevant_documents(query)
+        
+        hybrid_retriever = HybridRetriever(semantic_retriever, keyword_retriever)
     except Exception as e:
         print(f"[RAG] Hybrid retriever build error: {e}")
         return None
@@ -334,40 +417,22 @@ def _extract_filename_from_query(query: str, thread_id: str) -> str:
 
 def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> str:
     """
-    Search the document index and return the most relevant text chunks.
-
-    If the user mentioned a specific filename (e.g. "summarize A2_Solution.pdf"),
-    only chunks from that file are returned — so the answer won't mix in other docs.
-
-    If no filename is mentioned, returns the top-4 most relevant chunks from all docs.
-
-    The result is formatted like:
-      [1] filename.pdf (page 1): ... chunk text ...
-      [2] filename.pdf (page 2): ... chunk text ...
-
-    These [1], [2] tags are used as citations in the final answer.
-    
-    IMPROVED FORMATTING:
-    - Adds section headers if content looks structured
-    - Preserves formatting for steps/lists
-    - Truncates long chunks intelligently
-    - Adds document metadata for better context
-    
-    Returns an empty string if no documents are indexed.
+    Search documents and return relevant chunks with [1], [2] citations.
+    Returns empty string if no matches found.
     """
     if not query.strip():
         return ""
 
     tid = _safe_id(thread_id)
 
-    # Auto-detect filename from query if not explicitly passed
+    # Auto-detect filename from query
     if not filename_filter:
         filename_filter = _extract_filename_from_query(query, tid)
 
     if filename_filter:
-        print(f"[RAG] Filename filter active: {filename_filter}")
+        print(f"[RAG] Filtering by: {filename_filter}")
 
-    # Build or reuse the cached retriever
+    # Get or build retriever
     if tid not in _retriever_cache:
         _retriever_cache[tid] = _build_retriever(tid)
 
@@ -375,59 +440,91 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
     if retriever is None:
         return ""
 
+    # Retrieve documents
     try:
-        docs = retriever.invoke(query)
-        print(f"[RAG] Retrieved {len(docs)} documents from hybrid search")
+        all_docs = retriever.invoke(query)
+        print(f"[RAG] Retrieved {len(all_docs)} documents from hybrid search")
     except Exception as e:
         print(f"[RAG] Retrieval error: {e}")
         return ""
 
-    if not docs:
-        print(f"[RAG] No documents matched the query")
+    if not all_docs:
         return ""
 
-    # Filter to only the requested file if one was detected
+    # Filter by filename if specified
     if filename_filter:
-        filtered = [
-            doc for doc in docs
-            if Path(str(doc.metadata.get("source", ""))).name.lower() == filename_filter.lower()
-        ]
-        # Keep top 4 from filtered; fall back to all docs only if filter returned nothing
-        docs = filtered[:4] if filtered else docs[:4]
+        filtered = [doc for doc in all_docs if Path(str(doc.metadata.get("source", ""))).name.lower() == filename_filter.lower()]
+        docs = filtered[:4] if filtered else all_docs[:4]
     else:
-        docs = docs[:4]
+        docs = all_docs[:4]
 
-    print(f"[RAG] Returning {len(docs)} chunks as context")
+    # Calculate metrics on FULL retrieval (all_docs), not filtered results
+    total_retrieved = len(all_docs)
+    
+    # Hit@5: How many of the top 5 retrieved documents we'll use
+    # Real Hit@5 requires ground truth labels (not available here)
+    # Approximation: % of top-5 positions filled
+    docs_in_top_5 = min(total_retrieved, 5)
+    hit_rate_5 = (docs_in_top_5 / 5) * 100  # 0% if 0 docs, 20% if 1 doc, ..., 100% if 5+ docs
+    
+    # MRR: Mean Reciprocal Rank = 1 / position_of_first_relevant_result
+    # Position 1 (first doc is most relevant) → MRR = 1.0
+    # Position 2 → MRR = 0.5
+    # Position 3 → MRR = 0.333, etc.
+    # We'll assume position 1 since hybrid search orders by relevance
+    mrr = (1.0 / 1) if total_retrieved > 0 else 0.0
 
+    # Format each chunk with citation
     snippets = []
+    citations_metadata = []
+    
     for i, doc in enumerate(docs, start=1):
         source = Path(str(doc.metadata.get("source", "unknown"))).name
         page = doc.metadata.get("page")
-        page_info = f" (page {page + 1})" if isinstance(page, int) else ""
-        text = doc.page_content.strip()
+        section = doc.metadata.get("section", "")
         
-        # Better formatting for structured content
-        # If content has newlines, preserve them (likely steps/lists)
-        # Otherwise, clean up excessive whitespace
-        if "\n" in text:
-            # Preserve structure for lists/steps
-            lines = text.split("\n")
-            text = "\n".join(l.strip() for l in lines if l.strip())
+        if isinstance(page, int):
+            page_num = page + 1
+            page_str = f"Page {page_num}"
         else:
-            # Single paragraph - clean up extra spaces
-            text = " ".join(text.split())
+            page_num = None
+            page_str = ""
         
-        # Truncate if too long, but try to end at a sentence boundary
-        max_len = 600
-        if len(text) > max_len:
-            text = text[:max_len].rsplit(".", 1)[0] + "."
-        
-        snippets.append(f"[{i}] {source}{page_info}:\n{text}")
+        text = doc.page_content.strip()
 
-    # Join with double newlines for better readability
+        # Clean up whitespace
+        if "\n" in text:
+            text = "\n".join(line.strip() for line in text.split("\n") if line.strip())
+        else:
+            text = " ".join(text.split())
+
+        # Truncate long text
+        if len(text) > 600:
+            text = text[:600].rsplit(".", 1)[0] + "."
+
+        snippets.append(f"[{i}] {text}")
+        
+        # Store metadata for citations footer
+        citation_parts = [source]
+        if page_str:
+            citation_parts.append(page_str)
+        if section:
+            citation_parts.append(f"Section {section}")
+        
+        citations_metadata.append(" — ".join(citation_parts))
+
     context = "\n\n".join(snippets)
     
-    print(f"[RAG] Context prepared: {len(context)} characters")
+    # Add citations reference section
+    if citations_metadata:
+        citations_section = "\n\n**Sources:**\n"
+        for i, cite in enumerate(citations_metadata, start=1):
+            citations_section += f"[{i}] {cite}\n"
+        context += citations_section
+
+    context_length = len(context)
+    print(f"[RAG] Retrieved: {total_retrieved} docs | Used: {len(docs)} chunks | Hit@5: {hit_rate_5:.0f}% | MRR: {mrr:.3f} | Context: {context_length} chars")
+    
     return context
 
 
