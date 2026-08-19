@@ -2,5 +2,5 @@
   "queries_evaluated": 15,
   "hit_rate_at_5": 0.867,
   "mean_reciprocal_rank": 0.767,
-  "verdict": "MEETS resume claims (Hit@5: 86.7% ≈ 87%, MRR: 0.767 > 0.72)"
+  "verdict": "(Hit@5: 86.7% ≈ 87%, MRR: 0.767 > 0.72)"
 }
