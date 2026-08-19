@@ -127,7 +127,7 @@ def _get_embeddings():
                 return self.model.encode(text, convert_to_numpy=True).tolist()
         
         _embeddings_cache = SentenceTransformerEmbeddings(model)
-        print("[RAG] ✅ Embeddings model cached and ready")
+        print("[RAG] Embeddings model cached and ready")
         return _embeddings_cache
     except ImportError:
         print("[RAG] ERROR: sentence-transformers not installed. REQUIRED: pip install sentence-transformers")
@@ -300,7 +300,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     # Load existing index from disk if it exists and we are not forcing a rebuild
     if index_dir.exists() and not force_rebuild:
         try:
-            print(f"[RAG] ✅ Loading existing index for thread {tid}")
+            print(f"[RAG] Loading existing index for thread {tid}")
             vectorstore = FAISS.load_local(
                 str(index_dir), embeddings, allow_dangerous_deserialization=True
             )

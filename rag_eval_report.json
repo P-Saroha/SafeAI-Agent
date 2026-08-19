@@ -1,6 +1,6 @@
 {
-  "queries_evaluated": 15,
-  "hit_rate_at_5": 0.933,
-  "mean_reciprocal_rank": 0.9,
+  "queries_evaluated": 40,
+  "hit_rate_at_5": 0.9,
+  "mean_reciprocal_rank": 0.875,
   "verdict": "Evaluation complete"
 }

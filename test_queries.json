@@ -14,6 +14,32 @@
     {"query": "SMOTE and Focal Loss for imbalance?", "expected": ["SMOTE", "Focal Loss"]},
     {"query": "What is DoRA?", "expected": ["DoRA", "magnitude"]},
     {"query": "Explain transformer multi-head attention", "expected": ["transformer", "attention"]},
-    {"query": "How does learning rate scheduling work?", "expected": ["learning rate", "schedule"]}
+    {"query": "How does learning rate scheduling work?", "expected": ["learning rate", "schedule"]},
+    {"query": "Compare DPO vs PPO vs SFT alignment techniques with their trade-offs", "expected": ["DPO", "PPO", "SFT", "trade-offs"]},
+    {"query": "What are the mathematical differences between LoRA and QLoRA quantization approaches?", "expected": ["LoRA", "QLoRA", "quantization", "NF4"]},
+    {"query": "How does memory optimization work during inference with different batch sizes?", "expected": ["memory", "inference", "batch", "optimization"]},
+    {"query": "Explain the relationship between KL divergence penalty and model drift in DPO", "expected": ["KL divergence", "DPO", "drift", "model"]},
+    {"query": "What are edge cases where LoRA might fail compared to full fine-tuning?", "expected": ["LoRA", "fail", "full fine-tuning", "edge cases"]},
+    {"query": "Explain the mathematics of gradient clipping in PPO training", "expected": ["gradient clipping", "PPO", "ratio"]},
+    {"query": "How does adapter stacking combine multiple LoRA modules?", "expected": ["adapter", "stacking", "LoRA"]},
+    {"query": "What is the significance of the reference model in RLHF?", "expected": ["reference model", "RLHF", "reward"]},
+    {"query": "Compare batch size effects on training stability and generalization", "expected": ["batch size", "stability", "generalization", "convergence"]},
+    {"query": "Explain catastrophic forgetting and how continual learning prevents it", "expected": ["catastrophic forgetting", "continual learning", "regularization"]},
+    {"query": "What is the role of temperature scaling in softmax during generation?", "expected": ["temperature", "softmax", "generation", "diversity"]},
+    {"query": "How does mixed precision training (FP16 vs BF16) affect model convergence?", "expected": ["mixed precision", "FP16", "BF16", "numerical stability"]},
+    {"query": "Explain the trade-off between LoRA rank and model performance improvement", "expected": ["LoRA", "rank", "performance", "trade-off"]},
+    {"query": "What is the computational complexity of multi-head attention vs single-head?", "expected": ["multi-head", "attention", "complexity", "computational"]},
+    {"query": "How do you select optimal hyperparameters for fine-tuning on limited data?", "expected": ["hyperparameters", "optimization", "limited data", "validation"]},
+    {"query": "Explain the interaction between LoRA rank, learning rate, and convergence speed in practice", "expected": ["LoRA", "rank", "learning rate", "convergence"]},
+    {"query": "What is the numerical stability issue when computing attention scores with large sequences?", "expected": ["attention", "numerical stability", "scaling", "sequences"]},
+    {"query": "How does weight decay regularization interact with LoRA parameter updates?", "expected": ["weight decay", "regularization", "LoRA", "parameters"]},
+    {"query": "Compare memory footprint of full fine-tuning vs LoRA vs QLoRA with 7B model", "expected": ["memory", "7B", "LoRA", "QLoRA", "footprint"]},
+    {"query": "Explain why activation quantization affects model accuracy more than weight quantization", "expected": ["activation quantization", "weight quantization", "accuracy", "sensitivity"]},
+    {"query": "What is the computational overhead of computing KL divergence during DPO training?", "expected": ["KL divergence", "DPO", "computational", "overhead"]},
+    {"query": "How do you handle long-tail distribution in instruction-following data for fine-tuning?", "expected": ["long-tail", "distribution", "instruction", "sampling"]},
+    {"query": "Explain the relationship between model capacity and LoRA rank requirement for task adaptation", "expected": ["model capacity", "LoRA rank", "task adaptation", "expressiveness"]},
+    {"query": "What are the convergence guarantees for adaptive optimizers like AdamW in LLM fine-tuning?", "expected": ["convergence", "AdamW", "adaptive", "guarantees"]},
+    {"query": "How does gradient accumulation affect batch normalization statistics during training?", "expected": ["gradient accumulation", "batch normalization", "statistics", "training"]}
   ]
 }
+
