@@ -14,7 +14,14 @@ Run with:
     streamlit run chatbotFrontend.py
 """
 
+# ⚠️ SUPPRESS WARNINGS ONLY
+import warnings
+import logging
 import os
+
+warnings.filterwarnings("ignore")
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("streamlit").setLevel(logging.ERROR)
 import uuid
 from pathlib import Path
 

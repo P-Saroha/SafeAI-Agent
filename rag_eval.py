@@ -1,6 +1,5 @@
 """
-rag_eval_resume.py - Evaluate RAG performance on curated queries.
-Demonstrates Hit@K: 93.3%, MRR: 0.867 on resume-claim test set.
+rag_eval.py - Evaluate RAG retrieval performance on test queries.
 """
 
 import json
@@ -9,28 +8,32 @@ from chatbot_rag import get_rag_context, _safe_id
 
 
 def evaluate():
-    """Evaluate RAG on 15 curated queries."""
+    """Evaluate RAG on curated test queries."""
     
-    # Find thread with documents
+    # Find thread with FineTuningLLM.pdf
     knowledge_base = Path("knowledge_base")
     thread_id = None
     for folder in knowledge_base.iterdir():
         if folder.is_dir():
-            if list(folder.glob("*.pdf")):
-                thread_id = folder.name
+            pdfs = list(folder.glob("*.pdf"))
+            for pdf in pdfs:
+                if "FineTuningLLM" in pdf.name:
+                    thread_id = folder.name
+                    break
+            if thread_id:
                 break
     
     if not thread_id:
-        print("ERROR: No documents found")
+        print("ERROR: FineTuningLLM.pdf not found")
         return
     
     tid = _safe_id(thread_id)
     
     # Load test queries
-    with open("test_queries_resume_claim.json") as f:
+    with open("test_queries.json") as f:
         tests = json.load(f)["queries"]
     
-    print(f"\nEvaluating RAG on {len(tests)} curated queries...")
+    print(f"\nEvaluating RAG on {len(tests)} test queries...")
     print("=" * 60)
     
     h1_total = h3_total = h5_total = 0
@@ -80,8 +83,8 @@ def evaluate():
     print("=" * 60)
     print(f"Hit Rate@1: {h1_total/n:.1%}")
     print(f"Hit Rate@3: {h3_total/n:.1%}")
-    print(f"Hit Rate@5: {h5_total/n:.1%}   <-- Resume claim: 87%")
-    print(f"MRR:        {mrr_total/n:.3f}   <-- Resume claim: 0.72")
+    print(f"Hit Rate@5: {h5_total/n:.1%}")
+    print(f"MRR:        {mrr_total/n:.3f}")
     print("=" * 60)
     
     # Save report
@@ -89,13 +92,13 @@ def evaluate():
         "queries_evaluated": n,
         "hit_rate_at_5": round(h5_total/n, 3),
         "mean_reciprocal_rank": round(mrr_total/n, 3),
-        "verdict": "EXCEEDS resume claims" if (h5_total/n >= 0.87 and mrr_total/n >= 0.72) else "Below claims"
+        "verdict": "Evaluation complete"
     }
     
-    with open("rag_eval_resume_report.json", "w") as f:
+    with open("rag_eval_report.json", "w") as f:
         json.dump(report, f, indent=2)
     
-    print(f"\nReport saved to: rag_eval_resume_report.json")
+    print(f"\nReport saved to: rag_eval_report.json")
 
 
 if __name__ == "__main__":

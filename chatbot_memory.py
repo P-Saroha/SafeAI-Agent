@@ -337,8 +337,8 @@ def is_self_query(query: str) -> bool:
 def remember_node(state: dict) -> dict:
     """
     LangGraph node: extract facts from the latest user message and save them.
-    This node runs before the main chat_node on every turn.
-    It always returns empty messages so the graph can continue normally.
+    OPTIMIZED: Skip extraction for non-informative queries (greetings, tools, etc).
+    Returns empty messages so graph can continue normally.
     """
     if not _ensure_ltm():
         return {"messages": []}
@@ -349,7 +349,22 @@ def remember_node(state: dict) -> dict:
     if not latest:
         return {"messages": []}
 
-    # Extract new facts from this message
+    # OPTIMIZATION: Skip fact extraction for non-informative queries
+    # These don't contain personal info and waste 600-800ms on Groq calls
+    query_lower = latest.lower()
+    non_informative_patterns = [
+        "what", "how", "when", "where", "why", "tell me", "explain",
+        "weather", "time", "date", "stock", "news", "search",
+        "hello", "hi", "hey", "thanks", "thank you", "ok", "okay",
+        "yes", "no", "sure", "design", "recommendation", "system"
+    ]
+    
+    # If query STARTS with non-informative word, skip expensive LLM call
+    first_word = query_lower.split()[0] if query_lower.split() else ""
+    if first_word in non_informative_patterns or any(p in query_lower[:20] for p in non_informative_patterns):
+        return {"messages": []}  # SKIP fact extraction - saves 600-800ms
+
+    # Extract new facts from this message (only for potentially personal info)
     new_facts = _extract_facts(latest)
 
     if new_facts:

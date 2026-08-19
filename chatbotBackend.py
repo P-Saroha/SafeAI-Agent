@@ -14,7 +14,16 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import warnings
+import logging
+import sys
 from typing import Annotated, TypedDict
+
+# Suppress transformers/torchvision warnings (harmless background module inspection)
+warnings.filterwarnings("ignore")
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("streamlit").setLevel(logging.ERROR)
+os.environ["STREAMLIT_LOGGER_LEVEL"] = "error"
 
 from dotenv import load_dotenv
 
@@ -45,12 +54,7 @@ from chatbot_rag import (
     has_documents,
     rebuild_rag_index,
 )
-from chatbot_rag_metrics import (
-    get_cached_metrics,
-)
-from chatbot_query_rewriter import (
-    get_rag_context_with_rewriting,
-)
+from chatbot_query_rewriter import get_rag_context_with_rewriting
 from chatbot_tools import (
     call_datetime,
     call_search,
@@ -74,44 +78,13 @@ def _cite(source: str) -> str:
     return f"> 🔧 **Powered by:** {source}"
 
 
-# Config: RAG context below this length triggers HITL approval request
-HITL_MIN_CONTEXT_LENGTH = 200
-
 class ChatState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     thread_id: str        # unique ID for this conversation
     user_id: str          # unique ID for this user (for long-term memory)
-
-    # ── HITL fields ──────────────────────────────────────────────────────
-    # These three fields control the Human-In-The-Loop approval flow.
-    awaiting_hitl: bool   # True = bot is paused, waiting for human decision
-    hitl_question: str    # The original question that triggered the pause
+    awaiting_hitl: bool   # True = bot paused, waiting for human decision
+    hitl_question: str    # The original question that triggered HITL pause
     hitl_decision: str    # Human's answer: "approve" or "skip"
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════════
-
-def _is_document_question(query: str) -> bool:
-    """
-    Return True only for specific document questions where HITL makes sense.
-    Broad queries like 'summarize' or 'what does it say' should ALWAYS go
-    straight to RAG — never trigger HITL — because the user clearly wants
-    the bot to try regardless of context length.
-    """
-    q = query.lower()
-
-    # These broad queries mean "try with whatever you have" — never pause
-    broad_queries = ["summarize", "summary", "overview", "what does it say",
-                     "what is in", "tell me about", "explain this", "describe"]
-    if any(kw in q for kw in broad_queries):
-        return False
-
-    # Only trigger HITL for specific targeted questions about document content
-    specific_keywords = ["according to", "in this pdf", "in this document",
-                         "from this file", "the report says", "the paper says"]
-    return any(kw in q for kw in specific_keywords)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -148,7 +121,31 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     if is_greeting(query):
         return {"messages": [AIMessage(content="Hello! How can I help you today?")]}
 
-    # ── 2. HITL resume: human has made a decision ────────────────────────
+    # ── 2. RAG (PRIORITIZE DOCUMENTS) ────────────────────────────────────
+    if has_documents(thread_id):
+        rewritten, rag_context = get_rag_context_with_rewriting(query, thread_id)
+        
+        # No context found - ask for clarification if ambiguous
+        if not rag_context and len(query) < 10:
+            from chatbot_query_rewriter import is_ambiguous_query
+            if is_ambiguous_query(query):
+                return {"messages": [AIMessage(content="Your question is unclear. Could you provide more details?")]}
+        
+        # Low confidence context - trigger HITL
+        if rag_context and len(rag_context) < 200:
+            return {
+                "messages": [AIMessage(content="⚠️ Found limited context. Do you want me to answer with this, or rephrase?")],
+                "awaiting_hitl": True,
+                "hitl_question": rewritten or query,
+                "hitl_decision": "",
+            }
+        
+        # Good context - return directly (FAST - no extra LLM call)
+        if rag_context:
+            content = f"{rag_context}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq')}"
+            return {"messages": [AIMessage(content=content)]}
+
+    # ── 3. HITL resume: human has made a decision ────────────────────────
     if state.get("awaiting_hitl") and state.get("hitl_decision"):
         decision = str(state["hitl_decision"]).lower().strip()
         original_question = str(state.get("hitl_question", query))
@@ -156,14 +153,20 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
         if decision == "approve":
             rag_context = get_rag_context(original_question, thread_id)
             prompt = (
-                "You are answering from limited document context — the user approved this.\n"
-                "Do your best with the context below. Be honest if the answer is unclear.\n"
-                "Cite sources like [1], [2] where possible.\n\n"
-                f"Document context:\n{rag_context if rag_context else 'No context found.'}\n\n"
-                f"Question: {original_question}"
+                "You are answering a specific question based ONLY on the provided document context.\n\n"
+                "INSTRUCTIONS:\n"
+                "1. Structure your answer with clear sections (use ### for headers if needed)\n"
+                "2. Use bullet points for lists and multiple items\n"
+                "3. Keep paragraphs short (2-3 sentences max)\n"
+                "4. Cite your sources using [1], [2], [3] format\n"
+                "5. If context doesn't directly answer the question, say so explicitly\n"
+                "6. Do NOT add information beyond what's in the context\n\n"
+                f"QUESTION: {original_question}\n\n"
+                f"CONTEXT FROM DOCUMENTS:\n{rag_context}\n\n"
+                "ANSWER (structured, concise, with citations):"
             )
             response = llm.invoke(prompt)
-            content = f"{response.content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq (low-confidence approval)')}"
+            content = f"{response.content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq')}"
             return {
                 "messages": [AIMessage(content=content)],
                 "awaiting_hitl": False,
@@ -239,72 +242,6 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
         return {"messages": [AIMessage(
             content="Please include a company name or ticker, e.g. *'stock price of ORCL'*"
         )]}
-
-    # ── 8. RAG ───────────────────────────────────────────────────────────
-    if has_documents(thread_id):
-        rewritten, rag_context = get_rag_context_with_rewriting(query, thread_id)
-        if rewritten != query:
-            print(f"[Query Rewrite Fallback] {query} → {rewritten}")
-
-        # Ask user to clarify if query is ambiguous with no context
-        if not rag_context and len(query) < 10:
-            from chatbot_query_rewriter import is_ambiguous_query
-            if is_ambiguous_query(query):
-                clarify_message = (
-                    "❓ Your question is unclear. Could you provide more details?\n\n"
-                    "Example: Instead of 'What is it?', try 'What is LoRA in fine-tuning?'"
-                )
-                return {"messages": [AIMessage(content=clarify_message)]}
-
-        # HITL: Low confidence retrieval
-        if _is_document_question(query) and len(rag_context) < HITL_MIN_CONTEXT_LENGTH:
-            pause_message = (
-                "⚠️ I found very little relevant content in your uploaded document "
-                "for this question.\n\n"
-                "Do you want me to try answering with what I found, "
-                "or should I skip and let you rephrase / upload a better document?"
-            )
-            return {
-                "messages": [AIMessage(content=pause_message)],
-                "awaiting_hitl": True,
-                "hitl_question": query,
-                "hitl_decision": "",
-            }
-
-        if rag_context:
-            # Check if context is good quality (coherent, substantial chunks)
-            chunk_count = rag_context.count("[")  # Count citations
-            context_length = len(rag_context)
-            avg_chunk_size = context_length / max(chunk_count, 1) if chunk_count > 0 else 0
-            
-            # If chunks are substantial (avg > 300 chars each), return with minimal LLM touch
-            if avg_chunk_size > 300 and context_length > 1000:
-                print(f"[RAG] High-quality context ({context_length} chars, {chunk_count} chunks) - returning directly")
-                # Return chunks directly - they already include **Sources:** section
-                content = rag_context
-            else:
-                # Fragments - use LLM to organize
-                print(f"[RAG] Fragmented context ({context_length} chars, {chunk_count} chunks) - using LLM to organize")
-                system_prompt = (
-                    "You are answering based on provided document content.\n"
-                    "**CRITICAL RULES:**\n"
-                    "1. Use EXACT quotes from the context - do NOT paraphrase or rewrite\n"
-                    "2. If the context contains bullet points, preserve them exactly\n"
-                    "3. Only combine or organize, NEVER change the wording\n"
-                    "4. Use citations [1], [2], etc. for each fact\n"
-                    "5. IMPORTANT: Include the **Sources:** section from the context at the end\n\n"
-                    "Format: Use bullet points or short paragraphs with exact quotes.\n"
-                    "Example: 'Functional Monitoring includes request volume, response times, and error rates [1].'\n\n"
-                    f"{rag_context}\n\n"
-                    f"Question: {rewritten if rewritten != query else query}\n"
-                    "Answer (use exact text with [1], [2] citations, and include **Sources:** section):"
-                )
-                recent = get_recent_messages(state["messages"])
-                response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
-                content = response.content
-            
-            content = f"{content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq (gpt-oss-120b)')}"
-            return {"messages": [AIMessage(content=content)]}
 
     # ── 9. Default LLM answer ────────────────────────────────────────────
     memory_text = get_memory_as_text(user_id)

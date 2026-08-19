@@ -4,21 +4,30 @@ chatbot_rag.py
 RAG (Retrieval-Augmented Generation) helpers.
 
 What this file does:
+
 1. Lets each chat thread have its own folder of uploaded documents (PDF, TXT, MD).
+
 2. Builds a FAISS vector index from those documents so we can search them.
+
 3. Given a user question, finds the most relevant chunks and returns them as context.
 
 Folder layout:
+
   knowledge_base/<thread_id>/   ← uploaded documents
+
   faiss_index/<thread_id>/      ← saved FAISS index for that thread
 """
 
 import os
 import re
 import logging
+import warnings
 from pathlib import Path
-
 from dotenv import find_dotenv, load_dotenv
+
+# Suppress transformers/torchvision import warnings (harmless)
+warnings.filterwarnings("ignore")
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +59,6 @@ try:
 except ImportError:
     from langchain.embeddings.base import Embeddings
 
-
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 DOCS_ROOT = BASE_DIR / "knowledge_base"   # uploaded files go here
@@ -58,7 +66,7 @@ INDEX_ROOT = BASE_DIR / "faiss_index"     # FAISS indexes saved here
 
 # Simple in-memory caches so we don't rebuild the index on every question
 _retriever_cache: dict[str, object] = {}
-
+_embeddings_cache = None  # Cache embeddings model (loaded once)
 
 # ══════════════════════════════════════════════════════════════════════════
 # PATH HELPERS
@@ -70,16 +78,13 @@ def _safe_id(thread_id: str) -> str:
     value = str(thread_id or "default").strip()
     return re.sub(r"[^A-Za-z0-9._\-]", "_", value) or "default"
 
-
 def get_docs_dir(thread_id: str) -> Path:
     """Return the folder where uploaded documents for this thread are stored."""
     return DOCS_ROOT / _safe_id(thread_id)
 
-
 def get_index_dir(thread_id: str) -> Path:
     """Return the folder where the FAISS index for this thread is stored."""
     return INDEX_ROOT / _safe_id(thread_id)
-
 
 # ══════════════════════════════════════════════════════════════════════════
 # EMBEDDING BACKEND
@@ -88,28 +93,58 @@ def get_index_dir(thread_id: str) -> Path:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _get_embeddings():
-    """Return the best available embedding model.
+    """Return the best available embedding model (prioritized by quality & speed).
     
-    Options (set via RAG_EMBEDDING_BACKEND in .env):
-      "hash"   — offline hash embeddings, no API key needed (default)
-      "google" — Google text-embedding-004, needs GOOGLE_API_KEY in .env
+    CACHED in memory - loaded only ONCE, then reused.
     
-    Note: Groq does not provide an embeddings API, so we use hash by default.
-    For better RAG quality, set RAG_EMBEDDING_BACKEND=google and add GOOGLE_API_KEY.
+    1. Sentence-Transformers (best, free, local)
+    2. Google (needs GOOGLE_API_KEY)
+    3. Hash (poor, offline fallback)
     """
-    backend = os.getenv("RAG_EMBEDDING_BACKEND", "hash").lower()
-
-    if backend == "google" and GOOGLE_EMBEDDINGS_AVAILABLE:
+    global _embeddings_cache
+    
+    # Return cached if already loaded
+    if _embeddings_cache is not None:
+        return _embeddings_cache
+    
+    # Try sentence-transformers first (best quality, free, local)
+    try:
+        from sentence_transformers import SentenceTransformer
+        # all-MiniLM-L6-v2: Fast, good quality (384 dims)
+        # Production choice: balances speed and accuracy
+        print("[RAG] Loading embeddings model (all-MiniLM-L6-v2, CACHED in memory)")
+        model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+        
+        # Wrap in LangChain-compatible class
+        class SentenceTransformerEmbeddings(Embeddings):
+            def __init__(self, model):
+                self.model = model
+            
+            def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                return self.model.encode(texts, convert_to_numpy=True).tolist()
+            
+            def embed_query(self, text: str) -> list[float]:
+                return self.model.encode(text, convert_to_numpy=True).tolist()
+        
+        _embeddings_cache = SentenceTransformerEmbeddings(model)
+        print("[RAG] ✅ Embeddings model cached and ready")
+        return _embeddings_cache
+    except ImportError:
+        print("[RAG] ERROR: sentence-transformers not installed. REQUIRED: pip install sentence-transformers")
+    
+    # Try Google second
+    if GOOGLE_EMBEDDINGS_AVAILABLE:
         api_key = os.getenv("GOOGLE_API_KEY")
         if api_key:
             model = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/text-embedding-004")
-            return GoogleGenerativeAIEmbeddings(model=model)
-        else:
-            print("[RAG] RAG_EMBEDDING_BACKEND=google but GOOGLE_API_KEY not set, falling back to hash")
-
-    # Default: local hash embeddings (no API key needed, always works)
-    return _HashEmbeddings()
-
+            print("[RAG] Using Google Generative AI embeddings (high quality, costs $)")
+            _embeddings_cache = GoogleGenerativeAIEmbeddings(model=model)
+            return _embeddings_cache
+    
+    # Fallback to hash (poor quality)
+    print("[RAG] WARNING: Using hash embeddings (poor quality, offline fallback)")
+    _embeddings_cache = _HashEmbeddings()
+    return _embeddings_cache
 
 class _HashEmbeddings(Embeddings):
     """
@@ -117,7 +152,6 @@ class _HashEmbeddings(Embeddings):
     Inherits from LangChain's Embeddings base class so FAISS accepts it.
     Converts text to a fixed-size vector using word hashes.
     """
-
     DIM = 384
 
     def _embed(self, text: str) -> list[float]:
@@ -136,7 +170,6 @@ class _HashEmbeddings(Embeddings):
     def embed_query(self, text: str) -> list[float]:
         return self._embed(text)
 
-
 # ══════════════════════════════════════════════════════════════════════════
 # DOCUMENT LOADING
 # ══════════════════════════════════════════════════════════════════════════
@@ -148,7 +181,6 @@ def _get_supported_files(thread_id: str) -> list[Path]:
         return []
     supported = {".pdf", ".txt", ".md"}
     return sorted(p for p in docs_dir.rglob("*") if p.is_file() and p.suffix.lower() in supported)
-
 
 def _load_documents(files: list[Path]):
     """Load each file into LangChain Document objects."""
@@ -188,11 +220,27 @@ def _load_documents(files: list[Path]):
         except Exception as e:
             print(f"[RAG] Could not load {path.name}: {e}")
     
+    # Remove header/footer artifacts before returning
+    cleaned_docs = []
+    for doc in docs:
+        lines = doc.page_content.split('\n')
+        # Remove common PDF artifacts
+        filtered_lines = []
+        for line in lines:
+            line_lower = line.lower()
+            # Skip header/footer spam
+            if any(x in line_lower for x in ["free pdf", "amanai lab", "amanailab.com", "youtube", "linkedin", "github"]):
+                continue
+            if line.strip():
+                filtered_lines.append(line)
+        if filtered_lines:
+            doc.page_content = '\n'.join(filtered_lines)
+            cleaned_docs.append(doc)
+    
     if not docs:
         print(f"[RAG] WARNING: No documents loaded from {len(files)} file(s)")
     
-    return docs
-
+    return cleaned_docs
 
 def _extract_section_from_text(text: str) -> str:
     """
@@ -219,7 +267,6 @@ def _extract_section_from_text(text: str) -> str:
                 return match.group(1)
     
     return ""
-
 
 # ══════════════════════════════════════════════════════════════════════════
 # INDEX BUILDING & RETRIEVAL
@@ -253,21 +300,72 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     # Load existing index from disk if it exists and we are not forcing a rebuild
     if index_dir.exists() and not force_rebuild:
         try:
-            print(f"[RAG] Loading existing index for thread {tid}")
+            print(f"[RAG] ✅ Loading existing index for thread {tid}")
             vectorstore = FAISS.load_local(
                 str(index_dir), embeddings, allow_dangerous_deserialization=True
             )
-            semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+            semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
             # Rebuild BM25 from raw documents (not persisted, rebuilt on load)
             docs = _load_documents(files)
             if docs:
                 print(f"[RAG] Building BM25 from {len(docs)} documents")
-                # OPTIMIZED: Increased chunk size to 1200, overlap to 200 for better semantic boundaries
-                splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
+                splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
                 chunks = splitter.split_documents(docs)
                 print(f"[RAG] Split into {len(chunks)} chunks")
                 keyword_retriever = BM25Retriever.from_documents(chunks)
-            return semantic_retriever
+                
+                # Create hybrid retriever (same as fresh build)
+                class OptimizedHybridRetriever:
+                    def __init__(self, semantic, keyword, all_chunks):
+                        self.semantic = semantic
+                        self.keyword = keyword
+                        self.all_chunks = all_chunks
+                    
+                    def get_relevant_documents(self, query):
+                        sem_docs = []
+                        kw_docs = []
+                        
+                        if not isinstance(query, str):
+                            query = str(query)
+                        
+                        try:
+                            result = self.semantic.invoke(query)
+                            sem_docs = result if isinstance(result, list) else [result]
+                        except Exception as e:
+                            logger.debug(f"FAISS failed: {e}")
+                        
+                        try:
+                            result = self.keyword.invoke(query)
+                            kw_docs = result if isinstance(result, list) else [result]
+                        except Exception as e:
+                            logger.debug(f"BM25 failed: {e}")
+                        
+                        combined = {}
+                        for i, doc in enumerate(sem_docs[:5]):
+                            doc_id = hash(doc.page_content[:100])
+                            score = (1.0 - i/5) * 0.8
+                            combined[doc_id] = (score, doc)
+                        
+                        for i, doc in enumerate(kw_docs[:5]):
+                            doc_id = hash(doc.page_content[:100])
+                            score = (1.0 - i/5) * 0.2
+                            if doc_id in combined:
+                                old_score, old_doc = combined[doc_id]
+                                combined[doc_id] = (old_score + score, old_doc)
+                            else:
+                                combined[doc_id] = (score, doc)
+                        
+                        sorted_docs = sorted(combined.values(), key=lambda x: x[0], reverse=True)
+                        return [doc for _, doc in sorted_docs[:3]]
+                    
+                    def invoke(self, input_dict):
+                        query = input_dict.get("query", input_dict) if isinstance(input_dict, dict) else input_dict
+                        return self.get_relevant_documents(query)
+                
+                hybrid_retriever = OptimizedHybridRetriever(semantic_retriever, keyword_retriever, chunks)
+                return hybrid_retriever
+
         except Exception as e:
             print(f"[RAG] Could not load FAISS index, rebuilding: {e}")
 
@@ -280,8 +378,8 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         return None
 
     print(f"[RAG] Loaded {len(docs)} documents, splitting into chunks...")
-    # OPTIMIZED: Increased chunk size to 1200, overlap to 200
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
+    # OPTIMIZED: 1000 chars with 150 overlap = tight, focused chunks
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(docs)
     
     # Add section metadata to each chunk
@@ -296,7 +394,6 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         return None
 
     print(f"[RAG] Created {len(chunks)} chunks, building FAISS index...")
-
     try:
         # Build FAISS for semantic search
         vectorstore = FAISS.from_documents(chunks, embeddings)
@@ -336,58 +433,46 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 return 0.6 * keyword_score + 0.4 * length_score
             
             def get_relevant_documents(self, query):
-                # Both FAISS and BM25 use .invoke() but with different input formats
                 sem_docs = []
                 kw_docs = []
                 
-                # Ensure query is a string
                 if not isinstance(query, str):
-                    logger.debug(f"Query is not a string: {type(query)}")
                     query = str(query)
                 
-                # FAISS semantic retrieval
+                # Get both FAISS and BM25 results
                 try:
-                    logger.debug(f"Calling FAISS with query: {query[:50]}")
                     result = self.semantic.invoke(query)
                     sem_docs = result if isinstance(result, list) else [result]
-                    logger.debug(f"FAISS returned {len(sem_docs)} docs")
                 except Exception as e:
-                    logger.debug(f"FAISS failed: {type(e).__name__}: {e}")
-                    sem_docs = []
+                    logger.debug(f"FAISS failed: {e}")
                 
-                # BM25 keyword retrieval
                 try:
-                    logger.debug(f"Calling BM25 with query: {query[:50]}")
                     result = self.keyword.invoke(query)
                     kw_docs = result if isinstance(result, list) else [result]
-                    logger.debug(f"BM25 returned {len(kw_docs)} docs")
                 except Exception as e:
-                    logger.debug(f"BM25 failed: {type(e).__name__}: {e}")
-                    kw_docs = []
+                    logger.debug(f"BM25 failed: {e}")
                 
-                # OPTIMIZED: Combine with reranking
-                combined = sem_docs + kw_docs
-                seen = set()
-                unique = []
-                for doc in combined:
-                    if not hasattr(doc, 'metadata') or not hasattr(doc, 'page_content'):
-                        continue
-                    doc_id = doc.metadata.get("source", "") + doc.page_content[:50]
-                    if doc_id not in seen:
-                        seen.add(doc_id)
-                        unique.append(doc)
+                # Combine: FAISS 80%, BM25 20% (prioritize semantic)
+                combined = {}
+                for i, doc in enumerate(sem_docs[:5]):  # Top 5 from FAISS
+                    doc_id = hash(doc.page_content[:100])
+                    score = (1.0 - i/5) * 0.8  # 80% weight for FAISS
+                    combined[doc_id] = (score, doc)
                 
-                # RERANK: Score each unique doc and sort
-                ranked = []
-                for doc in unique:
-                    score = self._score_relevance(query, doc.page_content)
-                    ranked.append((score, doc))
+                for i, doc in enumerate(kw_docs[:5]):  # Top 5 from BM25
+                    doc_id = hash(doc.page_content[:100])
+                    score = (1.0 - i/5) * 0.2  # 20% weight for BM25
+                    if doc_id in combined:
+                        old_score, old_doc = combined[doc_id]
+                        combined[doc_id] = (old_score + score, old_doc)
+                    else:
+                        combined[doc_id] = (score, doc)
                 
-                # Sort by relevance score (descending)
-                ranked.sort(key=lambda x: x[0], reverse=True)
-                
-                # Return top 15 docs
-                return [doc for score, doc in ranked[:15]]
+                # Sort by combined score
+                sorted_docs = sorted(combined.values(), key=lambda x: x[0], reverse=True)
+                # Return top 3 chunks (more complete answers while maintaining quality)
+                # Still returns best-ranked chunks, provides better full context
+                return [doc for _, doc in sorted_docs[:3]]
             
             def invoke(self, input_dict):
                 """Support .invoke() method for compatibility"""
@@ -395,6 +480,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 return self.get_relevant_documents(query)
         
         hybrid_retriever = OptimizedHybridRetriever(semantic_retriever, keyword_retriever, chunks)
+
     except Exception as e:
         print(f"[RAG] Hybrid retriever build error: {e}")
         return None
@@ -409,7 +495,6 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
 
     print(f"[RAG] Optimized hybrid retriever built successfully!")
     return hybrid_retriever
-
 
 def rebuild_rag_index(thread_id: str) -> str:
     """Force a full rebuild of the FAISS index and update the cache."""
@@ -426,17 +511,14 @@ def rebuild_rag_index(thread_id: str) -> str:
     
     retriever = _build_retriever(tid, force_rebuild=True)
     _retriever_cache[tid] = retriever
-
     if retriever:
         return f"RAG index rebuilt successfully with {len(files)} file(s)."
     return "RAG index rebuild failed — check console for errors above"
-
 
 def _extract_filename_from_query(query: str, thread_id: str) -> str:
     """
     Check if the user mentioned a specific filename in their query.
     Returns the matching filename if found, empty string otherwise.
-
     Examples:
       "give me summary of A2_Solution.pdf"  -> "A2_Solution.pdf"
       "what does notes.txt say"             -> "notes.txt"
@@ -450,25 +532,14 @@ def _extract_filename_from_query(query: str, thread_id: str) -> str:
             return f.name
     return ""
 
-
 def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> str:
-    """
-    Search documents and return relevant chunks with [1], [2] citations.
-    Returns empty string if no matches found.
-    """
+    """Fast RAG retrieval - return top 3 chunks with clean structured formatting."""
     if not query.strip():
         return ""
 
     tid = _safe_id(thread_id)
-
-    # Auto-detect filename from query
-    if not filename_filter:
-        filename_filter = _extract_filename_from_query(query, tid)
-
-    if filename_filter:
-        print(f"[RAG] Filtering by: {filename_filter}")
-
-    # Get or build retriever
+    
+    # Get cached retriever
     if tid not in _retriever_cache:
         _retriever_cache[tid] = _build_retriever(tid)
 
@@ -479,90 +550,69 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
     # Retrieve documents
     try:
         all_docs = retriever.invoke(query)
-        print(f"[RAG] Retrieved {len(all_docs)} documents from hybrid search")
     except Exception as e:
-        print(f"[RAG] Retrieval error: {e}")
+        print(f"[RAG] Error: {e}")
         return ""
 
     if not all_docs:
         return ""
 
-    # Filter by filename if specified
-    if filename_filter:
-        filtered = [doc for doc in all_docs if Path(str(doc.metadata.get("source", ""))).name.lower() == filename_filter.lower()]
-        docs = filtered[:4] if filtered else all_docs[:4]
-    else:
-        docs = all_docs[:4]
+    docs = all_docs[:3]  # Top 3 chunks
 
-    # Calculate metrics on FULL retrieval (all_docs), not filtered results
-    total_retrieved = len(all_docs)
-    
-    # Hit@5: How many of the top 5 retrieved documents we'll use
-    # Real Hit@5 requires ground truth labels (not available here)
-    # Approximation: % of top-5 positions filled
-    docs_in_top_5 = min(total_retrieved, 5)
-    hit_rate_5 = (docs_in_top_5 / 5) * 100  # 0% if 0 docs, 20% if 1 doc, ..., 100% if 5+ docs
-    
-    # MRR: Mean Reciprocal Rank = 1 / position_of_first_relevant_result
-    # Position 1 (first doc is most relevant) → MRR = 1.0
-    # Position 2 → MRR = 0.5
-    # Position 3 → MRR = 0.333, etc.
-    # We'll assume position 1 since hybrid search orders by relevance
-    mrr = (1.0 / 1) if total_retrieved > 0 else 0.0
-
-    # Format each chunk with citation
+    # Format chunks with clean structure
     snippets = []
-    citations_metadata = []
-    
     for i, doc in enumerate(docs, start=1):
-        source = Path(str(doc.metadata.get("source", "unknown"))).name
-        page = doc.metadata.get("page")
-        section = doc.metadata.get("section", "")
-        
-        if isinstance(page, int):
-            page_num = page + 1
-            page_str = f"Page {page_num}"
-        else:
-            page_num = None
-            page_str = ""
-        
         text = doc.page_content.strip()
-
-        # Clean up whitespace
-        if "\n" in text:
-            text = "\n".join(line.strip() for line in text.split("\n") if line.strip())
-        else:
-            text = " ".join(text.split())
-
-        # Truncate long text
-        if len(text) > 600:
-            text = text[:600].rsplit(".", 1)[0] + "."
-
-        snippets.append(f"[{i}] {text}")
         
-        # Store metadata for citations footer
-        citation_parts = [source]
-        if page_str:
-            citation_parts.append(page_str)
-        if section:
-            citation_parts.append(f"Section {section}")
+        # Clean up: remove decorative lines, excessive whitespace
+        lines = text.split('\n')
+        cleaned_lines = []
         
-        citations_metadata.append(" — ".join(citation_parts))
+        for line in lines:
+            line = line.strip()
+            # Skip: empty, decorative (■, –), or too short
+            if not line or line.startswith('■') or line.startswith('–'):
+                continue
+            if len(line) < 3:
+                continue
+            cleaned_lines.append(line)
+        
+        # Rejoin with single newlines
+        text = '\n'.join(cleaned_lines)
+        
+        # Structure: break into paragraphs for readability
+        paragraphs = text.split('\n\n')
+        structured_text = '\n\n'.join(p.strip() for p in paragraphs if p.strip())
+        
+        # Truncate if too long
+        if len(structured_text) > 2000:
+            structured_text = structured_text[:2000]
+            # Find last sentence boundary
+            last_dot = structured_text.rfind('.')
+            if last_dot > 1500:
+                structured_text = structured_text[:last_dot+1]
+        
+        snippets.append(f"[{i}] {structured_text}")
 
     context = "\n\n".join(snippets)
     
-    # Add citations reference section
-    if citations_metadata:
-        citations_section = "\n\n**Sources:**\n"
-        for i, cite in enumerate(citations_metadata, start=1):
-            citations_section += f"[{i}] {cite}\n"
-        context += citations_section
-
-    context_length = len(context)
-    print(f"[RAG] Retrieved: {total_retrieved} docs | Used: {len(docs)} chunks | Hit@5: {hit_rate_5:.0f}% | MRR: {mrr:.3f} | Context: {context_length} chars")
+    # Add sources footer
+    if docs:
+        context += "\n\n---\n\n**Sources:**\n"
+        seen = set()
+        for i, doc in enumerate(docs, start=1):
+            source = Path(str(doc.metadata.get("source", "unknown"))).name
+            page = doc.metadata.get("page")
+            
+            source_line = f"[{i}] {source}"
+            if isinstance(page, int):
+                source_line += f" — Page {page + 1}"
+            
+            if source_line not in seen:
+                context += source_line + "\n"
+                seen.add(source_line)
     
     return context
-
 
 def has_documents(thread_id: str) -> bool:
     """Return True if this thread has any uploaded documents."""
