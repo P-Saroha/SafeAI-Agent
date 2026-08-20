@@ -140,9 +140,23 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 "hitl_decision": "",
             }
         
-        # Good context - return directly (FAST - no extra LLM call)
+        # Good context - pass through LLM for better formatting
         if rag_context:
-            content = f"{rag_context}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq')}"
+            # Add LLM formatting step here
+            prompt = (
+                "You are formatting retrieved document chunks into a structured response.\n\n"
+                "INSTRUCTIONS:\n"
+                "1. Organize information logically (intro → details → conclusion)\n"
+                "2. Use clear formatting: ### headers, **bold**, bullet points\n"
+                "3. Preserve citations [1], [2], [3]\n"
+                "4. Keep answer concise but complete\n"
+                "5. Don't add info beyond what's in chunks\n\n"
+                f"QUESTION: {query}\n\n"
+                f"CHUNKS:\n{rag_context}\n\n"
+                "FORMATTED RESPONSE:"
+            )
+            formatted = llm.invoke(prompt)
+            content = f"{formatted.content}\n\n{_cite('FAISS + BM25 + LLM Formatting')}"
             return {"messages": [AIMessage(content=content)]}
 
     # ── 3. HITL resume: human has made a decision ────────────────────────
