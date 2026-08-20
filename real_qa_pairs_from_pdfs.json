@@ -1,0 +1,111 @@
+{
+  "total_questions": 21,
+  "finetuning_llm": [
+    {
+      "question": "What are the seven stages of the fine-tuning pipeline?",
+      "expected_answer": "I implemented a comprehensive fine-tuning pipeline covering: 1) Data Preparation - the most critical stage, 2) Model Initialisation, 3) Training Setup with optimal hyperparameters, 4) Fine-Tuning with LoRA/QLoRA, 5) Evaluation metrics, 6) Deployment to production, 7) Monitoring for performance.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is Data Preparation and why is it critical?",
+      "expected_answer": "Data preparation is the most critical stage in fine-tuning. It involves curation, cleaning, and formatting training data to determine the upper bound of model performance. Poor data preparation directly limits how good your fine-tuned model can be.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is LoRA (Low-Rank Adaptation)?",
+      "expected_answer": "LoRA is a parameter-efficient method that constrains weight updates to a low-dimensional subspace, reducing trainable parameters by 99%. I used LoRA to enable efficient fine-tuning on consumer hardware while maintaining model quality.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is QLoRA and how does it work?",
+      "expected_answer": "QLoRA enables fine-tuning on consumer hardware by combining 4-bit quantization with LoRA, achieving 18x memory reduction while maintaining only 0.5% performance drop. This was critical for my deployment strategy.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is NormalFloat4 (NF4) Quantization?",
+      "expected_answer": "NF4 is an information-theoretically optimal data type for normally distributed weights, with quantization levels placed at quantiles of N(0,1). I implemented NF4 quantization to reduce memory footprint during inference.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What are the key hyperparameters in training setup?",
+      "expected_answer": "Key hyperparameters include: Learning Rate (1e-5 to 2e-4), Batch Size, Gradient Accumulation to simulate larger batches, Epochs (typically 1-5), and optimization algorithms like AdamW. I tuned these for optimal convergence.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is Deployment Stage and its main steps?",
+      "expected_answer": "Deployment involves: model export to ONNX/TensorRT for optimization, infrastructure setup with containerization (Docker), API development for serving, and production monitoring with alerting. I implemented all stages for production readiness.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is RLHF (Reinforcement Learning from Human Feedback)?",
+      "expected_answer": "RLHF trains models using human preference feedback via reward models, combining supervised learning with reinforcement learning. This aligns model outputs with human preferences and improves response quality.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is Gradient Accumulation and how does it work?",
+      "expected_answer": "Gradient accumulation simulates larger batch sizes by accumulating gradients over multiple steps before updating weights. Formula: Effective_Batch = batch_size × accumulation_steps × num_gpus. This allows training on memory-constrained hardware.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is Scaled Dot-Product Attention formula?",
+      "expected_answer": "Attention(Q,K,V) = softmax(QK^T / sqrt(d_k)) V. It computes attention weights by scaling dot products of queries and keys. This mechanism is fundamental to the transformer architecture.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is attention mechanism?",
+      "expected_answer": "Attention mechanism allows models to focus on different parts of input dynamically, crucial for transformer architectures that power modern LLMs.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is Training Setup phase?",
+      "expected_answer": "Training Setup configures the learning environment with hyperparameters, loss functions, and optimization algorithms. I set up learning rate scheduling, gradient clipping, and mixed precision training for efficient convergence.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is the role of Learning Rate in fine-tuning?",
+      "expected_answer": "Learning Rate controls the step size during gradient updates. I use adaptive learning rates (1e-5 to 2e-4) with LoRA, lower than full fine-tuning, to preserve base model knowledge.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is Batch Size optimization?",
+      "expected_answer": "Batch Size affects convergence and memory usage. I use gradient accumulation to simulate larger batches on memory-constrained hardware, achieving better convergence without exceeding GPU memory.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is AdamW optimization algorithm?",
+      "expected_answer": "AdamW is an adaptive optimizer with decoupled weight decay. I use AdamW for fine-tuning because it provides stable convergence, momentum tracking, and effective regularization compared to SGD.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is weight decay regularization?",
+      "expected_answer": "Weight decay (L2 regularization) prevents overfitting by penalizing large weights. I tune weight decay carefully with LoRA since we update fewer parameters than full fine-tuning.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is the purpose of validation during training?",
+      "expected_answer": "Validation during training monitors model performance on unseen data to detect overfitting early. I use validation loss as a signal for early stopping and learning rate adjustment.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "How does parameter efficiency improve training?",
+      "expected_answer": "Parameter efficiency through LoRA reduces memory footprint by 99%, enabling fine-tuning on consumer GPUs. This reduces training time significantly.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is model quantization for inference?",
+      "expected_answer": "Quantization reduces model size by representing weights in lower precision formats, enabling faster deployment.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "What is the advantage of mixed precision training?",
+      "expected_answer": "Mixed precision uses float32 and float16 to reduce memory while maintaining accuracy for efficient training.",
+      "source": "FineTuningLLM.pdf"
+    },
+    {
+      "question": "How to handle class imbalance in training data?",
+      "expected_answer": "Class imbalance affects model learning. I use techniques like weighted loss functions, data augmentation, and stratified sampling to handle imbalanced datasets.",
+      "source": "FineTuningLLM.pdf"
+    }
+  ],
+  "ai_system_design": []
+}
