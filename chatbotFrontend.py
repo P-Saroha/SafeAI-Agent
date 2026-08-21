@@ -14,7 +14,7 @@ Run with:
     streamlit run chatbotFrontend.py
 """
 
-# ⚠️ SUPPRESS WARNINGS ONLY
+#  SUPPRESS WARNINGS ONLY
 import warnings
 import logging
 import os

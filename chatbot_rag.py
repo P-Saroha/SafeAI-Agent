@@ -49,12 +49,6 @@ except ImportError as e:
     print("[RAG] Fix: pip install langchain-community langchain-text-splitters rank-bm25")
 
 try:
-    from langchain_google_genai import GoogleGenerativeAIEmbeddings
-    GOOGLE_EMBEDDINGS_AVAILABLE = True
-except ImportError:
-    GOOGLE_EMBEDDINGS_AVAILABLE = False
-
-try:
     from langchain_core.embeddings import Embeddings
 except ImportError:
     from langchain.embeddings.base import Embeddings
@@ -88,18 +82,18 @@ def get_index_dir(thread_id: str) -> Path:
 
 # ══════════════════════════════════════════════════════════════════════════
 # EMBEDDING BACKEND
-# Uses Google embeddings if available, otherwise falls back to a simple
-# hash-based embedding that needs no API key.
+# Uses all-MiniLM-L6-v2 (required in requirements.txt)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _get_embeddings():
-    """Return the best available embedding model (prioritized by quality & speed).
+    """Return all-MiniLM-L6-v2 embeddings model (REQUIRED).
     
     CACHED in memory - loaded only ONCE, then reused.
     
-    1. Sentence-Transformers (best, free, local)
-    2. Google (needs GOOGLE_API_KEY)
-    3. Hash (poor, offline fallback)
+    This is the production choice: fast, free, local, good quality (384 dims).
+    
+    Raises:
+        ImportError: If sentence-transformers is not installed.
     """
     global _embeddings_cache
     
@@ -107,11 +101,9 @@ def _get_embeddings():
     if _embeddings_cache is not None:
         return _embeddings_cache
     
-    # Try sentence-transformers first (best quality, free, local)
+    # Load all-MiniLM-L6-v2 (REQUIRED in requirements.txt)
     try:
         from sentence_transformers import SentenceTransformer
-        # all-MiniLM-L6-v2: Fast, good quality (384 dims)
-        # Production choice: balances speed and accuracy
         print("[RAG] Loading embeddings model (all-MiniLM-L6-v2, CACHED in memory)")
         model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
         
@@ -127,48 +119,19 @@ def _get_embeddings():
                 return self.model.encode(text, convert_to_numpy=True).tolist()
         
         _embeddings_cache = SentenceTransformerEmbeddings(model)
-        print("[RAG] Embeddings model cached and ready")
+        print("[RAG] ✅ Embeddings ready (all-MiniLM-L6-v2, 384 dims, cached)")
         return _embeddings_cache
-    except ImportError:
-        print("[RAG] ERROR: sentence-transformers not installed. REQUIRED: pip install sentence-transformers")
-    
-    # Try Google second
-    if GOOGLE_EMBEDDINGS_AVAILABLE:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if api_key:
-            model = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/text-embedding-004")
-            print("[RAG] Using Google Generative AI embeddings (high quality, costs $)")
-            _embeddings_cache = GoogleGenerativeAIEmbeddings(model=model)
-            return _embeddings_cache
-    
-    # Fallback to hash (poor quality)
-    print("[RAG] WARNING: Using hash embeddings (poor quality, offline fallback)")
-    _embeddings_cache = _HashEmbeddings()
-    return _embeddings_cache
-
-class _HashEmbeddings(Embeddings):
-    """
-    A simple offline embedding model — no API key needed.
-    Inherits from LangChain's Embeddings base class so FAISS accepts it.
-    Converts text to a fixed-size vector using word hashes.
-    """
-    DIM = 384
-
-    def _embed(self, text: str) -> list[float]:
-        import hashlib
-        import numpy as np
-        vec = [0.0] * self.DIM
-        for word in text.lower().split():
-            idx = int(hashlib.sha256(word.encode()).hexdigest(), 16) % self.DIM
-            vec[idx] += 1.0
-        norm = sum(v * v for v in vec) ** 0.5
-        return [v / norm for v in vec] if norm > 0 else vec
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return [self._embed(t) for t in texts]
-
-    def embed_query(self, text: str) -> list[float]:
-        return self._embed(text)
+        
+    except ImportError as e:
+        raise ImportError(
+            "\n❌ sentence-transformers is REQUIRED but not installed.\n\n"
+            "Fix:\n"
+            "  pip install sentence-transformers\n"
+            "  OR:\n"
+            "  pip install -r requirements.txt\n\n"
+            "The RAG system uses all-MiniLM-L6-v2 for semantic search.\n"
+            "It must be installed for the chatbot to work."
+        ) from e
 
 # ══════════════════════════════════════════════════════════════════════════
 # DOCUMENT LOADING
