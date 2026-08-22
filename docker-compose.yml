@@ -19,3 +19,8 @@ volumes:
 # Docker run
 # cd Chatbot
 # docker compose up -d
+
+# Then open: http://localhost:5050
+
+# Email: admin@admin.com
+# Password: admin

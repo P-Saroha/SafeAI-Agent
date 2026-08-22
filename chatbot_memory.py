@@ -349,20 +349,26 @@ def remember_node(state: dict) -> dict:
     if not latest:
         return {"messages": []}
 
-    # OPTIMIZATION: Skip fact extraction for non-informative queries
-    # These don't contain personal info and waste 600-800ms on Groq calls
+    # OPTIMIZATION: Skip fact extraction only for very short greetings
+    # But allow extraction for messages with personal info
     query_lower = latest.lower()
-    non_informative_patterns = [
-        "what", "how", "when", "where", "why", "tell me", "explain",
-        "weather", "time", "date", "stock", "news", "search",
-        "hello", "hi", "hey", "thanks", "thank you", "ok", "okay",
-        "yes", "no", "sure", "design", "recommendation", "system"
-    ]
     
-    # If query STARTS with non-informative word, skip expensive LLM call
-    first_word = query_lower.split()[0] if query_lower.split() else ""
-    if first_word in non_informative_patterns or any(p in query_lower[:20] for p in non_informative_patterns):
-        return {"messages": []}  # SKIP fact extraction - saves 600-800ms
+    # Only skip if it's a PURE greeting (max 2-3 words, no personal info)
+    pure_greetings = ["hello", "hi", "hey", "thanks", "thank you", "ok", "okay", "yes", "no", "sure"]
+    words = query_lower.split()
+    
+    # If message is ONLY a greeting (max 3 words, all are greetings), skip extraction
+    is_pure_greeting = len(words) <= 3 and all(w.strip("!.?,") in pure_greetings for w in words)
+    
+    if is_pure_greeting:
+        return {"messages": []}  # SKIP fact extraction for pure greetings - saves 600-800ms
+    
+    # Also skip if message is asking a question (what, how, why, tell me, etc)
+    # These rarely contain personal facts
+    question_keywords = ["what", "how", "why", "when", "where", "can you", "could you", "tell me", "show me", "explain"]
+    is_question = any(q in query_lower for q in question_keywords)
+    if is_question:
+        return {"messages": []}  # SKIP fact extraction for questions - saves 600-800ms
 
     # Extract new facts from this message (only for potentially personal info)
     new_facts = _extract_facts(latest)
