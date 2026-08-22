@@ -319,12 +319,17 @@ def generate_recap_greeting(user_id: str) -> str:
 
 
 def is_self_query(query: str) -> bool:
-    """Return True if the user is asking about themselves or their stored info."""
+    """Return True if the user is ASKING about themselves or their stored info.
+    
+    NOTE: Statements like "my interests are..." are NOT self-queries.
+    Only questions like "what do you know about me?" are self-queries.
+    Statements are handled by remember_node (LTM extraction).
+    """
     q = query.lower().strip()
     markers = [
         "about me", "about myself", "who am i", "my details",
-        "my profile", "what do you know about me", "my interests",
-        "my favorite", "my goals", "my skills",
+        "my profile", "what do you know about me", "what have you learned",
+        "remember", "remind me", "tell me about me",
     ]
     return any(m in q for m in markers)
 

@@ -17,6 +17,7 @@ import sqlite3
 import warnings
 import logging
 import sys
+import time
 from typing import Annotated, TypedDict
 
 # Suppress transformers/torchvision warnings (harmless background module inspection)
@@ -99,6 +100,7 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     The function follows a simple top-to-bottom routing order.
     The first matching condition wins and returns immediately.
     """
+    start_time = time.time()
     query = get_latest_user_message(state["messages"])
 
     # Read thread_id and user_id from the LangGraph config (always reliable)
@@ -115,72 +117,100 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
         or thread_id
     )
 
+    print(f"[CHAT_NODE] START | query='{query[:50]}...'")
+    print(f"[CHAT_NODE] awaiting_hitl={state.get('awaiting_hitl')} | hitl_decision='{state.get('hitl_decision', '')}'")
     print(f"[RAG] thread_id={thread_id} | has_docs={has_documents(thread_id)}")
 
     # ── 1. Greeting ─────────────────────────────────────────────────────
     if is_greeting(query):
+        elapsed = time.time() - start_time
+        print(f"[CHAT_NODE] GREETING (took {elapsed:.2f}s)")
         return {"messages": [AIMessage(content="Hello! How can I help you today?")]}
 
-    # ── 2. RAG (PRIORITIZE DOCUMENTS) ────────────────────────────────────
-    if has_documents(thread_id):
-        rewritten, rag_context = get_rag_context_with_rewriting(query, thread_id)
-        
-        # No context found - ask for clarification if ambiguous
-        if not rag_context and len(query) < 10:
-            from chatbot_query_rewriter import is_ambiguous_query
-            if is_ambiguous_query(query):
-                return {"messages": [AIMessage(content="Your question is unclear. Could you provide more details?")]}
-        
-        # Low confidence context - trigger HITL
-        if rag_context and len(rag_context) < 200:
-            return {
-                "messages": [AIMessage(content="⚠️ Found limited context. Do you want me to answer with this, or rephrase?")],
-                "awaiting_hitl": True,
-                "hitl_question": rewritten or query,
-                "hitl_decision": "",
-            }
-        
-        # Good context - pass through LLM for better formatting
-        if rag_context:
-            # Add LLM formatting step here
-            prompt = (
-                "You are formatting retrieved document chunks into a structured response.\n\n"
-                "INSTRUCTIONS:\n"
-                "1. Organize information logically (intro → details → conclusion)\n"
-                "2. Use clear formatting: ### headers, **bold**, bullet points\n"
-                "3. Preserve citations [1], [2], [3]\n"
-                "4. Keep answer concise but complete\n"
-                "5. Don't add info beyond what's in chunks\n\n"
-                f"QUESTION: {query}\n\n"
-                f"CHUNKS:\n{rag_context}\n\n"
-                "FORMATTED RESPONSE:"
-            )
-            formatted = llm.invoke(prompt)
-            content = f"{formatted.content}\n\n{_cite('FAISS + BM25 + LLM Formatting')}"
-            return {"messages": [AIMessage(content=content)]}
+    # ── 2. TOOLS FIRST (before RAG) - Weather, Stock, Time, News ─────────
+    if is_weather_query(query):
+        location = extract_weather_location(query)
+        if not location:
+            return {"messages": [AIMessage(content="Which city would you like the weather for?")]}
+        raw = call_weather(location)
+        content = format_weather_response(raw, location)
+        content = f"{content}\n\n{_cite('OpenWeather API')}"
+        elapsed = time.time() - start_time
+        print(f"[TOOL] Weather query (took {elapsed:.2f}s)")
+        return {"messages": [AIMessage(content=content)]}
 
-    # ── 3. HITL resume: human has made a decision ────────────────────────
+    if is_time_query(query):
+        now = call_datetime()
+        content = (
+            f"### Current Date & Time\n\n"
+            f"**{now}**\n\n"
+            f"{_cite('System Clock')}"
+        )
+        elapsed = time.time() - start_time
+        print(f"[TOOL] Time query (took {elapsed:.2f}s)")
+        return {"messages": [AIMessage(content=content)]}
+
+    if is_stock_query(query):
+        print(f"[TOOL] Stock query detected: {query[:50]}...")
+        symbol = extract_stock_symbol(query)
+        if symbol:
+            print(f"[TOOL] Extracted symbol: {symbol}")
+            result = call_stock(symbol)
+            content = (
+                f"### Stock Price — {symbol}\n\n"
+                f"**{result}**\n\n"
+                f"**Data source:** https://finance.yahoo.com/quote/{symbol}\n\n"
+                f"{_cite('Yahoo Finance via yfinance')}"
+            )
+            elapsed = time.time() - start_time
+            print(f"[TOOL] Stock query complete (took {elapsed:.2f}s)")
+            return {"messages": [AIMessage(content=content)]}
+        print(f"[TOOL] No symbol extracted from query")
+        return {"messages": [AIMessage(
+            content="Please include a company name or ticker, e.g. *'stock price of NVDA'*"
+        )]}
+
+    if is_news_query(query):
+        results = call_search(query)
+        content = f"{format_search_response(results, query)}\n\n{_cite('DuckDuckGo Search + Groq')}"
+        elapsed = time.time() - start_time
+        print(f"[TOOL] News query (took {elapsed:.2f}s)")
+        return {"messages": [AIMessage(content=content)]}
+
+    # ── 3. HITL RESUME - human made a decision ─────────────────────────
+    # Check BEFORE processing the question again (avoids re-triggering HITL)
     if state.get("awaiting_hitl") and state.get("hitl_decision"):
+        print(f"[HITL_RESUME] User decision: '{state.get('hitl_decision')}'")
         decision = str(state["hitl_decision"]).lower().strip()
         original_question = str(state.get("hitl_question", query))
+        print(f"[HITL_RESUME] Processing decision='{decision}' for question='{original_question[:50]}...'")
 
         if decision == "approve":
+            print(f"[HITL_RESUME] APPROVE: Getting RAG context...")
+            rag_start = time.time()
             rag_context = get_rag_context(original_question, thread_id)
+            rag_elapsed = time.time() - rag_start
+            print(f"[HITL_RESUME] RAG retrieval took {rag_elapsed:.2f}s")
+            
+            print(f"[HITL_RESUME] Calling Groq LLM for formatting...")
+            llm_start = time.time()
             prompt = (
-                "You are answering a specific question based ONLY on the provided document context.\n\n"
+                "You are answering a question based ONLY on provided document chunks.\n\n"
                 "INSTRUCTIONS:\n"
-                "1. Structure your answer with clear sections (use ### for headers if needed)\n"
-                "2. Use bullet points for lists and multiple items\n"
-                "3. Keep paragraphs short (2-3 sentences max)\n"
-                "4. Cite your sources using [1], [2], [3] format\n"
-                "5. If context doesn't directly answer the question, say so explicitly\n"
-                "6. Do NOT add information beyond what's in the context\n\n"
+                "1. Use ONLY the chunk information provided\n"
+                "2. Structure clearly: ### headers, **bold**, bullet points\n"
+                "3. PRESERVE CITATIONS: Every fact must have [1] [2] or [3] with PDF name and page\n"
+                "4. If chunks don't fully answer, say 'Limited information available: [cite]\n\n"
                 f"QUESTION: {original_question}\n\n"
-                f"CONTEXT FROM DOCUMENTS:\n{rag_context}\n\n"
-                "ANSWER (structured, concise, with citations):"
+                f"DOCUMENT CHUNKS (with [1] [2] [3] citations):\n{rag_context}\n\n"
+                "ANSWER (with citations preserved):"
             )
             response = llm.invoke(prompt)
-            content = f"{response.content}\n\n{_cite('FAISS + BM25 Hybrid Retriever + Groq')}"
+            llm_elapsed = time.time() - llm_start
+            print(f"[HITL_RESUME] LLM call took {llm_elapsed:.2f}s")
+            
+            content = f"{response.content}\n\n{_cite('Document Retrieval with Citations')}"
+            print(f"[HITL_RESUME] APPROVE complete (total {time.time() - start_time:.2f}s), clearing awaiting_hitl")
             return {
                 "messages": [AIMessage(content=content)],
                 "awaiting_hitl": False,
@@ -188,6 +218,8 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 "hitl_decision": "",
             }
         else:
+            elapsed = time.time() - start_time
+            print(f"[HITL_RESUME] SKIP: (took {elapsed:.2f}s)")
             return {
                 "messages": [AIMessage(
                     content=(
@@ -201,11 +233,84 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 "hitl_decision": "",
             }
 
-    # ── 3. Self-query ────────────────────────────────────────────────────
+    # ── 3. RAG (PRIORITIZE DOCUMENTS) ────────────────────────────────────
+    if has_documents(thread_id):
+        rewritten, rag_context = get_rag_context_with_rewriting(query, thread_id)
+        
+        # No context found - ask for clarification if ambiguous
+        if not rag_context and len(query) < 10:
+            from chatbot_query_rewriter import is_ambiguous_query
+            if is_ambiguous_query(query):
+                return {"messages": [AIMessage(content="Your question is unclear. Could you provide more details?")]}
+        
+        # Low confidence context - trigger HITL ONLY ONCE
+        if rag_context and len(rag_context) < 200:
+            print(f"[HITL_TRIGGER] Low confidence! rag_context length={len(rag_context)} < 200")
+            print(f"[HITL_TRIGGER] Current awaiting_hitl={state.get('awaiting_hitl')}")
+            if not state.get("awaiting_hitl"):
+                print(f"[HITL_TRIGGER] Setting awaiting_hitl=True, storing hitl_question='{query[:50]}...'")
+                return {
+                    "messages": [AIMessage(content="Found limited context. Do you want me to answer with this, or rephrase?")],
+                    "awaiting_hitl": True,
+                    "hitl_question": rewritten or query,
+                    "hitl_decision": "",
+                }
+            else:
+                print(f"[HITL_TRIGGER] Already awaiting HITL, skipping (avoid loop)")
+
+        
+        # Good context - pass through LLM for better formatting
+        if rag_context:
+            print(f"[RAG] Good context found ({len(rag_context)} chars), calling LLM for formatting...")
+            llm_start = time.time()
+            prompt = (
+                "You are formatting retrieved document chunks into a well-structured response.\n\n"
+                "CRITICAL: Preserve ALL citations [1], [2], [3] with PDF filenames and page numbers.\n\n"
+                "INSTRUCTIONS:\n"
+                "1. Answer the question using ONLY the provided chunks\n"
+                "2. Use clear formatting: ### headers, **bold**, bullet points\n"
+                "3. PRESERVE citations exactly as shown: [1] filename.pdf (Page X)\n"
+                "4. Every fact must have a citation [1] or [2] or [3] inline\n"
+                "5. Keep answer concise but complete\n"
+                "6. Do NOT add information beyond what's in chunks\n"
+                "7. At the end, repeat the Sources list from chunks\n\n"
+                f"QUESTION: {query}\n\n"
+                f"DOCUMENT CHUNKS (already formatted with proper citations):\n{rag_context}\n\n"
+                "FORMATTED RESPONSE (preserve all citations [1] [2] [3] with filenames and pages!):"
+            )
+            formatted = llm.invoke(prompt)
+            llm_elapsed = time.time() - llm_start
+            print(f"[RAG] LLM formatting took {llm_elapsed:.2f}s")
+            
+            content = f"{formatted.content}\n\n{_cite('Document Chunks + LLM Formatting')}"
+            elapsed = time.time() - start_time
+            print(f"[RAG] RAG answer complete (total {elapsed:.2f}s)")
+            return {"messages": [AIMessage(content=content)]}
+
+    # ── 4. Self-query ────────────────────────────────────────────────────
     if is_self_query(query):
         facts = get_memory_as_text(user_id)
         if facts:
-            response = f"Here is what I remember about you:\n\n{facts}\n\n{_cite('PostgreSQL Long-Term Memory')}"
+            # Use Groq to format facts beautifully and structurally
+            format_prompt = f"""
+You are a personal profile formatter. Given user facts, create a clean, structured markdown profile.
+
+Format ONLY as:
+👤 **Profile Overview**
+- **Name:** [name]
+- **Education:** [education]
+- **University:** [university]
+- **Interests:** [interests in bullet list]
+
+That's it. No learning path. No resources. Just the profile.
+
+User Facts:
+{facts}
+
+Create the profile now:
+"""
+            formatted_profile = llm.invoke(format_prompt)
+            response = f"{formatted_profile.content}\n\n{_cite('PostgreSQL Long-Term Memory + Groq Formatting')}"
         else:
             response = (
                 "I don't have any saved details about you yet. "
@@ -213,56 +318,24 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             )
         return {"messages": [AIMessage(content=response)]}
 
-    # ── 4. Weather ───────────────────────────────────────────────────────
-    if is_weather_query(query):
-        location = extract_weather_location(query)
-        if not location:
-            return {"messages": [AIMessage(content="Which city would you like the weather for?")]}
-        raw = call_weather(location)
-        content = format_weather_response(raw, location)
-        # format_weather_response already adds a Sources line — append citation below it
-        content = f"{content}\n\n{_cite('OpenWeather API')}"
-        return {"messages": [AIMessage(content=content)]}
-
-    # ── 5. Date / Time ───────────────────────────────────────────────────
-    if is_time_query(query):
-        now = call_datetime()
-        content = (
-            f"### Current Date & Time\n\n"
-            f"**{now}**\n\n"
-            f"{_cite('System Clock')}"
-        )
-        return {"messages": [AIMessage(content=content)]}
-
-    # ── 6. News ──────────────────────────────────────────────────────────
-    if is_news_query(query):
-        results = call_search(query)
-        # format_search_response already appends source URLs — add powered-by below
-        content = f"{format_search_response(results, query)}\n\n{_cite('DuckDuckGo Search + Groq (gpt-oss-120b)')}"
-        return {"messages": [AIMessage(content=content)]}
-
-    # ── 7. Stock price ───────────────────────────────────────────────────
-    if is_stock_query(query):
-        symbol = extract_stock_symbol(query)
-        if symbol:
-            result = call_stock(symbol)
-            content = (
-                f"### Stock Price — {symbol}\n\n"
-                f"**{result}**\n\n"
-                f"**Data source:** https://finance.yahoo.com/quote/{symbol}\n\n"
-                f"{_cite('Yahoo Finance via yfinance')}"
-            )
-            return {"messages": [AIMessage(content=content)]}
+    # ── 5. Default LLM answer ────────────────────────────────────────────
+    # But check if this looks like a personal statement (not a question)
+    if not any(q in query.lower() for q in ["?", "what", "how", "why", "when", "where", "can you", "could you", "summary", "recap", "tell me", "explain"]):
+        # This is likely a personal statement ("my interests are...", "I love...", etc)
+        # Just acknowledge it briefly — LTM will extract the facts
         return {"messages": [AIMessage(
-            content="Please include a company name or ticker, e.g. *'stock price of ORCL'*"
+            content="Got it! I've noted that. 📝"
         )]}
-
-    # ── 9. Default LLM answer ────────────────────────────────────────────
+    
     memory_text = get_memory_as_text(user_id)
 
     system_parts = ["You are a helpful AI assistant. Answer clearly and concisely."]
     if memory_text:
-        system_parts.append(f"\nFacts about the user (use only if relevant):\n{memory_text}")
+        system_parts.append(
+            f"\n🎯 About the user (personalize your response using this context):\n{memory_text}\n\n"
+            f"💡 Tip: When answering, relate your response to their interests and experience level. "
+            f"For example, if they're interested in RAG/ML, mention relevant frameworks or techniques."
+        )
 
     system_prompt = "\n".join(system_parts)
     recent = get_recent_messages(state["messages"])

@@ -22,6 +22,7 @@ import os
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("streamlit").setLevel(logging.ERROR)
+
 import uuid
 from pathlib import Path
 
@@ -205,7 +206,7 @@ if _hitl["awaiting"] and not st.session_state["hitl_pending"]:
 st.sidebar.title("LangGraph AI Agent")
 
 # ── New Chat button ─────────────────────────────────────────────────────
-if st.sidebar.button("➕ New Chat"):
+if st.sidebar.button("New Chat"):
     # Clear message cache for the old thread
     load_thread_messages.clear()
     start_new_chat()
@@ -218,7 +219,7 @@ doc_files = list(current_docs_dir.rglob("*")) if current_docs_dir.exists() else 
 doc_count = sum(1 for p in doc_files if p.is_file() and p.suffix.lower() in {".pdf", ".txt", ".md"})
 st.sidebar.caption(f"Uploaded documents in this chat: {doc_count}")
 
-if st.sidebar.button("🔄 Rebuild RAG Index"):
+if st.sidebar.button("Rebuild RAG Index"):
     with st.spinner("Rebuilding..."):
         msg = rebuild_rag_index(st.session_state["thread_id"])
     st.sidebar.success(msg)
@@ -239,7 +240,7 @@ if st.session_state.get("messages"):
     export_text = "\n---\n".join(lines)
 
     st.sidebar.download_button(
-        label="⬇️ Download chat as .md",
+        label="Download chat as .md",
         data=export_text,
         file_name=f"{title.replace(' ', '_')}.md",
         mime="text/markdown",
@@ -251,10 +252,10 @@ else:
 st.sidebar.header("Long-Term Memory")
 mem_status = get_memory_status()
 if mem_status["available"]:
-    st.sidebar.success("✅ Connected to Postgres")
+    st.sidebar.success("Connected to Postgres")
     st.sidebar.caption(f"Stored facts: {get_memory_count(user_id)}")
 else:
-    st.sidebar.warning("⚠️ Postgres not connected (LTM disabled)")
+    st.sidebar.warning("Postgres not connected (LTM disabled)")
     if mem_status.get("last_error"):
         st.sidebar.caption(f"Error: {mem_status['last_error']}")
 
@@ -263,7 +264,7 @@ def get_cached_memory(user_id: str):
     """Get memory list cached for 5 minutes."""
     return get_memory_list(user_id)
 
-if st.sidebar.button("🧠 Show Memory"):
+if st.sidebar.button("Show Memory"):
     facts = get_cached_memory(user_id)
     if facts:
         for fact in facts:
@@ -271,7 +272,7 @@ if st.sidebar.button("🧠 Show Memory"):
     else:
         st.sidebar.info("No memory stored yet.")
 
-if st.sidebar.button("🗑️ Clear All Memory"):
+if st.sidebar.button("Clear All Memory"):
     removed = clear_memory(user_id)
     st.sidebar.success(f"Cleared {removed} memory entries.")
 
@@ -288,12 +289,12 @@ for tid in reversed(st.session_state["thread_ids"]):
         st.session_state["thread_titles"][tid] = title
 
     title = st.session_state["thread_titles"][tid]
-    col1, col2 = st.sidebar.columns([4, 1])
+    col1, col2 = st.sidebar.columns([5, 1], gap="small")
 
     with col1:
         # Highlight the active thread
         label = f"**{title}**" if tid == st.session_state["thread_id"] else title
-        if st.button(label, key=f"load_{tid}"):
+        if st.button(label, key=f"load_{tid}", use_container_width=True):
             st.session_state["thread_id"] = tid
             # Don't use cached messages when switching threads - bypass cache
             load_thread_messages.clear()
@@ -301,7 +302,7 @@ for tid in reversed(st.session_state["thread_ids"]):
             st.rerun()
 
     with col2:
-        if st.button("🗑", key=f"del_{tid}"):
+        if st.button("X", key=f"del_{tid}", use_container_width=True):
             result = delete_thread(tid)
             st.session_state["thread_ids"].remove(tid)
             st.session_state["thread_titles"].pop(tid, None)
@@ -318,7 +319,7 @@ for tid in reversed(st.session_state["thread_ids"]):
 # MAIN CHAT UI
 # ══════════════════════════════════════════════════════════════════════════
 
-st.title("🤖 AI Agent Chatbot")
+st.title("AI Agent Chatbot")
 st.caption("Upload PDF, TXT, or MD files using the paperclip icon in the chat input.")
 
 # Display all messages in the current thread
@@ -355,12 +356,12 @@ if not st.session_state["messages"]:
 # show Approve / Skip buttons instead of the normal chat input.
 if st.session_state.get("hitl_pending"):
     st.warning(
-        "⚠️ **Approval needed:** The bot found limited context in your document. "
+        "Approval needed: The bot found limited context in your document. "
         "Choose what to do:"
     )
     col_approve, col_skip = st.columns(2)
 
-    if col_approve.button("✅ Yes, try to answer", key="hitl_approve"):
+    if col_approve.button("Yes, try to answer", key="hitl_approve"):
         config = {
             "configurable": {
                 "thread_id": st.session_state["thread_id"],
@@ -401,7 +402,7 @@ if st.session_state.get("hitl_pending"):
         st.session_state["hitl_pending"] = False
         st.rerun()
 
-    if col_skip.button("❌ No, skip", key="hitl_skip"):
+    if col_skip.button("No, skip", key="hitl_skip"):
         config = {
             "configurable": {
                 "thread_id": st.session_state["thread_id"],
@@ -443,7 +444,6 @@ if st.session_state.get("hitl_pending"):
         st.rerun()
 
     st.stop()  # Don't show the chat input while HITL is pending
-
 
 # ── Chat input (supports file attachments) ───────────────────────────────
 chat_input = st.chat_input(
