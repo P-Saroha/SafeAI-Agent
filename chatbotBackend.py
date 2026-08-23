@@ -6,7 +6,6 @@ Main agent orchestrator. Chains together:
 2. chat_node: Route intent and generate response
 3. Graph checkpoint: Save state to SQLite
 
-See prep/HITL_EXPLANATION.md for details on Human-In-The-Loop pausing.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import sqlite3
 import warnings
 import logging
 import sys
-import time
 from typing import Annotated, TypedDict
 
 # Suppress transformers/torchvision warnings (harmless background module inspection)
@@ -100,7 +98,6 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     The function follows a simple top-to-bottom routing order.
     The first matching condition wins and returns immediately.
     """
-    start_time = time.time()
     query = get_latest_user_message(state["messages"])
 
     # Read thread_id and user_id from the LangGraph config (always reliable)
@@ -123,8 +120,6 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
 
     # ── 1. Greeting ─────────────────────────────────────────────────────
     if is_greeting(query):
-        elapsed = time.time() - start_time
-        print(f"[CHAT_NODE] GREETING (took {elapsed:.2f}s)")
         return {"messages": [AIMessage(content="Hello! How can I help you today?")]}
 
     # ── 2. TOOLS FIRST (before RAG) - Weather, Stock, Time, News ─────────
@@ -135,8 +130,6 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
         raw = call_weather(location)
         content = format_weather_response(raw, location)
         content = f"{content}\n\n{_cite('OpenWeather API')}"
-        elapsed = time.time() - start_time
-        print(f"[TOOL] Weather query (took {elapsed:.2f}s)")
         return {"messages": [AIMessage(content=content)]}
 
     if is_time_query(query):
@@ -146,8 +139,6 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             f"**{now}**\n\n"
             f"{_cite('System Clock')}"
         )
-        elapsed = time.time() - start_time
-        print(f"[TOOL] Time query (took {elapsed:.2f}s)")
         return {"messages": [AIMessage(content=content)]}
 
     if is_stock_query(query):
@@ -162,8 +153,6 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 f"**Data source:** https://finance.yahoo.com/quote/{symbol}\n\n"
                 f"{_cite('Yahoo Finance via yfinance')}"
             )
-            elapsed = time.time() - start_time
-            print(f"[TOOL] Stock query complete (took {elapsed:.2f}s)")
             return {"messages": [AIMessage(content=content)]}
         print(f"[TOOL] No symbol extracted from query")
         return {"messages": [AIMessage(
@@ -173,8 +162,6 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     if is_news_query(query):
         results = call_search(query)
         content = f"{format_search_response(results, query)}\n\n{_cite('DuckDuckGo Search + Groq')}"
-        elapsed = time.time() - start_time
-        print(f"[TOOL] News query (took {elapsed:.2f}s)")
         return {"messages": [AIMessage(content=content)]}
 
     # ── 3. HITL RESUME - human made a decision ─────────────────────────
@@ -187,13 +174,9 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
 
         if decision == "approve":
             print(f"[HITL_RESUME] APPROVE: Getting RAG context...")
-            rag_start = time.time()
             rag_context = get_rag_context(original_question, thread_id)
-            rag_elapsed = time.time() - rag_start
-            print(f"[HITL_RESUME] RAG retrieval took {rag_elapsed:.2f}s")
             
             print(f"[HITL_RESUME] Calling Groq LLM for formatting...")
-            llm_start = time.time()
             prompt = (
                 "You are answering a question based ONLY on provided document chunks.\n\n"
                 "INSTRUCTIONS:\n"
@@ -206,11 +189,9 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 "ANSWER (with citations preserved):"
             )
             response = llm.invoke(prompt)
-            llm_elapsed = time.time() - llm_start
-            print(f"[HITL_RESUME] LLM call took {llm_elapsed:.2f}s")
             
             content = f"{response.content}\n\n{_cite('Document Retrieval with Citations')}"
-            print(f"[HITL_RESUME] APPROVE complete (total {time.time() - start_time:.2f}s), clearing awaiting_hitl")
+            print(f"[HITL_RESUME] APPROVE complete, clearing awaiting_hitl")
             return {
                 "messages": [AIMessage(content=content)],
                 "awaiting_hitl": False,
@@ -218,8 +199,7 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 "hitl_decision": "",
             }
         else:
-            elapsed = time.time() - start_time
-            print(f"[HITL_RESUME] SKIP: (took {elapsed:.2f}s)")
+            print(f"[HITL_RESUME] SKIP")
             return {
                 "messages": [AIMessage(
                     content=(
@@ -262,7 +242,6 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
         # Good context - pass through LLM for better formatting
         if rag_context:
             print(f"[RAG] Good context found ({len(rag_context)} chars), calling LLM for formatting...")
-            llm_start = time.time()
             prompt = (
                 "You are formatting retrieved document chunks into a well-structured response.\n\n"
                 "CRITICAL: Preserve ALL citations [1], [2], [3] with PDF filenames and page numbers.\n\n"
@@ -279,12 +258,9 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 "FORMATTED RESPONSE (preserve all citations [1] [2] [3] with filenames and pages!):"
             )
             formatted = llm.invoke(prompt)
-            llm_elapsed = time.time() - llm_start
-            print(f"[RAG] LLM formatting took {llm_elapsed:.2f}s")
             
             content = f"{formatted.content}\n\n{_cite('Document Chunks + LLM Formatting')}"
-            elapsed = time.time() - start_time
-            print(f"[RAG] RAG answer complete (total {elapsed:.2f}s)")
+            print(f"[RAG] RAG answer complete")
             return {"messages": [AIMessage(content=content)]}
 
     # ── 4. Self-query ────────────────────────────────────────────────────
