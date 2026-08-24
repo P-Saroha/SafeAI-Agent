@@ -162,6 +162,32 @@ def save_uploaded_files(files, thread_id: str) -> tuple[int, str]:
     return len(files), status
 
 
+def render_response_with_latex(text: str):
+    """Render text with LaTeX math support using st.markdown() for LaTeX blocks."""
+    import re
+    
+    # Split by LaTeX block delimiters: [...] for inline, [...] for display
+    # Handle both [ ] and $$ $$ formats
+    parts = re.split(r'(\[.*?\]|\$\$.*?\$\$)', text, flags=re.DOTALL)
+    
+    for part in parts:
+        if not part:
+            continue
+        
+        # Check if this is a LaTeX block
+        if part.startswith('[') and part.endswith(']'):
+            # Display equation - render as LaTeX
+            latex_code = part[1:-1].strip()
+            st.latex(latex_code)
+        elif part.startswith('$$') and part.endswith('$$'):
+            # Dollar sign display equation
+            latex_code = part[2:-2].strip()
+            st.latex(latex_code)
+        else:
+            # Regular markdown text
+            st.markdown(part)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # SESSION STATE INIT
 # Runs once when the app first loads.
@@ -574,7 +600,8 @@ if user_text:
                 if not ai_response:
                     ai_response = "I couldn't generate a response. Please try again."
                 
-                st.markdown(ai_response)
+                # Render response with LaTeX support
+                render_response_with_latex(ai_response)
             except Exception as e:
                 ai_response = f"Sorry, something went wrong: {e}"
                 st.markdown(ai_response)
