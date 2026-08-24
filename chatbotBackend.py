@@ -188,9 +188,14 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 f"DOCUMENT CHUNKS (with [1] [2] [3] citations):\n{rag_context}\n\n"
                 "ANSWER (with citations preserved):"
             )
-            response = llm.invoke(prompt)
             
-            content = f"{response.content}\n\n{_cite('Document Retrieval with Citations')}"
+            # Stream response token-by-token
+            content = ""
+            for chunk in llm.stream(prompt):
+                if hasattr(chunk, 'content') and chunk.content:
+                    content += chunk.content
+            
+            content = f"{content}\n\n{_cite('Document Retrieval with Citations')}"
             print(f"[HITL_RESUME] APPROVE complete, clearing awaiting_hitl")
             return {
                 "messages": [AIMessage(content=content)],
@@ -242,24 +247,33 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
         # Good context - pass through LLM for better formatting
         if rag_context:
             print(f"[RAG] Good context found ({len(rag_context)} chars), calling LLM for formatting...")
+            print(f"[RAG_DEBUG] RAG context sample:\n{rag_context[:500]}...\n")  # Debug: show what we're passing
+            
             prompt = (
                 "You are formatting retrieved document chunks into a well-structured response.\n\n"
-                "CRITICAL: Preserve ALL citations [1], [2], [3] with PDF filenames and page numbers.\n\n"
+                "🔴 CRITICAL RULE: Copy the EXACT citations from the chunks provided.\n"
+                "Do NOT change citation format. Do NOT use Chinese brackets 【 】.\n"
+                "Copy EXACTLY as shown: [1] FineTuningLLM.pdf (Page X)\n\n"
                 "INSTRUCTIONS:\n"
                 "1. Answer the question using ONLY the provided chunks\n"
                 "2. Use clear formatting: ### headers, **bold**, bullet points\n"
-                "3. PRESERVE citations exactly as shown: [1] filename.pdf (Page X)\n"
-                "4. Every fact must have a citation [1] or [2] or [3] inline\n"
+                "3. COPY citations EXACTLY from the chunks - DO NOT modify them\n"
+                "4. Example: 'LoRA is a technique【1】' should be 'LoRA is a technique [1]'\n"
                 "5. Keep answer concise but complete\n"
                 "6. Do NOT add information beyond what's in chunks\n"
-                "7. At the end, repeat the Sources list from chunks\n\n"
+                "7. Do NOT add a separate 'Sources' section\n\n"
                 f"QUESTION: {query}\n\n"
-                f"DOCUMENT CHUNKS (already formatted with proper citations):\n{rag_context}\n\n"
-                "FORMATTED RESPONSE (preserve all citations [1] [2] [3] with filenames and pages!):"
+                f"DOCUMENT CHUNKS (copy the [1] [2] [3] citations exactly as shown):\n{rag_context}\n\n"
+                "FORMATTED RESPONSE (use exact [1] [2] [3] citations, NOT Chinese 【】 brackets):"
             )
-            formatted = llm.invoke(prompt)
             
-            content = f"{formatted.content}\n\n{_cite('Document Chunks + LLM Formatting')}"
+            # Blocking response (removed streaming)
+            response = llm.invoke(prompt)
+            content = response.content if hasattr(response, 'content') else str(response)
+            
+            print(f"[RAG_DEBUG] LLM response sample:\n{content[:500]}...\n")  # Debug: show what LLM returned
+            
+            content = f"{content}\n\n{_cite('Document Chunks + LLM Formatting')}"
             print(f"[RAG] RAG answer complete")
             return {"messages": [AIMessage(content=content)]}
 
@@ -285,8 +299,14 @@ User Facts:
 
 Create the profile now:
 """
-            formatted_profile = llm.invoke(format_prompt)
-            response = f"{formatted_profile.content}\n\n{_cite('PostgreSQL Long-Term Memory + Groq Formatting')}"
+            
+            # Stream response token-by-token
+            content = ""
+            for chunk in llm.stream(format_prompt):
+                if hasattr(chunk, 'content') and chunk.content:
+                    content += chunk.content
+            
+            response = f"{content}\n\n{_cite('PostgreSQL Long-Term Memory + Groq Formatting')}"
         else:
             response = (
                 "I don't have any saved details about you yet. "
@@ -315,8 +335,14 @@ Create the profile now:
 
     system_prompt = "\n".join(system_parts)
     recent = get_recent_messages(state["messages"])
-    response = llm.invoke([SystemMessage(content=system_prompt)] + recent)
-    content = f"{response.content}\n\n{_cite('Groq (gpt-oss-120b)')}"
+    
+    # Stream response token-by-token
+    content = ""
+    for chunk in llm.stream([SystemMessage(content=system_prompt)] + recent):
+        if hasattr(chunk, 'content') and chunk.content:
+            content += chunk.content
+    
+    content = f"{content}\n\n{_cite('Groq (gpt-oss-120b)')}"
     return {"messages": [AIMessage(content=content)]}
 
 

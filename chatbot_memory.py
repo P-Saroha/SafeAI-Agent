@@ -23,6 +23,13 @@ How it works:
 import json
 import os
 import re
+import warnings
+import logging
+
+# Suppress ZoeDepth and torchvision warnings BEFORE any imports
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+warnings.filterwarnings("ignore")
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage

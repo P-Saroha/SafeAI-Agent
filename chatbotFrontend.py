@@ -19,6 +19,9 @@ import warnings
 import logging
 import os
 
+# Suppress ZoeDepth and torchvision warnings BEFORE any imports
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("streamlit").setLevel(logging.ERROR)
@@ -249,13 +252,14 @@ else:
     st.sidebar.caption("No messages to export yet.")
 
 # ── Memory section ──────────────────────────────────────────────────────
-st.sidebar.header("Long-Term Memory")
+st.sidebar.header("👤 Long-Term Memory")
 mem_status = get_memory_status()
 if mem_status["available"]:
-    st.sidebar.success("Connected to Postgres")
-    st.sidebar.caption(f"Stored facts: {get_memory_count(user_id)}")
+    st.sidebar.success("✓ Connected to Postgres")
+    mem_count = get_memory_count(user_id)
+    st.sidebar.caption(f"📊 Stored facts: {mem_count}")
 else:
-    st.sidebar.warning("Postgres not connected (LTM disabled)")
+    st.sidebar.warning("⚠️ Postgres not connected (LTM disabled)")
     if mem_status.get("last_error"):
         st.sidebar.caption(f"Error: {mem_status['last_error']}")
 
@@ -264,21 +268,61 @@ def get_cached_memory(user_id: str):
     """Get memory list cached for 5 minutes."""
     return get_memory_list(user_id)
 
-if st.sidebar.button("Show Memory"):
+if st.sidebar.button("📖 Show Memory", use_container_width=True):
     facts = get_cached_memory(user_id)
     if facts:
+        # Better structured display
+        st.sidebar.markdown("### Your Profile")
+        
+        # Organize facts by category for better readability
+        profile_facts = {}
         for fact in facts:
-            st.sidebar.write(f"- {fact}")
+            if ": " in fact:
+                key, value = fact.split(": ", 1)
+                profile_facts[key.strip()] = value.strip()
+            else:
+                profile_facts[fact] = ""
+        
+        # Display in organized sections
+        display_order = ["name", "role", "location", "education", "university", "interests", "skills", "current_project", "goals"]
+        
+        for key in display_order:
+            if key in profile_facts:
+                value = profile_facts.pop(key)
+                if value:
+                    # Format key nicely (capitalize and add emoji)
+                    emoji_map = {
+                        "name": "",
+                        "role": "",
+                        "location": "",
+                        "education": "",
+                        "university": "",
+                        "interests": "",
+                        "skills": "",
+                        "current_project": "",
+                        "goals": "",
+                    }
+                    emoji = emoji_map.get(key, "•")
+                    formatted_key = key.replace("_", " ").title()
+                    st.sidebar.markdown(f"**{emoji} {formatted_key}:** {value}")
+        
+        # Display any remaining facts not in the standard order
+        if profile_facts:
+            for key, value in profile_facts.items():
+                if value:
+                    formatted_key = key.replace("_", " ").title()
+                    st.sidebar.markdown(f"**• {formatted_key}:** {value}")
     else:
-        st.sidebar.info("No memory stored yet.")
+        st.sidebar.info(" No memory stored yet. Tell me about yourself!")
 
-if st.sidebar.button("Clear All Memory"):
+if st.sidebar.button("🗑️ Clear All Memory", use_container_width=True):
     removed = clear_memory(user_id)
-    st.sidebar.success(f"Cleared {removed} memory entries.")
+    st.sidebar.success(f"✓ Cleared {removed} memory entries.")
 
 # ── Conversation list ────────────────────────────────────────────────────
 st.sidebar.header("My Conversations")
 
+# Show newest conversations first (reverse the list)
 for tid in reversed(st.session_state["thread_ids"]):
     # Use cached title or extract first message as preview (NO LLM CALL!)
     if tid not in st.session_state["thread_titles"]:
@@ -322,23 +366,14 @@ for tid in reversed(st.session_state["thread_ids"]):
 st.title("AI Agent Chatbot")
 st.caption("Upload PDF, TXT, or MD files using the paperclip icon in the chat input.")
 
-# Display all messages in the current thread
-for msg in st.session_state["messages"]:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# ── Memory recap greeting ────────────────────────────────────────────────
-# When a chat is empty (new chat) and the user has stored LTM facts,
-# show a personalized welcome-back message so they know the bot remembers them.
-# We store it in session_state so it only generates once per new chat,
-# not on every page re-render.
+# Display messages BEFORE processing new input
+# Show greeting only when thread is empty
 if not st.session_state["messages"]:
     if "recap_shown_for" not in st.session_state:
         st.session_state["recap_shown_for"] = None
 
     current_tid = st.session_state["thread_id"]
 
-    # Only generate once per thread (avoid re-running on every Streamlit rerun)
     if st.session_state["recap_shown_for"] != current_tid:
         recap = generate_recap_greeting(user_id)
         st.session_state["recap_shown_for"] = current_tid
@@ -349,6 +384,11 @@ if not st.session_state["messages"]:
     if recap:
         with st.chat_message("assistant"):
             st.markdown(recap)
+else:
+    # Display all messages in conversation
+    for msg in st.session_state["messages"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
 # ── HITL Approval UI ────────────────────────────────────────────────────
 # When the bot is not confident about a document answer, it pauses and
@@ -372,6 +412,7 @@ if st.session_state.get("hitl_pending"):
         with st.chat_message("assistant"):
             with st.spinner("Answering with available context..."):
                 ai_response = ""
+                placeholder = st.empty()
                 try:
                     for state_snapshot in chatbot.stream(
                         {
@@ -391,12 +432,17 @@ if st.session_state.get("hitl_pending"):
                                 and isinstance(msg.content, str)
                                 and msg.content.strip()
                             ):
-                                ai_response = msg.content.strip()
+                                new_response = msg.content.strip()
+                                if new_response != ai_response:
+                                    ai_response = new_response
+                                    placeholder.markdown(ai_response)
                                 break
                 except Exception as e:
                     ai_response = f"Error: {e}"
-                ai_response = ai_response or "No response generated."
-                st.markdown(ai_response)
+                    placeholder.markdown(ai_response)
+                if not ai_response:
+                    ai_response = "No response generated."
+                    placeholder.markdown(ai_response)
 
         st.session_state["messages"].append({"role": "assistant", "content": ai_response})
         st.session_state["hitl_pending"] = False
@@ -413,6 +459,7 @@ if st.session_state.get("hitl_pending"):
         with st.chat_message("assistant"):
             with st.spinner("Skipping..."):
                 ai_response = ""
+                placeholder = st.empty()
                 try:
                     for state_snapshot in chatbot.stream(
                         {
@@ -432,12 +479,17 @@ if st.session_state.get("hitl_pending"):
                                 and isinstance(msg.content, str)
                                 and msg.content.strip()
                             ):
-                                ai_response = msg.content.strip()
+                                new_response = msg.content.strip()
+                                if new_response != ai_response:
+                                    ai_response = new_response
+                                    placeholder.markdown(ai_response)
                                 break
                 except Exception as e:
                     ai_response = f"Error: {e}"
-                ai_response = ai_response or "No response generated."
-                st.markdown(ai_response)
+                    placeholder.markdown(ai_response)
+                if not ai_response:
+                    ai_response = "No response generated."
+                    placeholder.markdown(ai_response)
 
         st.session_state["messages"].append({"role": "assistant", "content": ai_response})
         st.session_state["hitl_pending"] = False
@@ -484,8 +536,10 @@ if uploaded_files:
 
 # ── Handle user message ──────────────────────────────────────────────────
 if user_text:
-    # Show the user message immediately
+    # Add user message to history
     st.session_state["messages"].append({"role": "user", "content": user_text})
+    
+    # Show ONLY the new user message, skip old messages
     with st.chat_message("user"):
         st.markdown(user_text)
 
@@ -500,36 +554,30 @@ if user_text:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            # Use stream_mode="values" to get the final state after all nodes run.
-            # This avoids the {} from remember_node and double-response issues.
-            ai_response = ""
+            # Use simple blocking call instead of streaming
             try:
-                for state_snapshot in chatbot.stream(
+                response = chatbot.invoke(
                     {
                         "messages": [HumanMessage(content=user_text)],
                         "thread_id": st.session_state["thread_id"],
                         "user_id": user_id,
                     },
                     config=config,
-                    stream_mode="values",
-                ):
-                    # "values" mode gives us the full state after each node.
-                    # We want the last AIMessage from the final state.
-                    messages = state_snapshot.get("messages", [])
-                    for msg in reversed(messages):
-                        if (
-                            isinstance(msg, AIMessage)
-                            and isinstance(msg.content, str)
-                            and msg.content.strip()
-                        ):
-                            ai_response = msg.content.strip()
-                            break
+                )
+                messages = response.get("messages", [])
+                ai_response = ""
+                for msg in reversed(messages):
+                    if isinstance(msg, AIMessage) and isinstance(msg.content, str) and msg.content.strip():
+                        ai_response = msg.content.strip()
+                        break
+                
+                if not ai_response:
+                    ai_response = "I couldn't generate a response. Please try again."
+                
+                st.markdown(ai_response)
             except Exception as e:
                 ai_response = f"Sorry, something went wrong: {e}"
-
-            if not ai_response:
-                ai_response = "I couldn't generate a response. Please try again."
-            st.markdown(ai_response)
+                st.markdown(ai_response)
 
     # Save the assistant response to history
     st.session_state["messages"].append({"role": "assistant", "content": ai_response})

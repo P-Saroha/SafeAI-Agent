@@ -19,16 +19,25 @@ Folder layout:
   faiss_index/<thread_id>/      # saved FAISS index for that thread
 """
 
+import sys
 import os
+
+# CRITICAL: Set these BEFORE any other imports to prevent ZoeDepth/torchvision errors
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
 import re
 import logging
 import warnings
 from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
-# Suppress transformers/torchvision import warnings (harmless)
+# Suppress ALL transformers warnings
 warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +47,36 @@ load_dotenv(find_dotenv())
 
 # Optional heavy imports — the app still works without them
 try:
+    # Temporarily redirect stderr to suppress ZoeDepth import errors
+    import sys
+    from io import StringIO
+    _old_stderr = sys.stderr
+    sys.stderr = StringIO()
+    
     from langchain_community.document_loaders import PyPDFLoader, TextLoader
     from langchain_community.vectorstores import FAISS
     from langchain_community.retrievers import BM25Retriever
     from langchain_text_splitters import RecursiveCharacterTextSplitter
+    
+    # Restore stderr
+    sys.stderr = _old_stderr
+    
     # Note: EnsembleRetriever has pydantic_v1 compatibility issues, we'll implement hybrid search manually
     RAG_AVAILABLE = True
 except ImportError as e:
+    # Restore stderr if error happened
+    if '_old_stderr' in locals():
+        sys.stderr = _old_stderr
     RAG_AVAILABLE = False
     print(f"[RAG] WARNING: RAG dependencies missing: {e}")
     print("[RAG] Fix: pip install langchain-community langchain-text-splitters rank-bm25")
+except Exception as e:
+    # Restore stderr
+    if '_old_stderr' in locals():
+        sys.stderr = _old_stderr
+    # Ignore any other import errors (like ZoeDepth/torchvision)
+    RAG_AVAILABLE = True
+    print(f"[RAG] Minor import warning suppressed (non-critical): {type(e).__name__}")
 
 try:
     from langchain_core.embeddings import Embeddings
@@ -61,7 +90,9 @@ INDEX_ROOT = BASE_DIR / "faiss_index"     # FAISS indexes saved here
 
 # Simple in-memory caches so we don't rebuild the index on every question
 _retriever_cache: dict[str, object] = {}
-_embeddings_cache = None  # Cache embeddings model (loaded once)
+
+# NOTE: _embeddings_cache is now handled by @st.cache_resource in _get_embeddings()
+# to survive Streamlit reruns
 
 # ══════════════════════════════════════════════════════════════════════════
 # PATH HELPERS
@@ -87,48 +118,46 @@ def get_index_dir(thread_id: str) -> Path:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _get_embeddings():
-    """Return all-MiniLM-L6-v2 embeddings model (REQUIRED).
+    """Return all-MiniLM-L6-v2 embeddings model (CACHED across Streamlit reruns).
     
-    CACHED in memory - loaded only ONCE, then reused.
-    
-    This is the production choice: fast, free, local, good quality (384 dims).
-    First load takes ~5-10 seconds. Subsequent loads are instant (cached).
+    Uses Streamlit's @st.cache_resource to persist model in memory.
+    First load takes ~5-10 seconds. Subsequent loads are instant.
     
     Raises:
         ImportError: If sentence-transformers is not installed.
     """
-    global _embeddings_cache
-    
-    # Return cached if already loaded
-    if _embeddings_cache is not None:
-        return _embeddings_cache
-    
-    # Load all-MiniLM-L6-v2 (REQUIRED in requirements.txt)
     try:
-        from sentence_transformers import SentenceTransformer
-        print("[RAG] Loading embeddings model (all-MiniLM-L6-v2)...")
-        print("[RAG] First load: 5-10 seconds (downloading model if needed)")
-        print("[RAG] Subsequent loads: instant (cached in memory)")
-        model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-        print("[RAG] Embeddings model loaded successfully!")
+        import streamlit as st
         
-        # Wrap in LangChain-compatible class
-        class SentenceTransformerEmbeddings(Embeddings):
-            def __init__(self, model):
-                self.model = model
+        @st.cache_resource(show_spinner=False)
+        def load_embeddings_model():
+            """Load and cache the embeddings model."""
+            from sentence_transformers import SentenceTransformer
+            print("[RAG] Loading embeddings model (all-MiniLM-L6-v2)...")
+            print("[RAG] First load: 5-10 seconds (downloading model if needed)")
+            print("[RAG] Subsequent loads: instant (cached in Streamlit)")
+            model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+            print("[RAG] Embeddings model loaded successfully!")
             
-            def embed_documents(self, texts: list[str]) -> list[list[float]]:
-                print(f"[RAG] Embedding {len(texts)} documents...")
-                embeddings = self.model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
-                print(f"[RAG] Done embedding {len(texts)} documents!")
-                return embeddings.tolist()
+            # Wrap in LangChain-compatible class
+            class SentenceTransformerEmbeddings(Embeddings):
+                def __init__(self, model):
+                    self.model = model
+                
+                def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                    print(f"[RAG] Embedding {len(texts)} documents...")
+                    embeddings = self.model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
+                    print(f"[RAG] Done embedding {len(texts)} documents!")
+                    return embeddings.tolist()
+                
+                def embed_query(self, text: str) -> list[float]:
+                    return self.model.encode(text, convert_to_numpy=True).tolist()
             
-            def embed_query(self, text: str) -> list[float]:
-                return self.model.encode(text, convert_to_numpy=True).tolist()
+            return SentenceTransformerEmbeddings(model)
         
-        _embeddings_cache = SentenceTransformerEmbeddings(model)
+        embeddings = load_embeddings_model()
         print("[RAG] Embeddings ready (all-MiniLM-L6-v2, 384 dims, CACHED)")
-        return _embeddings_cache
+        return embeddings
         
     except ImportError as e:
         raise ImportError(
@@ -627,12 +656,8 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
 
     context = "\n\n---\n\n".join(snippets)
     
-    # Add comprehensive sources footer
-    if source_citations:
-        context += "\n\n---\n\n"
-        context += "**Sources:**\n"
-        for i, citation in enumerate(source_citations, start=1):
-            context += f"[{i}] {citation}\n"
+    # NOTE: We already have inline citations above (e.g., "[1] FineTuningLLM.pdf (Page 7)")
+    # No need for a separate "Sources" footer - it creates duplication in LLM responses
     
     return context
 

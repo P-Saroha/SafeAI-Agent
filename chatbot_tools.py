@@ -83,30 +83,35 @@ def is_stock_query(query: str) -> bool:
 
 def extract_weather_location(query: str) -> str:
     """Pull the city/location name out of a weather question."""
-    q = query.lower()
+    q = query.lower().strip()
     
-    # Remove common filler words to simplify extraction
-    q_clean = re.sub(r'\b(?:today|today\'s|today is|what\'s|what is|tell|me|the|show|give)\b\s*', '', q)
+    # Remove common question prefixes
+    q = re.sub(r"^(?:what|what's|whats|tell|show|give)\s+(?:is|are|me)?\s*", "", q)
+    q = re.sub(r"^(?:today|today's|todays)\s+", "", q)
+    q = re.sub(r"(?:weather|temperature|temp|forecast)\s+", "", q)
     
-    # Match patterns like "weather in Delhi" or "weather of Mumbai"
-    match = re.search(r"weather\s+(?:in|of|for)\s+([a-z\s]+?)(?:\s+(?:today|now|forecast))?[\?.,]?$", q_clean)
+    # Pattern 1: "weather in/of/for CITY"
+    match = re.search(r"(?:in|of|for)\s+([a-z\s]+?)(?:\s+(?:today|now|forecast|weather))?[\?.,]?$", q)
     if match:
-        return match.group(1).strip()
+        location = match.group(1).strip()
+        if location and len(location) > 0:
+            return location
     
-    # Match patterns like "Delhi weather" or "rohtak weather"
-    match = re.search(r"([a-z]+(?:\s+[a-z]+)?)\s+weather", q_clean)
+    # Pattern 2: "CITY weather"
+    match = re.search(r"^([a-z]+(?:\s+[a-z]+)?)\s+(?:weather|temperature|temp|forecast)", q)
     if match:
-        return match.group(1).strip()
+        location = match.group(1).strip()
+        if location and len(location) > 0:
+            return location
     
-    # As fallback, try original query with common filler words removed
-    # Extract any word that looks like a city name (before or after "weather")
-    if "weather" in q_clean:
-        parts = q_clean.split("weather")
-        for part in parts:
-            # Look for capitalized words or known city patterns
-            cities = re.findall(r'\b([a-z]+(?:\s+[a-z]+)?)\b', part.strip())
-            if cities:
-                return cities[-1].strip()  # Return the last city-like word
+    # Pattern 3: Just city name (for queries like "delhi" or "chennai")
+    # Extract longest continuous word sequence that's not a keyword
+    keywords = {"weather", "temperature", "temp", "forecast", "today", "today's", "todays", "current", "what", "is"}
+    words = q.split()
+    for word in words:
+        clean_word = word.strip("?.,!:;").lower()
+        if clean_word and clean_word not in keywords and len(clean_word) > 2:
+            return clean_word
     
     return ""
 
