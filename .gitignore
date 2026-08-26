@@ -157,3 +157,11 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# ═════════════════════════════════════════════════════════════
+# DOCUMENTATION & ASSETS
+# ═════════════════════════════════════════════════════════════
+# doc/ folder for local documentation
+# SS/ folder for UI screenshots
+doc/
+SS/

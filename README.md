@@ -46,6 +46,23 @@ SafeAI is a **document Q&A system** that attempts to solve the hallucination pro
 
 ---
 
+## UI Demo
+
+### Chat Interface
+![AI Agent Chatbot UI](doc/SS/UI.png)
+
+**Features visible in the UI:**
+- **Left Sidebar:** Document management, memory status, conversation history
+- **Main Chat Area:** Welcome message with personalized greeting
+- **Long-Term Memory:** Connected to PostgreSQL, storing user facts
+- **RAG Controls:** "Rebuild RAG Index" button for document processing
+- **Chat Export:** Download conversations as Markdown
+- **Multi-thread Support:** Manage multiple isolated conversations
+
+---
+
+---
+
 | Feature | Description |
 |---|---|
 | **Hybrid Document Search (RAG)** | **PRODUCTION:** Combines semantic search (FAISS + embeddings, 80%) + keyword search (BM25, 20%) for **85.7% Hit Rate** on 21 professional fine-tuning questions with **0.857 MRR** (rank 1.17) — clean, validated evaluation dataset extracted from real FineTuningLLM.pdf with professional answers tied to resume claims |
@@ -647,7 +664,61 @@ LangGraph detects these env vars and sends traces automatically.
 
 ---
 
-## Scaling Path (If Needed)
+## Deployment
+
+### Live Demo
+For a live demo deployment instructions, you can use one of these platforms:
+
+#### **Option 1: Streamlit Cloud (Recommended - Free)**
+```bash
+# 1. Push your code to GitHub (with secrets in .env.example, not .env)
+git push origin main
+
+# 2. Go to https://streamlit.io/cloud
+# 3. Click "New app"
+# 4. Select your repo: SafeAI-Agent
+# 5. Main file: chatbotFrontend.py
+# 6. Deploy
+
+# 7. Add secrets in Streamlit Cloud settings:
+# - Settings > Secrets > Add GROQ_API_KEY, OPENWEATHER_API_KEY, etc.
+```
+
+**Streamlit Cloud URL (after deployment):**
+```
+https://share.streamlit.io/[your-username]/SafeAI-Agent/main/chatbotFrontend.py
+```
+
+#### **Option 2: Docker (Production)**
+```bash
+# Build Docker image
+docker build -t safeai-agent .
+
+# Run container
+docker run -p 8501:8501 \
+  -e GROQ_API_KEY=your_key \
+  -e OPENWEATHER_API_KEY=your_key \
+  safeai-agent
+```
+
+#### **Option 3: Railway.app (Easy Deploy)**
+```bash
+# 1. Connect GitHub repo
+# 2. Add environment variables
+# 3. Deploy command: streamlit run chatbotFrontend.py
+# 4. Public URL generated automatically
+```
+
+#### **Option 4: HuggingFace Spaces**
+```bash
+# 1. Create new Space
+# 2. Select "Streamlit" as SDK
+# 3. Upload repo
+# 4. Add secrets
+# 5. Auto-deployed
+```
+
+---
 
 **Current (MVP):** SQLite + FAISS (single machine)
 - Suitable for < 1K users
