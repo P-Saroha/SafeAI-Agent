@@ -1,0 +1,159 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+Chatbot/.env
+*.pem
+*.key
+secrets.json
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# IDE & Editor
+.vscode/
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ═════════════════════════════════════════════════════════════
+# SENSITIVE: Interview Prep & Private Documentation
+# ═════════════════════════════════════════════════════════════
+Chatbot/prep/
+prep/
+**/prep/
+INTERVIEW_GUIDE.md
+*INTERVIEW*.md
+*interview*.md
+
+# ═════════════════════════════════════════════════════════════
+# SENSITIVE: Local User State & Session Files
+# ═════════════════════════════════════════════════════════════
+# Active thread IDs, user IDs (PII)
+Chatbot/.active_thread_*
+Chatbot/.user_id
+.active_thread_*
+.user_id
+
+# ═════════════════════════════════════════════════════════════
+# SENSITIVE: Local Databases & Conversation State
+# ═════════════════════════════════════════════════════════════
+# SQLite databases store conversation history
+Chatbot/chatbot_db
+Chatbot/chatbot_db-shm
+Chatbot/chatbot_db-wal
+chatbot_db
+chatbot_db-shm
+chatbot_db-wal
+*.db
+*.sqlite
+*.sqlite3
+
+# ═════════════════════════════════════════════════════════════
+# SENSITIVE: User Uploaded Documents & Generated Indexes
+# ═════════════════════════════════════════════════════════════
+# knowledge_base: contains all user-uploaded documents (PDFs, docs)
+# faiss_index: generated vector indexes from those documents
+Chatbot/knowledge_base/
+Chatbot/faiss_index/
+knowledge_base/
+faiss_index/
+*.faiss
+*.pkl
+
+# ═════════════════════════════════════════════════════════════
+# Temporary & Build Files
+# ═════════════════════════════════════════════════════════════
+*.log
+*.tmp
+*.temp
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Node (if using any frontend tools)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing
+.pytest_cache/
+.hypothesis/
+
+
+TEST_RESULTS_90_PERCENT.md
+HYBRID_SEARCH_SUMMARY.txt
+HYBRID_RETRIEVER_PERFORMANCE_REPORT.md
+prep/INTERVIEW_GUIDE.md
+
+# ═════════════════════════════════════════════════════════════
+# LOCAL TESTING & TEMPORARY FILES
+# ═════════════════════════════════════════════════════════════
+minimal_test.pdf
+test_*.py
+*_test.py
+test_results_*.json
+temp_*.py
+
+# ═════════════════════════════════════════════════════════════
+# OS-SPECIFIC
+# ═════════════════════════════════════════════════════════════
+.env.local.user
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ═════════════════════════════════════════════════════════════
+# RUNTIME & CACHE
+# ═════════════════════════════════════════════════════════════
+*.cache
+.streamlit/
+streamlit_session/
+__pycache__/
+*.pyc
+.venv/
+venv/
