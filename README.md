@@ -59,6 +59,9 @@ SafeAI is a **document Q&A system** that attempts to solve the hallucination pro
 - **Chat Export:** Download conversations as Markdown
 - **Multi-thread Support:** Manage multiple isolated conversations
 
+### Demo Video
+[Watch Full Demo on Google Drive](https://drive.google.com/file/d/1PKJx3dArWOHV25kfpO7yCPP4TFeuWQs0/view?usp=sharing)
+
 ---
 
 ---
