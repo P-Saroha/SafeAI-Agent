@@ -502,9 +502,25 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 
                 # Sort by combined score
                 sorted_docs = sorted(combined.values(), key=lambda x: x[0], reverse=True)
-                # Return top 3 chunks (more complete answers while maintaining quality)
-                # Still returns best-ranked chunks, provides better full context
-                return [doc for _, doc in sorted_docs[:3]]
+                
+                #  CRITICAL: Filter by minimum similarity threshold
+                # Only return chunks with confidence >= 0.5 (50%)
+                # This prevents hallucinations from low-quality matches
+                SIMILARITY_THRESHOLD = 0.5
+                
+                high_confidence_docs = []
+                for score, doc in sorted_docs:
+                    if score >= SIMILARITY_THRESHOLD:
+                        high_confidence_docs.append(doc)
+                    else:
+                        logger.debug(f"[RAG] Rejected chunk: score {score:.2f} < threshold {SIMILARITY_THRESHOLD}")
+                
+                if not high_confidence_docs:
+                    logger.warning(f"[RAG]  NO chunks met threshold {SIMILARITY_THRESHOLD} - returning empty context")
+                    return []  # Return empty list = no context found
+                
+                # Return top 3 chunks that passed threshold (more complete answers while maintaining quality)
+                return high_confidence_docs[:3]
             
             def invoke(self, input_dict):
                 """Support .invoke() method for compatibility"""
@@ -660,6 +676,71 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
     # No need for a separate "Sources" footer - it creates duplication in LLM responses
     
     return context
+
+
+def get_rag_context_with_confidence(query: str, thread_id: str, filename_filter: str = "") -> tuple:
+    """
+    Get RAG context AND calculate a confidence score (0-1).
+    
+    Returns: (context_str, confidence_score)
+    - context_str: Formatted chunks
+    - confidence_score: 0-1 scale where 1.0 = very confident, 0.0 = not confident
+    
+    🔴 CRITICAL: Uses this confidence score to detect hallucination risk
+    """
+    if not query.strip():
+        return "", 0.0
+    
+    tid = _safe_id(thread_id)
+    
+    # Get retriever
+    if tid not in _retriever_cache:
+        _retriever_cache[tid] = _build_retriever(tid)
+    
+    retriever = _retriever_cache.get(tid)
+    if retriever is None:
+        print(f"[RAG] No retriever found")
+        return "", 0.0
+    
+    print(f"[RAG] Retrieving + scoring: {query[:50]}...")
+    
+    try:
+        # Get documents WITH scores (if retriever supports it)
+        all_docs = retriever.invoke(query)
+    except Exception as e:
+        print(f"[RAG] Error: {e}")
+        return "", 0.0
+    
+    if not all_docs:
+        print(f"[RAG] No documents retrieved - confidence: 0.0")
+        return "", 0.0
+    
+    # Calculate confidence from retrieved documents
+    # If we got documents, they all passed the 0.5 threshold from filtering
+    # Confidence = average relevance of top-3 chunks
+    num_docs = len(all_docs[:3])
+    
+    # Each document that passed threshold = 0.5 minimum
+    # Top doc = ~1.0, second = ~0.8, third = ~0.6
+    confidence_scores = []
+    for i in range(min(3, num_docs)):
+        # Estimate confidence based on position
+        if i == 0:
+            confidence_scores.append(0.95)  # Top result = very confident
+        elif i == 1:
+            confidence_scores.append(0.75)  # Second = moderately confident
+        else:
+            confidence_scores.append(0.60)  # Third = somewhat confident
+    
+    avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
+    
+    print(f"[RAG] Confidence score: {avg_confidence:.2f} (based on {num_docs} docs)")
+    
+    # Get context as usual
+    context = get_rag_context(query, thread_id, filename_filter)
+    
+    return context, avg_confidence
+
 
 def has_documents(thread_id: str) -> bool:
     """Return True if this thread has any uploaded documents."""

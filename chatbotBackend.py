@@ -179,14 +179,20 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             print(f"[HITL_RESUME] Calling Groq LLM for formatting...")
             prompt = (
                 "You are answering a question based ONLY on provided document chunks.\n\n"
+                "🔴 CRITICAL RULES:\n"
+                "1. ONLY use information from the provided chunks\n"
+                "2. If the question is NOT answered in chunks, you MUST refuse\n"
+                "3. Say 'I don't have this information in the uploaded document' if chunks don't answer\n"
+                "4. NEVER use general knowledge, inference, or 'common sense'\n"
+                "5. NEVER make assumptions or fill gaps with outside information\n\n"
                 "INSTRUCTIONS:\n"
-                "1. Use ONLY the chunk information provided\n"
-                "2. Structure clearly: ### headers, **bold**, bullet points\n"
-                "3. PRESERVE CITATIONS: Every fact must have [1] [2] or [3] with PDF name and page\n"
-                "4. If chunks don't fully answer, say 'Limited information available: [cite]\n\n"
+                "- Use structure: ### headers, **bold**, bullet points\n"
+                "- Preserve citations: Every fact must have [1] [2] or [3] with PDF name and page\n"
                 f"QUESTION: {original_question}\n\n"
                 f"DOCUMENT CHUNKS (with [1] [2] [3] citations):\n{rag_context}\n\n"
-                "ANSWER (with citations preserved):"
+                "If chunks don't answer the question, respond EXACTLY with:\n"
+                "'I don't have this information in the uploaded document. Please ask about topics covered in the document or upload a relevant document.'\n\n"
+                "ANSWER (use chunks ONLY):"
             )
             
             # Stream response token-by-token
@@ -220,7 +226,7 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
 
     # ── 3. RAG (PRIORITIZE DOCUMENTS) ────────────────────────────────────
     if has_documents(thread_id):
-        rewritten, rag_context = get_rag_context_with_rewriting(query, thread_id)
+        rewritten, rag_context, confidence_score = get_rag_context_with_rewriting(query, thread_id)
         
         # No context found - ask for clarification if ambiguous
         if not rag_context and len(query) < 10:
@@ -228,9 +234,10 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             if is_ambiguous_query(query):
                 return {"messages": [AIMessage(content="Your question is unclear. Could you provide more details?")]}
         
-        # Low confidence context - trigger HITL ONLY ONCE
-        if rag_context and len(rag_context) < 200:
-            print(f"[HITL_TRIGGER] Low confidence! rag_context length={len(rag_context)} < 200")
+        # Low confidence - use confidence score instead of character length
+        # 🔴 CRITICAL: confidence < 0.6 means too risky to answer
+        if rag_context and confidence_score < 0.6:
+            print(f"[HITL_TRIGGER] Low confidence! confidence_score={confidence_score:.2f} < 0.6")
             print(f"[HITL_TRIGGER] Current awaiting_hitl={state.get('awaiting_hitl')}")
             if not state.get("awaiting_hitl"):
                 print(f"[HITL_TRIGGER] Setting awaiting_hitl=True, storing hitl_question='{query[:50]}...'")
@@ -246,25 +253,32 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
         
         # Good context - pass through LLM for better formatting
         if rag_context:
-            print(f"[RAG] Good context found ({len(rag_context)} chars), calling LLM for formatting...")
+            print(f"[RAG] Good context found (confidence={confidence_score:.2f}), calling LLM for formatting...")
             print(f"[RAG_DEBUG] RAG context sample:\n{rag_context[:500]}...\n")  # Debug: show what we're passing
             
             prompt = (
                 "You are formatting retrieved document chunks into a well-structured response.\n\n"
-                "🔴 CRITICAL RULE: Copy the EXACT citations from the chunks provided.\n"
-                "Do NOT change citation format. Do NOT use Chinese brackets 【 】.\n"
-                "Copy EXACTLY as shown: [1] FineTuningLLM.pdf (Page X)\n\n"
+                "🔴 CRITICAL RULES - READ CAREFULLY:\n"
+                "1. ONLY answer if question is answered in the chunks below\n"
+                "2. If question is NOT in chunks, REFUSE and say 'I don't have this information'\n"
+                "3. Do NOT use general knowledge, inference, or assumptions\n"
+                "4. Do NOT try to 'complete' partial answers\n"
+                "5. Do NOT make educated guesses\n"
+                "6. Copy EXACT citations from chunks - DO NOT modify them\n"
+                "Do NOT use Chinese brackets 【 】. Use [1] [2] [3] format EXACTLY\n\n"
                 "INSTRUCTIONS:\n"
-                "1. Answer the question using ONLY the provided chunks\n"
+                "1. Answer using ONLY the provided chunks\n"
                 "2. Use clear formatting: ### headers, **bold**, bullet points\n"
-                "3. COPY citations EXACTLY from the chunks - DO NOT modify them\n"
+                "3. COPY citations EXACTLY from chunks - DO NOT modify\n"
                 "4. Example: 'LoRA is a technique【1】' should be 'LoRA is a technique [1]'\n"
                 "5. Keep answer concise but complete\n"
-                "6. Do NOT add information beyond what's in chunks\n"
-                "7. Do NOT add a separate 'Sources' section\n\n"
+                "6. Do NOT add information beyond chunks\n"
+                "7. Do NOT add separate 'Sources' section\n\n"
                 f"QUESTION: {query}\n\n"
-                f"DOCUMENT CHUNKS (copy the [1] [2] [3] citations exactly as shown):\n{rag_context}\n\n"
-                "FORMATTED RESPONSE (use exact [1] [2] [3] citations, NOT Chinese 【】 brackets):"
+                f"DOCUMENT CHUNKS (copy [1] [2] [3] citations exactly):\n{rag_context}\n\n"
+                "If question is NOT answered in chunks, respond EXACTLY with:\n"
+                "'I don't have this information in the uploaded document.'\n\n"
+                "FORMATTED RESPONSE (use exact [1] [2] [3] citations, NOT Chinese 【】):"
             )
             
             # Blocking response (removed streaming)
@@ -314,36 +328,27 @@ Create the profile now:
             )
         return {"messages": [AIMessage(content=response)]}
 
-    # ── 5. Default LLM answer ────────────────────────────────────────────
-    # But check if this looks like a personal statement (not a question)
-    if not any(q in query.lower() for q in ["?", "what", "how", "why", "when", "where", "can you", "could you", "summary", "recap", "tell me", "explain"]):
-        # This is likely a personal statement ("my interests are...", "I love...", etc)
-        # Just acknowledge it briefly — LTM will extract the facts
-        return {"messages": [AIMessage(
-            content="Got it! I've noted that. 📝"
-        )]}
+    # ── 5. NO DEFAULT LLM ANSWER (Removed to prevent hallucination) ────────
+    #  CRITICAL: Generic LLM fallback DISABLED
+    # Previously: Answered any question using general knowledge (Groq)
+    # Problem: User asked about "capital of France", chatbot answered (hallucination)
+    # Solution: REFUSE all questions NOT answered by RAG
     
-    memory_text = get_memory_as_text(user_id)
-
-    system_parts = ["You are a helpful AI assistant. Answer clearly and concisely."]
-    if memory_text:
-        system_parts.append(
-            f"\n🎯 About the user (personalize your response using this context):\n{memory_text}\n\n"
-            f"💡 Tip: When answering, relate your response to their interests and experience level. "
-            f"For example, if they're interested in RAG/ML, mention relevant frameworks or techniques."
-        )
-
-    system_prompt = "\n".join(system_parts)
-    recent = get_recent_messages(state["messages"])
-    
-    # Stream response token-by-token
-    content = ""
-    for chunk in llm.stream([SystemMessage(content=system_prompt)] + recent):
-        if hasattr(chunk, 'content') and chunk.content:
-            content += chunk.content
-    
-    content = f"{content}\n\n{_cite('Groq (gpt-oss-120b)')}"
-    return {"messages": [AIMessage(content=content)]}
+    # If we get here, query was not RAG-eligible, no memory match, not a tool
+    # Response: REFUSE gracefully
+    refuse_response = (
+        " I don't have this information in the uploaded documents.\n\n"
+        "I can only answer questions about the documents you've uploaded (PDFs, text files, etc).\n\n"
+        " **What you can ask me:**\n"
+        "- Questions about your uploaded documents\n"
+        "- Summaries of document content\n"
+        "- Details about PDFs in your knowledge base\n\n"
+        " **To get answers to other topics:**\n"
+        "1. Upload relevant documents\n"
+        "2. Ask your question again\n\n"
+        "Example: Upload a Python tutorial PDF, then ask 'How do I use decorators?'"
+    )
+    return {"messages": [AIMessage(content=refuse_response)]}
 
 
 # ══════════════════════════════════════════════════════════════════════════

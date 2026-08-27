@@ -45,29 +45,34 @@ def rewrite_query(query):
 
 def get_rag_context_with_rewriting(query, thread_id, filename_filter=""):
     """
-    Smart retrieval strategy:
-    1. Try original query
+    Smart retrieval strategy (with confidence scoring):
+    1. Try original query with confidence scoring
     2. If fails and ambiguous -> ask user to clarify
-    3. If fails and not ambiguous -> try rewrite as fallback
+    3. If fails and not ambiguous -> return empty (no fallback)
+    
+    Returns: (query, context, confidence_score)
+    - confidence_score: 0-1, used by backend to detect hallucination risk
     """
-    # Try original query first
-    context = get_rag_context(query, thread_id, filename_filter)
+    from chatbot_rag import get_rag_context_with_confidence
+    
+    # Try original query first with confidence scoring
+    context, confidence = get_rag_context_with_confidence(query, thread_id, filename_filter)
     
     # If we got good context, return it
     if context and len(context) > 100:
-        return query, context
+        return query, context, confidence
     
     # No good context - check if ambiguous
     if is_ambiguous_query(query):
-        # Ask user to clarify - signal via empty context
-        return query, ""
+        # Ask user to clarify - signal via empty context and 0 confidence
+        return query, "", 0.0
     
-    # Not ambiguous but no chunks - try rewrite as fallback
-    rewritten = rewrite_query(query)
-    if rewritten != query:
-        print(f"[Fallback Rewrite] No chunks found for '{query}' → trying '{rewritten}'")
-        context = get_rag_context(rewritten, thread_id, filename_filter)
-        return rewritten, context
+    #  DISABLED: Auto-rewrite fallback removed to prevent hallucination
+    # Previously: Tried rewriting query if no chunks found
+    # Problem: Rewrites can introduce assumptions, defeating RAG guardrails
+    # Solution: Return empty context - let backend refuse gracefully
     
-    # Rewrite didn't help either - return original with empty context
-    return query, context
+    # Return original query with empty context and low confidence
+    # This signals to chatbotBackend that no chunks were found
+    # Backend will refuse with: "I don't have this information in the uploaded document"
+    return query, context, confidence
