@@ -240,10 +240,21 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             if is_ambiguous_query(query):
                 return {"messages": [AIMessage(content="Your question is unclear. Could you provide more details?")]}
         
-        # Low confidence - use confidence score instead of character length
-        # 🔴 CRITICAL: confidence < 0.6 means too risky to answer
-        if rag_context and confidence_score < 0.6:
-            print(f"[HITL_TRIGGER] Low confidence! confidence_score={confidence_score:.2f} < 0.6")
+        # Low confidence - use BOTH conditions for HITL trigger
+        # 🔴 CRITICAL: Trigger HITL if EITHER:
+        #   - confidence_score < 0.6 (low similarity/relevance)
+        #   - len(rag_context) < 200 chars (too few chunks/short context)
+        context_is_short = rag_context and len(rag_context) < 200
+        confidence_is_low = rag_context and confidence_score < 0.6
+        
+        if context_is_short or confidence_is_low:
+            reason = []
+            if confidence_is_low:
+                reason.append(f"confidence={confidence_score:.2f} < 0.6")
+            if context_is_short:
+                reason.append(f"context_len={len(rag_context)} < 200")
+            
+            print(f"[HITL_TRIGGER] Low confidence! {' + '.join(reason)}")
             print(f"[HITL_TRIGGER] Current awaiting_hitl={state.get('awaiting_hitl')}")
             if not state.get("awaiting_hitl"):
                 print(f"[HITL_TRIGGER] Setting awaiting_hitl=True, storing hitl_question='{query[:50]}...'")
