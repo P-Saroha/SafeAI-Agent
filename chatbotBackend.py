@@ -98,7 +98,13 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     The function follows a simple top-to-bottom routing order.
     The first matching condition wins and returns immediately.
     """
-    query = get_latest_user_message(state["messages"])
+    # 🔴 CRITICAL: If HITL is in progress, use stored hitl_question instead of latest message
+    # This allows the graph to cycle back to chat_node after user approves/rejects
+    if state.get("awaiting_hitl") and state.get("hitl_question"):
+        query = state.get("hitl_question", "")
+        print(f"[CHAT_NODE] HITL in progress - using stored hitl_question: '{query[:50]}...'")
+    else:
+        query = get_latest_user_message(state["messages"])
 
     # Read thread_id and user_id from the LangGraph config (always reliable)
     # Fall back to state fields if config doesn't have them
