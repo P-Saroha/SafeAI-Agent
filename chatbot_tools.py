@@ -81,6 +81,20 @@ def is_stock_query(query: str) -> bool:
     return "stock" in q or ("price" in q and "weather" not in q)
 
 
+def is_github_query(query: str) -> bool:
+    """Return True if the query contains a GitHub URL or asks about GitHub repos."""
+    q = query.lower()
+    # Check for github.com in URL
+    if "github.com/" in q:
+        return True
+    # Check for GitHub keywords
+    if any(keyword in q for keyword in ["github", "repository", "repo", "github repo"]):
+        # Verify there's likely a URL present
+        if "github.com" in query or re.search(r'https?://\S+', query):
+            return True
+    return False
+
+
 def extract_weather_location(query: str) -> str:
     """Pull the city/location name out of a weather question."""
     q = query.lower().strip()

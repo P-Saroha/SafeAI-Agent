@@ -63,6 +63,7 @@ from chatbot_tools import (
     extract_weather_location,
     format_search_response,
     format_weather_response,
+    is_github_query,
     is_greeting,
     is_news_query,
     is_stock_query,
@@ -163,6 +164,22 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
         results = call_search(query)
         content = f"{format_search_response(results, query)}\n\n{_cite('DuckDuckGo Search + Groq')}"
         return {"messages": [AIMessage(content=content)]}
+
+    # ── GitHub Repository Analysis ──────────────────────────────────────
+    if is_github_query(query):
+        from chatbot_github import extract_github_url, analyze_github_repo, format_github_response
+        
+        github_url = extract_github_url(query)
+        if github_url:
+            print(f"[TOOL] GitHub query detected: {github_url}")
+            repo_info = analyze_github_repo(github_url)
+            content = format_github_response(repo_info)
+            content = f"{content}\n\n{_cite('GitHub API')}"
+            return {"messages": [AIMessage(content=content)]}
+        else:
+            return {"messages": [AIMessage(
+                content="Please provide a valid GitHub repository URL, e.g., `https://github.com/owner/repo`"
+            )]}
 
     # ── 3. HITL RESUME - human made a decision ─────────────────────────
     # Check BEFORE processing the question again (avoids re-triggering HITL)
