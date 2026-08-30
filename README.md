@@ -27,10 +27,10 @@ SafeAI is a **document Q&A system** that attempts to solve the hallucination pro
    - Combined: 85.7% accuracy with 0.857 MRR (average rank 1.17)
 
 2. **Human-In-The-Loop Safety** (HITL)
-   - When confidence is low (<200 chars retrieved), system pauses
+   - The RAG pipeline filters weak hybrid matches; the system pauses when returned context is short (<200 chars) or retrieval confidence is below 0.60
    - Shows human: "Not enough info. Should I try anyway?"
    - Human clicks "Approve" or "Skip" — system respects the decision
-   - Result: Zero hallucinations due to insufficient context
+   - Approved answers are restricted to retrieved document chunks; unsupported document questions are refused rather than answered from general knowledge
 
 3. **Transparent Citations**
    - Answers show [1][2][3] linking to actual document chunks
@@ -43,6 +43,10 @@ SafeAI is a **document Q&A system** that attempts to solve the hallucination pro
    - **Auto-extract:** LLM automatically saves new facts from conversations
 
 **Result:** Document Q&A system that pauses when uncertain instead of guessing.
+
+### GitHub Repository Analysis
+
+The new `chatbot_github.py` tool lets users paste a public GitHub repository URL, for example `analyze https://github.com/langchain-ai/langchain`. It retrieves repository metadata, languages, stars, forks, top-level structure, topics, license, and README content through the GitHub API. When `GROQ_API_KEY` is configured, it also produces a concise README-based summary. Set the optional `GITHUB_TOKEN` in `.env` for higher GitHub API rate limits.
 
 ---
 
@@ -88,6 +92,28 @@ Watch this demo to see the platform in action:
 ---
 
 ## What is HITL (Human-In-The-Loop)?
+
+**Current trigger:** after hybrid retrieval, the safety gate pauses when the available context is under 200 characters or its confidence score is below 0.60. Retrieval also filters weak hybrid matches before document chunks reach the LLM.
+
+### Four-layer hallucination guardrail
+
+```text
+Layer 1: RETRIEVAL FILTERING
+         ├─ Similarity Threshold (0.5)
+         └─ Blocks low-quality chunks at retrieval stage
+                ↓
+Layer 2: CONFIDENCE SCORING
+         ├─ Position-based scoring (top=0.95, 2nd=0.75, 3rd=0.60)
+         └─ Quantifies retrieval quality for decision-making
+                ↓
+Layer 3: HUMAN-IN-THE-LOOP (HITL)
+         ├─ Triggers if: confidence < 0.6 OR context < 200 chars
+         └─ Asks user approval before answering borderline cases
+                ↓
+Layer 4: LLM PROMPTING
+         ├─ Strict REFUSE instructions
+         └─ Prevents inference, assumptions, and general-knowledge answers
+```
 
 Normally the bot answers automatically. But what if the uploaded document doesn't actually contain the answer? The bot could give a confidently wrong answer — that's called hallucination.
 
@@ -135,8 +161,8 @@ Each chat thread has its own `knowledge_base/<thread_id>/` folder. Documents are
 ```
 User Query
     ↓
-1. Semantic Search (FAISS + Hash Embeddings, 80% weight)
-   • Query embedded using hash embeddings (default, offline, zero API cost)
+1. Semantic Search (FAISS + all-MiniLM-L6-v2 embeddings, 80% weight)
+   • Query embedded using the local sentence-transformers/all-MiniLM-L6-v2 model (384 dimensions)
    • FAISS indexes compared, top-3 semantic matches returned
    • Catches meaning-based queries: "What is the main concept?"
    
@@ -144,9 +170,9 @@ User Query
    • Query split into terms, exact matches ranked by frequency
    • Catches exact term matches: "Find mentions of 'salary'"
    
-3. Score Normalization & Blending (LangChain EnsembleRetriever)
-   • Both scores normalized to 0-1 scale
-   • Final score = 0.8 × semantic_score + 0.2 × bm25_score
+3. Positional Weighted Blending (custom hybrid retriever)
+   • Top results are combined with positional 80/20 semantic/keyword weighting
+   • Weak hybrid matches are filtered before document chunks reach the LLM
    • Semantic priority: Most queries are concept-driven, not keyword-driven
    
 4. Top-3 Results
@@ -154,10 +180,10 @@ User Query
    • [1] filename.pdf (page 1): ...
    • [2] filename.pdf (page 2): ...
    
-5. Direct Formatting (1-2 seconds total)
-   • Format with clean structure: citations, sources
-   • NO extra LLM synthesis call (removed 30-35s overhead)
-   • Direct return to user
+5. Citation-Preserving Formatting
+   • Retrieved chunks retain filename/page citations
+   • The LLM formatter is instructed to use only document chunks
+   • Unsupported answers are refused instead of completed with general knowledge
 ```
 
 ### Why Hybrid Retrieval?
@@ -194,19 +220,21 @@ User Query
 
 ## Query Rewriting explained
 
-Raw user queries can be ambiguous or vague. The chatbot automatically detects and clarifies them before RAG retrieval.
+Raw user queries can be ambiguous or vague. The chatbot detects very short or pronoun-only questions before RAG retrieval.
 
-**Examples:**
+> **Current safety behavior:** automatic rewrite fallback is disabled. The original query is retrieved first; when retrieval is poor and the question is ambiguous, the app asks the user to clarify instead of having an LLM invent a more specific question.
+
+**Previous rewrite examples (disabled for safety):**
 - "what about it" → "What is the main topic discussed in the document?"
 - "tell me about that" → "Provide a detailed explanation of the key concepts"
 - "what does it say" → "What information is available in the document?"
 
 **How it works:**
 1. User query comes in
-2. `is_ambiguous_query()` checks for vague pronouns (it, that, this), vague verbs (tell, say, show), or very short queries
-3. If ambiguous → `rewrite_query()` uses Groq LLM to clarify it
-4. Rewritten query is used for RAG retrieval
-5. Better retrieval = better answers
+2. `is_ambiguous_query()` checks for very short or pronoun-only queries
+3. The original query is retrieved first with a confidence score
+4. If retrieval fails and the question is ambiguous, the user is asked to clarify
+5. No automatic rewrite fallback is used, preventing an answer to a changed question
 
 **Integration:**
 - Happens transparently in `chatbotBackend.py` line 318 via `get_rag_context_with_rewriting()`
@@ -396,6 +424,7 @@ Chatbot/
 ├── chatbot_rag_metrics.py       # RAG evaluation metrics (Hit Rate@K, MRR)
 ├── chatbot_query_rewriter.py    # Query ambiguity detection and LLM-based rewriting
 ├── chatbot_tools.py             # Tool functions (weather, search, stock, time) + intent detectors
+├── chatbot_github.py            # GitHub repository analysis via the GitHub API and optional Groq summary
 ├── quick_test_real_qa.py        # Clean test script for RAG evaluation (no hardcoded IDs)
 ├── real_qa_pairs_from_pdfs.json # 21 professional Q&A pairs for evaluation (FineTuningLLM.pdf)
 ├── rag_eval_real_questions.json # Test results with metrics (85.7% Hit Rate, 0.857 MRR)
@@ -531,11 +560,11 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 | Agent framework | LangGraph | State machine orchestration + checkpointing |
 | LLM | Groq — gpt-oss-120b | Response generation |
 | UI | Streamlit | Web interface, chat display |
-| **Semantic Search** | **FAISS + Hash Embeddings** | **80% weight in hybrid retrieval (production tuned)** |
+| **Semantic Search** | **FAISS + all-MiniLM-L6-v2** | **80% weight in hybrid retrieval (production tuned)** |
 | **Keyword Search** | **rank-bm25** | **20% weight in hybrid retrieval (production tuned)** |
-| Retrieval Blend | LangChain EnsembleRetriever | Score normalization + weighted combination |
-| Response Format | Direct (top-3 chunks, 1-2s) | Citations only, NO LLM synthesis (saves 20-30s) |
-| Embeddings | Hash (offline default, zero API cost) | 384-dim vectors, global cache (8-15s savings) |
+| Retrieval Blend | Custom hybrid retriever | 80/20 positional weighting with weak-match filtering |
+| Response Format | Citation-preserving LLM formatting | Retrieved chunks only; unsupported answers are refused |
+| Embeddings | `sentence-transformers/all-MiniLM-L6-v2` | 384-dimensional local semantic vectors cached by Streamlit |
 | Long-term memory | PostgreSQL via `langgraph.store.postgres` | User facts across sessions |
 | Short-term memory | Last-N messages (in-context) | Recent conversation context |
 | Conversation state | SqliteSaver (LangGraph) | Graph checkpointing + HITL persistence |
