@@ -75,6 +75,7 @@ Watch this demo to see the platform in action:
 | **News** | Latest headlines via DuckDuckGo |
 | **Stock price** | Live prices via Yahoo Finance |
 | **Date / Time** | Current system time |
+| **GitHub Repository Analysis** | Analyzes public GitHub repos (language, README, stars, main files, structure) |
 | **Long-term memory** | Remembers your name, skills, goals across sessions (Postgres) |
 | **Short-term memory** | Keeps the last 12 messages as conversation context |
 | **HITL approval** | Pauses and asks you before answering with low-confidence document context (production safety pattern) |
@@ -513,6 +514,7 @@ MRR: 0.857
 "what time is it"                → system clock
 "latest AI news"                 → DuckDuckGo search
 "stock price of Apple"           → Yahoo Finance
+"analyze https://github.com/langchain-ai/langchain" → GitHub repo analysis
 "what do you know about me"      → reads your stored LTM facts
 "my name is Sara, I like Python" → saves to LTM automatically
 "summarize the PDF I uploaded"   → RAG over your document
