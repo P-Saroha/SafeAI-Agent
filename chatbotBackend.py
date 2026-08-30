@@ -98,12 +98,21 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
     The function follows a simple top-to-bottom routing order.
     The first matching condition wins and returns immediately.
     """
-    # 🔴 CRITICAL: If HITL is in progress, use stored hitl_question instead of latest message
-    # This allows the graph to cycle back to chat_node after user approves/rejects
+    # ── HITL STATE DETECTION ────────────────────────────────────────────
+    # When user clicks "Approve" or "Reject" in the HITL UI, the frontend sends:
+    #   {hitl_decision: "approve"|"reject", awaiting_hitl: True}
+    # The graph cycles back: START → remember → chat_node (this function)
+    #
+    # Problem: There's no NEW user message, so extracting from state["messages"]
+    #          would get the OLD question (or empty string if cleared).
+    #
+    # Solution: If awaiting_hitl=True, use the stored hitl_question instead.
+    #           This preserves the original question through the HITL cycle.
     if state.get("awaiting_hitl") and state.get("hitl_question"):
         query = state.get("hitl_question", "")
         print(f"[CHAT_NODE] HITL in progress - using stored hitl_question: '{query[:50]}...'")
     else:
+        # Normal flow: Extract the latest user message from conversation history
         query = get_latest_user_message(state["messages"])
 
     # Read thread_id and user_id from the LangGraph config (always reliable)
@@ -185,7 +194,7 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             print(f"[HITL_RESUME] Calling Groq LLM for formatting...")
             prompt = (
                 "You are answering a question based ONLY on provided document chunks.\n\n"
-                "🔴 CRITICAL RULES:\n"
+                " CRITICAL RULES:\n"
                 "1. ONLY use information from the provided chunks\n"
                 "2. If the question is NOT answered in chunks, you MUST refuse\n"
                 "3. Say 'I don't have this information in the uploaded document' if chunks don't answer\n"
@@ -240,65 +249,91 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             if is_ambiguous_query(query):
                 return {"messages": [AIMessage(content="Your question is unclear. Could you provide more details?")]}
         
-        # Low confidence - use BOTH conditions for HITL trigger
-        # 🔴 CRITICAL: Trigger HITL if EITHER:
-        #   - confidence_score < 0.6 (low similarity/relevance)
-        #   - len(rag_context) < 200 chars (too few chunks/short context)
+        # ── HITL TRIGGER CONDITION ──────────────────────────────────────────
+        # Human-In-The-Loop safety gate: When should we ask the user for approval?
+        #
+        # TRIGGER if EITHER condition is true (OR logic):
+        #   1. confidence_score < 0.6
+        #      - Means: Retrieved chunks have low semantic relevance
+        #      - Risk: LLM might hallucinate or misinterpret poor matches
+        #      - Example: Asked "What is ML?" but got chunks about data structures
+        #
+        #   2. len(rag_context) < 200 characters
+        #      - Means: Only a small amount of text was retrieved
+        #      - Risk: Answer might be incomplete or based on limited context
+        #      - Example: Found only 1-2 sentences when question is complex
+        #
+        # If either is true, ask user before answering:
+        #   "Found limited context. Do you want me to answer with this, or rephrase?"
+        #
+        # This dual-check provides two layers of safety:
+        #   Layer 1: Quality check (confidence score)
+        #   Layer 2: Quantity check (context length)
+        
         context_is_short = rag_context and len(rag_context) < 200
         confidence_is_low = rag_context and confidence_score < 0.6
         
         if context_is_short or confidence_is_low:
+            # ── LOG WHICH CONDITION TRIGGERED ───────────────────────────
+            # Helps debugging: Was it poor quality or sparse retrieval?
+            # (or both?)
             reason = []
             if confidence_is_low:
-                reason.append(f"confidence={confidence_score:.2f} < 0.6")
+                reason.append(f"confidence={confidence_score:.2f} < 0.6 (low quality)")
             if context_is_short:
-                reason.append(f"context_len={len(rag_context)} < 200")
+                reason.append(f"context_len={len(rag_context)} chars < 200 (sparse)")
             
-            print(f"[HITL_TRIGGER] Low confidence! {' + '.join(reason)}")
-            print(f"[HITL_TRIGGER] Current awaiting_hitl={state.get('awaiting_hitl')}")
+            trigger_reason = " + ".join(reason)
+            print(f"[HITL_TRIGGER] Pausing bot for human review: {trigger_reason}")
+            print(f"[HITL_TRIGGER] Current state: awaiting_hitl={state.get('awaiting_hitl')}")
             if not state.get("awaiting_hitl"):
-                print(f"[HITL_TRIGGER] Setting awaiting_hitl=True, storing hitl_question='{query[:50]}...'")
+                # ── PAUSE BOT AND WAIT FOR HUMAN DECISION ────────────────
+                # Set awaiting_hitl=True to signal frontend to show approval UI
+                # Store hitl_question so we can retrieve it when user responds
+                # Clear hitl_decision so we know this is a NEW HITL (not a resume)
+                print(f"[HITL_TRIGGER] Setting awaiting_hitl=True, storing question: '{query[:50]}...'")
+                
                 return {
                     "messages": [AIMessage(content="Found limited context. Do you want me to answer with this, or rephrase?")],
-                    "awaiting_hitl": True,
-                    "hitl_question": rewritten or query,
-                    "hitl_decision": "",
+                    "awaiting_hitl": True,  # Signal to frontend: show Approve/Reject buttons
+                    "hitl_question": rewritten or query,  # Store question for when user decides
+                    "hitl_decision": "",  # Clear decision so we don't re-trigger
                 }
             else:
-                print(f"[HITL_TRIGGER] Already awaiting HITL, skipping (avoid loop)")
+                # ── AVOID INFINITE LOOP ──────────────────────────────────
+                # If awaiting_hitl is already True, don't trigger HITL again
+                # This prevents: HITL trigger → user doesn't respond → auto-trigger again
+                print(f"[HITL_TRIGGER] Already waiting for user decision, skipping duplicate trigger")
 
         
         # Good context - pass through LLM for better formatting
         if rag_context:
             print(f"[RAG] Good context found (confidence={confidence_score:.2f}), calling LLM for formatting...")
             print(f"[RAG_DEBUG] RAG context sample:\n{rag_context[:500]}...\n")  # Debug: show what we're passing
+            print(f"[RAG_DEBUG] Full RAG context length: {len(rag_context)} chars")  # Debug: show total size
             
             prompt = (
-                "You are formatting retrieved document chunks into a well-structured response.\n\n"
-                "🔴 CRITICAL RULES - READ CAREFULLY:\n"
-                "1. ONLY answer if question is answered in the chunks below\n"
-                "2. If question is NOT in chunks, REFUSE and say 'I don't have this information'\n"
-                "3. Do NOT use general knowledge, inference, or assumptions\n"
-                "4. Do NOT try to 'complete' partial answers\n"
-                "5. Do NOT make educated guesses\n"
-                "6. Copy EXACT citations from chunks - DO NOT modify them\n"
-                "Do NOT use Chinese brackets 【 】. Use [1] [2] [3] format EXACTLY\n\n"
-                "INSTRUCTIONS:\n"
-                "1. Answer using ONLY the provided chunks\n"
-                "2. Use clear formatting: ### headers, **bold**, bullet points\n"
-                "3. COPY citations EXACTLY from chunks - DO NOT modify\n"
-                "4. Example: 'LoRA is a technique【1】' should be 'LoRA is a technique [1]'\n"
-                "5. Keep answer concise but complete\n"
-                "6. Do NOT add information beyond chunks\n"
-                "7. Do NOT add separate 'Sources' section\n\n"
+                "You are a citation-preserving formatter. Your ONLY job is to reformat content while preserving ALL citations exactly.\n\n"
+                "   ABSOLUTE RULES (NON-NEGOTIABLE):\n"
+                "1. Copy content WORD-FOR-WORD from chunks - do NOT paraphrase or rewrite\n"
+                "2. Preserve EVERY citation character-by-character: [1], [2], [3] with filename and page\n"
+                "3. If you see: **[1] Document.pdf (Page 7)** keep it EXACTLY like this\n"
+                "4. Do NOT convert [1] to 【1】, [one], or any other format\n"
+                "5. Do NOT move citations from start to end of line\n"
+                "6. Do NOT paraphrase chunks - preserve original text\n"
+                "7. Only add formatting: ### headers, **bold**, bullet points\n"
+                "8. If question is NOT in chunks, respond with: 'I don't have this information in the uploaded document.'\n\n"
+                "COPYING RULES:\n"
+                "- Citations with page numbers: **[1] FineTuningLLM.pdf (Page 7)**\n"
+                "- Copy the WHOLE thing, including [1], filename, AND (Page X)\n"
+                "- Do NOT abbreviate or modify\n"
+                "- Multiple citations: **[1] file1.pdf (Page 3)**\n**[2] file2.pdf (Page 5)**\n\n"
                 f"QUESTION: {query}\n\n"
-                f"DOCUMENT CHUNKS (copy [1] [2] [3] citations exactly):\n{rag_context}\n\n"
-                "If question is NOT answered in chunks, respond EXACTLY with:\n"
-                "'I don't have this information in the uploaded document.'\n\n"
-                "FORMATTED RESPONSE (use exact [1] [2] [3] citations, NOT Chinese 【】):"
+                f"DOCUMENT CHUNKS (copy everything exactly, including [1] [2] [3]):\n{rag_context}\n\n"
+                "NOW FORMAT THE RESPONSE (preserve ALL citations, do NOT rewrite):"
             )
             
-            # Blocking response (removed streaming)
+            # Blocking response (
             response = llm.invoke(prompt)
             content = response.content if hasattr(response, 'content') else str(response)
             

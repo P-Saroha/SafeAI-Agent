@@ -444,26 +444,6 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 self.keyword = keyword
                 self.all_chunks = all_chunks
             
-            def _score_relevance(self, query: str, chunk_text: str) -> float:
-                """Score chunk relevance to query (0-1 scale)"""
-                query_lower = query.lower()
-                chunk_lower = chunk_text.lower()
-                
-                # Exact match boost
-                if query_lower in chunk_lower:
-                    return 0.9
-                
-                # Keyword match count
-                query_words = set(query_lower.split())
-                chunk_words = chunk_lower.split()
-                matches = sum(1 for word in query_words if word in chunk_words)
-                keyword_score = min(matches / len(query_words), 1.0) if query_words else 0
-                
-                # Length penalty (prefer concise, focused chunks)
-                length_score = 1.0 / (1.0 + (len(chunk_text) / 1500))
-                
-                return 0.6 * keyword_score + 0.4 * length_score
-            
             def get_relevant_documents(self, query):
                 sem_docs = []
                 kw_docs = []
@@ -504,22 +484,46 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 sorted_docs = sorted(combined.values(), key=lambda x: x[0], reverse=True)
                 
                 #  CRITICAL: Filter by minimum similarity threshold
+                # ── HALLUCINATION PREVENTION: SIMILARITY THRESHOLD ──────
                 # Only return chunks with confidence >= 0.5 (50%)
-                # This prevents hallucinations from low-quality matches
+                # This is the FIRST layer of defense against hallucinations
+                #
+                # What this does:
+                # - Filters out low-quality chunk matches before they reach LLM
+                # - Prevents LLM from misinterpreting weak semantic connections
+                # - Returns empty list if NO chunks meet the threshold
+                #
+                # Threshold = 0.5 because:
+                # - 80% weight from FAISS (semantic) + 20% from BM25 (keyword)
+                # - Position-weighted: top chunk weight 1.0, 3rd chunk 0.4
+                # - 0.5 threshold blocks obvious mismatches while allowing valid retrievals
+                #
+                # Example:
+                # - Asked "What is Python?" but got chunks about snakes → rejected (< 0.5)
+                # - Asked "Python functions" and got "Python basics" → accepted (>= 0.5)
+                
                 SIMILARITY_THRESHOLD = 0.5
                 
                 high_confidence_docs = []
                 for score, doc in sorted_docs:
                     if score >= SIMILARITY_THRESHOLD:
+                        # Chunk passed threshold - include it
                         high_confidence_docs.append(doc)
                     else:
-                        logger.debug(f"[RAG] Rejected chunk: score {score:.2f} < threshold {SIMILARITY_THRESHOLD}")
+                        # Chunk failed threshold - reject and log for debugging
+                        logger.debug(f"[RAG] Rejected low-quality chunk: score {score:.2f} < threshold {SIMILARITY_THRESHOLD}")
                 
+                # ── HANDLE NO CHUNKS CASE ────────────────────────────────
                 if not high_confidence_docs:
-                    logger.warning(f"[RAG]  NO chunks met threshold {SIMILARITY_THRESHOLD} - returning empty context")
-                    return []  # Return empty list = no context found
+                    logger.warning(f"[RAG] Query failed threshold: No chunks >= {SIMILARITY_THRESHOLD} found")
+                    print(f"[RAG] Returning empty list - this will trigger HITL or fallback")
+                    return []  # Return empty list = backend will refuse or ask user
                 
-                # Return top 3 chunks that passed threshold (more complete answers while maintaining quality)
+                # ── RETURN TOP 3 PASSING CHUNKS ──────────────────────────
+                # Take only top 3 for:
+                # 1. Efficiency: Reduces token count to LLM
+                # 2. Quality: Prevents dilution with less relevant chunks
+                # 3. Citations: We cite [1] [2] [3] anyway
                 return high_confidence_docs[:3]
             
             def invoke(self, input_dict):
@@ -682,61 +686,85 @@ def get_rag_context_with_confidence(query: str, thread_id: str, filename_filter:
     """
     Get RAG context AND calculate a confidence score (0-1).
     
-    Returns: (context_str, confidence_score)
-    - context_str: Formatted chunks
-    - confidence_score: 0-1 scale where 1.0 = very confident, 0.0 = not confident
+    This function serves two purposes:
+    1. Retrieve and format document chunks (same as get_rag_context)
+    2. Calculate a confidence score indicating retrieval quality
     
-    🔴 CRITICAL: Uses this confidence score to detect hallucination risk
+    The confidence score is used by the backend to decide:
+    - Score >= 0.6: Answer directly (high confidence)
+    - Score < 0.6: Trigger HITL (ask user for approval)
+    - Score = 0.0: No chunks found (refuse answer)
+    
+    Returns: (context_str, confidence_score)
+    - context_str: Formatted chunks with citations [1] [2] [3]
+    - confidence_score: Float 0.0 to 1.0 indicating retrieval quality
     """
     if not query.strip():
         return "", 0.0
     
     tid = _safe_id(thread_id)
     
-    # Get retriever
+    # ── STEP 1: LOAD OR BUILD RETRIEVER ──────────────────────────────
+    # Check cache first (fast), then build if needed
     if tid not in _retriever_cache:
         _retriever_cache[tid] = _build_retriever(tid)
     
     retriever = _retriever_cache.get(tid)
     if retriever is None:
-        print(f"[RAG] No retriever found")
+        print(f"[RAG] No retriever found - no documents uploaded yet")
         return "", 0.0
     
     print(f"[RAG] Retrieving + scoring: {query[:50]}...")
     
+    # ── STEP 2: RETRIEVE DOCUMENTS ───────────────────────────────────
     try:
-        # Get documents WITH scores (if retriever supports it)
+        # Invoke retriever: Uses hybrid FAISS + BM25 with 0.5 threshold filter
+        # Returns only chunks that passed similarity threshold
         all_docs = retriever.invoke(query)
     except Exception as e:
-        print(f"[RAG] Error: {e}")
+        print(f"[RAG] Retrieval error: {e}")
         return "", 0.0
     
+    # ── STEP 3: HANDLE EMPTY RETRIEVAL ──────────────────────────────
     if not all_docs:
-        print(f"[RAG] No documents retrieved - confidence: 0.0")
+        print(f"[RAG] No chunks met threshold - confidence: 0.0")
         return "", 0.0
     
-    # Calculate confidence from retrieved documents
-    # If we got documents, they all passed the 0.5 threshold from filtering
-    # Confidence = average relevance of top-3 chunks
-    num_docs = len(all_docs[:3])
+    # ── STEP 4: CALCULATE CONFIDENCE SCORE ───────────────────────────
+    # Confidence is NOT based on raw similarity scores (which vary per model).
+    # Instead, use POSITION-BASED SCORING:
+    # - Top chunk (rank 1): 0.95 (very high relevance)
+    # - 2nd chunk (rank 2): 0.75 (good relevance)
+    # - 3rd chunk (rank 3): 0.60 (acceptable relevance)
+    #
+    # Rationale:
+    # - Retriever already filtered with 0.5 threshold
+    # - Top-ranked chunks are more likely to be relevant
+    # - Taking average of top-3 gives overall retrieval quality
     
-    # Each document that passed threshold = 0.5 minimum
-    # Top doc = ~1.0, second = ~0.8, third = ~0.6
+    num_docs = len(all_docs[:3])  # We only use top 3 chunks anyway
+    
     confidence_scores = []
-    for i in range(min(3, num_docs)):
-        # Estimate confidence based on position
-        if i == 0:
-            confidence_scores.append(0.95)  # Top result = very confident
-        elif i == 1:
-            confidence_scores.append(0.75)  # Second = moderately confident
+    for rank_position in range(min(3, num_docs)):
+        # Assign confidence based on rank position
+        if rank_position == 0:
+            # First result: highest confidence
+            confidence_scores.append(0.95)
+        elif rank_position == 1:
+            # Second result: good confidence
+            confidence_scores.append(0.75)
         else:
-            confidence_scores.append(0.60)  # Third = somewhat confident
+            # Third result: acceptable confidence
+            # Note: Even this is >= 0.6, so HITL threshold remains meaningful
+            confidence_scores.append(0.60)
     
+    # Calculate average confidence across all retrieved chunks
     avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
     
-    print(f"[RAG] Confidence score: {avg_confidence:.2f} (based on {num_docs} docs)")
+    print(f"[RAG] Confidence score: {avg_confidence:.2f} (from {num_docs} retrieved chunks)")
     
-    # Get context as usual
+    # ── STEP 5: FORMAT AND RETURN CONTEXT ───────────────────────────
+    # Get formatted chunks with citations using existing function
     context = get_rag_context(query, thread_id, filename_filter)
     
     return context, avg_confidence

@@ -45,34 +45,69 @@ def rewrite_query(query):
 
 def get_rag_context_with_rewriting(query, thread_id, filename_filter=""):
     """
-    Smart retrieval strategy (with confidence scoring):
+    Smart retrieval strategy with confidence scoring and security guardrails.
+    
+    This function implements a SAFE fallback strategy:
     1. Try original query with confidence scoring
-    2. If fails and ambiguous -> ask user to clarify
-    3. If fails and not ambiguous -> return empty (no fallback)
+    2. If ambiguous → ask user to clarify
+    3. If not ambiguous but no chunks → refuse (NOT rewrite)
+    
+    Why no automatic rewrite?
+    - Rewriting can introduce assumptions beyond what's in documents
+    - Defeats RAG security by bypassing the original question intent
+    - User's intent might be different from rewritten version
+    - Better to ask user or refuse than to answer a different question
     
     Returns: (query, context, confidence_score)
-    - confidence_score: 0-1, used by backend to detect hallucination risk
+    - query: The question that will be answered
+    - context: Formatted chunks, or "" if retrieval failed
+    - confidence_score: 0-1 indicating retrieval quality
     """
     from chatbot_rag import get_rag_context_with_confidence
     
-    # Try original query first with confidence scoring
+    # ── STEP 1: RETRIEVE WITH CONFIDENCE SCORING ─────────────────────
+    # Get both context AND confidence score from RAG
+    # Confidence is used by backend to decide: answer now or ask user?
     context, confidence = get_rag_context_with_confidence(query, thread_id, filename_filter)
     
-    # If we got good context, return it
+    # ── STEP 2: CHECK IF RETRIEVAL WAS GOOD ──────────────────────────
+    # If we got >= 100 chars of context, confident enough to answer
     if context and len(context) > 100:
+        print(f"[RETRIEVER] Good context found ({len(context)} chars)")
         return query, context, confidence
     
-    # No good context - check if ambiguous
+    # ── STEP 3: CHECK IF QUERY IS AMBIGUOUS ──────────────────────────
+    # If query uses vague pronouns, ask user to clarify
+    # Examples: "What is that?", "How?", "It?" (too short)
     if is_ambiguous_query(query):
-        # Ask user to clarify - signal via empty context and 0 confidence
+        print(f"[RETRIEVER] Query is ambiguous - asking user to clarify")
+        # Return empty context + 0 confidence to signal backend
+        # Backend will ask: "Your question is unclear. Could you provide more details?"
         return query, "", 0.0
     
-    #  DISABLED: Auto-rewrite fallback removed to prevent hallucination
-    # Previously: Tried rewriting query if no chunks found
-    # Problem: Rewrites can introduce assumptions, defeating RAG guardrails
-    # Solution: Return empty context - let backend refuse gracefully
+    # ── STEP 4: NO REWRITE FALLBACK (SECURITY) ──────────────────────
+    # DISABLED: Auto-query rewriting removed to prevent hallucination
+    #
+    # Previous behavior (REMOVED):
+    #   if no chunks found:
+    #     rewritten_query = llm.rewrite(query)
+    #     context = retrieve(rewritten_query)
+    #
+    # Why removed?
+    # - LLM rewrites can misinterpret user intent
+    # - Defeats RAG guardrails by circumventing the original question
+    # - If retrieval failed, rewriting doesn't guarantee success
+    # - Better to ask user or refuse than to answer a different question
+    #
+    # Example of risk:
+    # User: "What is quantum computing?"
+    # No chunks found → LLM rewrites to: "Explain quantum mechanics"
+    # LLM then answers general knowledge (hallucination!)
+    #
+    # Safer approach: Return empty, let backend refuse gracefully
     
-    # Return original query with empty context and low confidence
-    # This signals to chatbotBackend that no chunks were found
-    # Backend will refuse with: "I don't have this information in the uploaded document"
+    print(f"[RETRIEVER] No good chunks found - returning empty (no rewrite fallback)")
+    # Backend sees empty context + low confidence
+    # Backend will either trigger HITL or refuse with:
+    # "I don't have this information in the uploaded document"
     return query, context, confidence
