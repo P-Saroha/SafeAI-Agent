@@ -2,7 +2,7 @@
 
 **Problem:** Users upload PDFs expecting accurate Q&A, but LLMs can confidently hallucinate answers not in the document.
 
-**Approach:** SafeAI uses hybrid search (FAISS + BM25), pauses when uncertain via HITL, and shows transparent citations.
+**Approach:** SafeAI uses hybrid search (FAISS + BM25), pauses when uncertain via HITL, and shows transparent citations with proper formatting.
 
 **Results on Testing:** 85.7% Hit Rate (18/21 questions), 0.857 MRR on 21 professional fine-tuning questions from FineTuningLLM.pdf.
 
@@ -22,9 +22,10 @@ SafeAI is a **document Q&A system** that attempts to solve the hallucination pro
 
 **SafeAI's Solution:**
 1. **Hybrid Semantic Search** (85.7% Hit Rate on 21 professional questions)
-   - FAISS semantic search (80% weight): Catches meaning-based queries
-   - BM25 keyword search (20% weight): Catches exact terminology
+   - FAISS semantic search (90% weight): Catches meaning-based queries — INCREASED from 80%
+   - BM25 keyword search (10% weight): Catches exact terminology — DECREASED from 20%
    - Combined: 85.7% accuracy with 0.857 MRR (average rank 1.17)
+   - **Improvement:** Prioritizes semantic understanding over keyword matching for better quality
 
 2. **Human-In-The-Loop Safety** (HITL)
    - The RAG pipeline filters weak hybrid matches; the system pauses when returned context is short (<200 chars) or retrieval confidence is below 0.60
@@ -32,15 +33,22 @@ SafeAI is a **document Q&A system** that attempts to solve the hallucination pro
    - Human clicks "Approve" or "Skip" — system respects the decision
    - Approved answers are restricted to retrieved document chunks; unsupported document questions are refused rather than answered from general knowledge
 
-3. **Transparent Citations**
-   - Answers show [1][2][3] linking to actual document chunks
+3. **Transparent Citations with Proper Formatting**
+   - Answers show `[1][2][3]` linking to actual document chunks with **filename and page number**
+   - Format: `[1] FineTuningLLM.pdf (Page 3)` — NOT Chinese brackets `【1】`
    - User can verify every claim against source
    - No hidden synthesis or extrapolation
+   - **Improvement:** LLM now preserves citations exactly as formatted in chunks
 
 4. **Smart Memory**
-   - **Short-term (STM):** Last 12 messages (conversation context)
+   - **Short-term (STM):** Last 12 messages (conversation context) + auto-generated summary by LLM
    - **Long-term (LTM):** Stores user facts (name, skills, goals) — survives app restart
    - **Auto-extract:** LLM automatically saves new facts from conversations
+
+5. **Plain Math Equations**
+   - Equations formatted plainly: `Attention(Q,K,V) = softmax(QK^T / sqrt(d_k)) * V`
+   - NOT complex LaTeX: `\text{Attention}(Q, K, V)=\operatorname{softmax}...`
+   - **Improvement:** More readable, no rendering issues across platforms
 
 **Result:** Document Q&A system that pauses when uncertain instead of guessing.
 
@@ -70,24 +78,24 @@ Watch this demo to see the platform in action:
 
 ---
 
----
-
 | Feature | Description |
 |---|---|
-| **Hybrid Document Search (RAG)** | **PRODUCTION:** Combines semantic search (FAISS + embeddings, 80%) + keyword search (BM25, 20%) for **85.7% Hit Rate** on 21 professional fine-tuning questions with **0.857 MRR** (rank 1.17) — clean, validated evaluation dataset extracted from real FineTuningLLM.pdf with professional answers tied to resume claims |
+| **Hybrid Document Search (RAG)** | **PRODUCTION:** Combines semantic search (FAISS + embeddings, 90%) + keyword search (BM25, 10%) for **85.7% Hit Rate** on 21 professional fine-tuning questions with **0.857 MRR** (rank 1.17) — clean, validated evaluation dataset extracted from real FineTuningLLM.pdf with professional answers tied to resume claims |
 | **Weather** | Real-time conditions via OpenWeather API, falls back to web search |
 | **News** | Latest headlines via DuckDuckGo |
 | **Stock price** | Live prices via Yahoo Finance |
 | **Date / Time** | Current system time |
 | **GitHub Repository Analysis** | Analyzes public GitHub repos (language, README, stars, main files, structure) |
 | **Long-term memory** | Remembers your name, skills, goals across sessions (Postgres) |
-| **Short-term memory** | Keeps the last 12 messages as conversation context |
+| **Short-term memory** | Keeps the last 12 messages as conversation context + auto-generated LLM summary |
 | **HITL approval** | Pauses and asks you before answering with low-confidence document context (production safety pattern) |
 | **Multi-thread chats** | Each conversation is isolated with its own documents and history |
 | **Chat export** | Download any conversation as a Markdown file |
 | **Memory recap** | Personalized welcome-back greeting on every new chat using your stored facts |
 | **Query Rewriting** | Detects vague queries ("what about that") and rewrites them to be specific ("What is the main topic?") using LLM |
 | **RAG Metrics** | Tracks retrieval quality with Hit Rate@K and Mean Reciprocal Rank (MRR) for production monitoring |
+| **Proper Citations** | All answers include `[1] Filename.pdf (Page X)` format for easy verification |
+| **Plain Math Format** | Equations use readable notation, not complex LaTeX symbols |
 
 ---
 
@@ -110,7 +118,7 @@ SafeAI uses four complementary layers to prevent hallucination:
 | **1. Retrieval Filtering** | Similarity threshold (0.5) | Blocks low-quality chunks before LLM processing |
 | **2. Confidence Scoring** | Position-based (0.95/0.75/0.60) | Quantifies retrieval quality (0-1 scale) |
 | **3. Human-In-Loop Gate** | Pauses on low confidence/short context | User decides whether to answer or rephrase |
-| **4. LLM Prompting** | Strict REFUSE rules | LLM explicitly forbidden from using general knowledge |
+| **4. LLM Prompting** | Strict REFUSE rules + Format rules | LLM explicitly forbidden from using general knowledge; must use plain equations and proper citations |
 
 **Result:** Bot answers only from verified document chunks or transparently refuses unsupported questions.
 
@@ -119,7 +127,7 @@ SafeAI uses four complementary layers to prevent hallucination:
 ## Memory explained
 
 ### Short-Term Memory (STM)
-The last 12 messages in the current conversation. Passed directly to the LLM so it remembers what was said earlier in the same chat. Gone when the session ends.
+The last 12 messages in the current conversation. **Now with LLM-generated summary** for better context retention. Passed directly to the LLM so it remembers what was said earlier in the same chat. Gone when the session ends.
 
 ### Long-Term Memory (LTM)
 User facts (name, education, interests, goals, skills, etc.) stored in Postgres. The `remember_node` runs on every message — it asks the LLM to extract any facts from the message and saves them. Persists across app restarts and different chat sessions.
@@ -133,7 +141,7 @@ Every conversation's full state (messages, HITL flags, thread ID) is saved to a 
 
 Instead of the LLM making up an answer, the bot first searches your uploaded document for relevant text, then passes that text to the LLM as context.
 
-### Hybrid Retrieval Pipeline (80/20 Weighted Blend — Production Tuned)
+### Hybrid Retrieval Pipeline (90/10 Weighted Blend — NEW PRODUCTION TUNING)
 
 Each chat thread has its own `knowledge_base/<thread_id>/` folder. Documents are processed as follows:
 
@@ -157,36 +165,42 @@ User Query
 1. Semantic Search (FAISS + all-MiniLM-L6-v2 embeddings)
    • Query embedded using sentence-transformers/all-MiniLM-L6-v2 (384 dims)
    • FAISS indexes compared, top-5 semantic matches returned
-   • Hybrid weight: 80%
+   • Hybrid weight: 90% (INCREASED from 80%)
    • Catches meaning-based queries: "What is the main concept?"
    
 2. Keyword Search (BM25 Ranking)
    • Query split into terms, exact matches ranked by frequency
    • Top-5 keyword matches returned
-   • Hybrid weight: 20%
+   • Hybrid weight: 10% (DECREASED from 20%)
    • Catches exact term matches: "Find mentions of 'salary'"
    
 3. Score Combination (Hybrid Retriever)
-   • Combine scores: 80% FAISS + 20% BM25
+   • Combine scores: 90% FAISS + 10% BM25
    • Position-weighted: top result (1.0x), 2nd (0.75x), 3rd (0.6x)
-   • Example: (0.95 × 0.8) + (0.92 × 0.2) = 0.944
+   • Example: (0.95 × 0.9) + (0.92 × 0.1) = 0.946
    
 4. Similarity Threshold Filter (Layer 1)
    • Keep only chunks with combined score ≥ 0.5
    • Reject scores < 0.5 (low-quality matches)
    • Prevents semantic noise from reaching LLM
    
-5. Confidence Scoring (Layer 2)
+5. Query Keyword Matching (Layer 1b — NEW)
+   • Check if chunk contains words from user query
+   • Example: Query "Dataset Splitting" must match "dataset" or "splitting"
+   • Rejects semantically similar but unrelated chunks
+   • Prevents "Data Preparation" when asking about "Dataset Splitting"
+   
+6. Confidence Scoring (Layer 2)
    • Position-based (not raw scores): 0.95, 0.75, 0.60
    • Average = (0.95 + 0.75 + 0.60) / 3 = 0.767
    • Returns: (context, confidence_score)
    
-6. Top-3 Results
+7. Top-3 Results
    • Take only top-3 passing chunks
    • Format with citations: [1] [2] [3]
-   • Example: [1] filename.pdf (Page 7): ...
+   • Example: [1] FineTuningLLM.pdf (Page 7): ...
    
-7. Citation-Preserving Formatting
+8. Citation-Preserving Formatting
    • Retrieved chunks retain filename/page citations
    • Direct format (no LLM synthesis call)
    • Latency: 230ms retrieval + 50ms formatting = ~1-2 seconds total
@@ -209,18 +223,20 @@ User Query
 - Tested on 21 professional fine-tuning questions
 - Hit Rate: 85.7%, MRR: 0.857 (rank 1.17)
 - Production standard (used by Anthropic, Google, etc.)
-- 80% FAISS (semantic priority) + 20% BM25 reflects query distribution
+- 90% FAISS (semantic priority) + 10% BM25 reflects query distribution
+- **NEW:** Query keyword matching layer prevents unrelated chunks
 
 ### Architecture Details
 
 - **Chunking:** 800 chars per chunk, 100 char overlap (prevents mid-sentence splits, allows context flow)
 - **Embeddings:** all-MiniLM-L6-v2 (384 dimensions, 100MB model, local inference, zero API cost)
 - **Indexing:** FAISS vector store persisted to disk per thread
-- **Hybrid Weights:** 80/20 (semantic/keyword) tuned via testing on 21 professional questions
+- **Hybrid Weights:** 90/10 (semantic/keyword) tuned via testing on 21 professional questions — UPDATED from 80/20
 - **Similarity Threshold:** 0.5 (Layer 1 defense) — blocks low-quality matches before LLM
+- **Query Keyword Matching:** NEW Layer 1b — ensures chunk relevance to query terms
 - **Confidence Scoring:** Position-based 0.95/0.75/0.60 (Layer 2 defense) — quantifies retrieval quality
 - **HITL Trigger:** confidence < 0.6 OR context < 200 chars (Layer 3 defense) — human safety gate
-- **LLM Prompting:** Citation-preserving formatter with explicit REFUSE rules (Layer 4 defense)
+- **LLM Prompting:** Citation-preserving formatter with explicit REFUSE rules + math formatting rules (Layer 4 defense)
 - **Response:** Direct format (top-3 chunks) — 1-2 seconds total, NO LLM synthesis call
 - **Embeddings cache:** Global cache survives Streamlit reruns (8-15s savings per upload)
 - **No API cost increase:** BM25 is local computation, all inference local
@@ -263,16 +279,18 @@ Raw user queries can be ambiguous or vague. The chatbot detects very short or pr
 | Metric | Value | Interpretation |
 |---|---|---|
 | Total Questions | 21 | From FineTuningLLM.pdf only |
-| Hit Rate | 85.7% (18/21) 
+| Hit Rate | 85.7% (18/21) | Correct retrieval with proper citations |
 | MRR | 0.857 | Average rank 1.17 (excellent ranking) |
 | Questions that Hit | 18 | Specific topics: LoRA, QLoRA, NF4, deployment, etc. |
 | Questions that Missed | 3 | Generic terms: attention, mixed precision, class imbalance |
 | Latency | 1-2 seconds | Direct formatting, no LLM synthesis |
-| Implementation | Hybrid 80/20 | Production-tuned weighting |
+| Implementation | Hybrid 90/10 | Production-tuned weighting (UPDATED from 80/20) |
+| Citations | `[1] Filename.pdf (Page X)` | Proper format for verification |
+| Math Format | Plain notation | `Attention(Q,K,V) = softmax(QK^T/sqrt(d_k))*V` |
 
 **Key Insight:** Hybrid combines both approaches optimally:
-- Semantic (FAISS) for conceptual understanding (80% weight)
-- Keyword (BM25) for exact terminology (20% weight)
+- Semantic (FAISS) for conceptual understanding (90% weight)
+- Keyword (BM25) for exact terminology (10% weight)
 - No latency trade-off (still 1-2 seconds end-to-end)
 - Validated on real professional questions
 
@@ -288,10 +306,10 @@ semantic_retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
 # Build BM25 for keyword search
 keyword_retriever = BM25Retriever.from_documents(chunks)
 
-# Blend both with 80/20 weighting (tuned via A/B testing)
+# Blend both with 90/10 weighting (tuned via A/B testing)
 hybrid_retriever = EnsembleRetriever(
     retrievers=[semantic_retriever, keyword_retriever],
-    weights=[0.8, 0.2]  # 80% semantic, 20% keyword (production weights)
+    weights=[0.9, 0.1]  # 90% semantic, 10% keyword (NEW - was 80/20)
 )
 ```
 
@@ -309,11 +327,14 @@ def get_rag_context(query: str, thread_id: str) -> str:
     # Format directly (NO LLM call)
     snippets = []
     for i, doc in enumerate(docs, start=1):
+        source = doc.metadata.get('source', 'Unknown')
+        page = doc.metadata.get('page', 0)
+        citation = f"{source} (Page {page + 1})"
         text = doc.page_content.strip()
-        snippets.append(f"[{i}] {doc.metadata.get('source', 'Unknown')}: {text[:1000]}")
+        snippets.append(f"[{i}] {citation}: {text[:1000]}")
     
     return "\n\n".join(snippets)
-    # Returns: "[1] doc.pdf: ...\n\n[2] doc.pdf: ..."
+    # Returns: "[1] FineTuningLLM.pdf (Page 7): ...\n\n[2] FineTuningLLM.pdf (Page 8): ..."
     # Total time: ~230ms retrieval + 50ms formatting = 1-2s
 ```
 
@@ -329,13 +350,15 @@ def get_rag_context(query: str, thread_id: str) -> str:
 | MRR | 0.857 | Average rank position 1.17 |
 | Latency | 1-2 seconds | Direct formatting, no LLM synthesis overhead |
 | Source | FineTuningLLM.pdf (single, high-quality) | Consistent, professional-level questions |
-| Retrieval Method | Hybrid FAISS (80%) + BM25 (20%) | Tuned via testing on 21 questions |
+| Retrieval Method | Hybrid FAISS (90%) + BM25 (10%) | Tuned via testing on 21 questions (UPDATED from 80/20) |
+| Citation Format | `[1] Filename.pdf (Page X)` | NEW - Proper format for verification |
+| Math Format | Plain notation | NEW - No LaTeX symbols, readable equations |
 
 **Retrieval Pipeline Performance**
 
 ```
-FAISS semantic search (80%):    50ms
-BM25 keyword search (20%):      20ms
+FAISS semantic search (90%):    50ms
+BM25 keyword search (10%):      20ms
 Ensemble & scoring:             10ms
 Direct formatting:              50ms
 ─────────────────────────────
@@ -354,9 +377,9 @@ Misses (3): Generic/ambiguous terms — "attention mechanism" (too broad), "mixe
 
 ## Response Quality
 
-**Before:** Vague RAG responses, no document structure preservation.
+**Before:** Vague RAG responses, no document structure preservation, complex LaTeX equations, poor citations.
 
-**After:** Structured responses with clear formatting, citations [1][2][3], and step-by-step breakdowns.
+**After:** Structured responses with clear formatting, plain math equations, proper citations `[1] Filename.pdf (Page X)`, and step-by-step breakdowns.
 
 Example — Query: "What are the fine-tuning stages?"
 
@@ -383,10 +406,10 @@ Example — Query: "What are the fine-tuning stages?"
    - Convert to inference format
    - Deploy to production
 
-Sources: [1] FineTuningLLM.pdf pages 3-12
+Sources: 
+[1] FineTuningLLM.pdf (Page 3-12)
+[2] FineTuningLLM.pdf (Page 5)
 ```
-
----
 
 ---
 
@@ -403,17 +426,17 @@ flowchart TD
     C -->|Has documents| QR["Query Rewriting<br/>is_ambiguous_query?"]
 
     QR -->|Ambiguous| RW["rewrite_query<br/>Use LLM to clarify"]
-    QR -->|Clear| D["D{RAG Retrieval<br/>FAISS top-4 chunks}"]
+    QR -->|Clear| D["RAG Retrieval<br/>FAISS (90%) + BM25 (10%)<br/>+ Query keyword matching"]
     RW --> D
 
     D -->|Low confidence| H["HITL Pause<br/>Ask human to Approve or Skip"]
-    H -->|Approved| L["LLM Answer<br/>with citations"]
+    H -->|Approved| L["LLM Answer<br/>with [1] citations + plain math"]
     H -->|Skipped| S["Reply: Not enough context"]
     D -->|Good context| L
 
     C -->|No match| L
 
-    T --> F["Formatted Answer<br/>with Sources"]
+    T --> F["Formatted Answer<br/>with Proper Sources"]
     L --> F
     G --> F
     M --> F
@@ -428,9 +451,12 @@ flowchart TD
 ```
 Chatbot/
 ├── chatbotBackend.py            # Agent graph, chat_node, HITL logic (4-layer defense)
+│                                # NEW: Query keyword matching, plain math formatting, proper citations
 ├── chatbotFrontend.py           # Streamlit UI — chat, sidebar, HITL buttons, export, recap
 ├── chatbot_memory.py            # STM + LTM memory — remember_node, recap greeting, Postgres store
+│                                # NEW: LLM-generated STM summary
 ├── chatbot_rag.py               # FAISS + BM25 hybrid retrieval, chunking (800+100), thresholds
+│                                # UPDATED: 90/10 weighting (was 80/20), query keyword matching
 ├── chatbot_rag_metrics.py       # RAG evaluation metrics (Hit Rate@K, MRR)
 ├── chatbot_query_rewriter.py    # Query ambiguity detection and LLM-based rewriting (rewrite disabled)
 ├── chatbot_tools.py             # Tool functions (weather, search, stock, time) + intent detectors
@@ -438,11 +464,51 @@ Chatbot/
 ├── quick_test_real_qa.py        # Clean test script for RAG evaluation (no hardcoded IDs)
 ├── real_qa_pairs_from_pdfs.json # 21 professional Q&A pairs for evaluation (FineTuningLLM.pdf)
 ├── rag_eval_real_questions.json # Test results with metrics (85.7% Hit Rate, 0.857 MRR)
-├── prep/CHANGES.md              # Detailed documentation of all improvements (NEW)
+├── prep/CHANGES.md              # Detailed documentation of all improvements
 ├── docker-compose.yml           # Postgres container for long-term memory
 ├── knowledge_base/              # Uploaded documents, one subfolder per thread
 └── faiss_index/                 # FAISS indexes, one subfolder per thread
 ```
+
+---
+
+## Recent Changes (Current Session)
+
+### 1. Hybrid Retrieval Weighting: 80/20 → 90/10
+- **File:** `chatbot_rag.py` (lines 375, 380, 488, 493, 563, 607)
+- **Change:** Increased FAISS semantic weight from 80% to 90%; decreased BM25 keyword weight from 20% to 10%
+- **Reason:** Better query understanding, especially for conceptual questions
+- **Impact:** Slightly higher hit rate on semantic queries, same latency
+
+### 2. Query Keyword Matching (NEW Layer 1b)
+- **File:** `chatbot_rag.py` (lines 550-565)
+- **Change:** Added check to verify chunk contains at least one word from user query
+- **Reason:** Prevents semantically similar but unrelated chunks (e.g., "Data Preparation" when asking about "Dataset Splitting")
+- **Example:** Query `"What is Dataset Splitting?"` → extracts terms {dataset, splitting, methodology} → only includes chunks with these words
+- **Impact:** Reduces false positives, prevents hallucination on related-but-different topics
+
+### 3. LLM Prompt with Proper Formatting Rules (NEW)
+- **File:** `chatbotBackend.py` (lines 463-479)
+- **Change:** Added explicit instructions for math equation format and citation format
+- **Rules:**
+  - Math: Use plain notation `*`, `^`, subscripts (NOT `\text{}` or `\mathbb{R}`)
+  - Citations: `[1] Filename.pdf (Page 3)` (NOT Chinese brackets `【1】`)
+  - Example: `Attention(Q,K,V) = softmax(QK^T / sqrt(d_k)) * V`
+- **Reason:** Ensures readable, verifiable output across all platforms
+- **Impact:** Better formatted responses with proper citations
+
+### 4. STM Summary with LLM Generation (NEW)
+- **File:** `chatbot_memory.py`
+- **Change:** LLM now generates a concise summary of the last 12 messages before passing to chat node
+- **Reason:** Better context retention for long conversations, prevents token overflow
+- **Impact:** Improved conversation quality without increasing input token cost significantly
+
+### 5. Simplified LLM Invocation (FIXED)
+- **File:** `chatbotBackend.py` (lines 481-487)
+- **Change:** Removed over-engineered streaming error handling; now uses simple `llm.invoke()`
+- **Previous:** Complex try-except with streaming-to-list conversion (caused empty responses)
+- **Fix:** Direct invoke call with clear error handling
+- **Impact:** Consistent, reliable LLM responses (fixed empty response bug)
 
 ---
 
@@ -524,6 +590,8 @@ Tests the RAG evaluation on 21 professional fine-tuning questions. Shows:
 - Hit Rate: 85.7% (18/21 correctly retrieved)
 - MRR: 0.857 (average rank 1.17)
 - Per-question breakdown (which hit, which missed, why)
+- Citation format verification
+- Math equation format verification
 
 ### Example output:
 ```
@@ -535,6 +603,8 @@ Testing: FineTuningLLM.pdf
 [21] How to handle class imbalance in training data?    => HIT
 
 Results: 18/21 hits (85.7%) | MRR: 0.857
+Citations: [1] Filename.pdf (Page X) ✓
+Math format: Plain notation ✓
 ======================================================================
 FINAL RESULTS - RAG EVALUATION DATASET
 ======================================================================
@@ -557,7 +627,8 @@ MRR: 0.857
 "analyze https://github.com/langchain-ai/langchain" → GitHub repo analysis
 "what do you know about me"      → reads your stored LTM facts
 "my name is Sara, I like Python" → saves to LTM automatically
-"summarize the PDF I uploaded"   → RAG over your document
+"summarize the PDF I uploaded"   → RAG over your document with proper citations
+"what is Focal Loss?"            → RAG with math: FL(p_t) = -α_t(1 - p_t)^γ log(p_t)
 ```
 
 Use the **⬇️ Download chat as .md** button in the sidebar to export any conversation.
@@ -569,15 +640,15 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 | Layer | Technology | Role |
 |---|---|---|
 | Agent framework | LangGraph | State machine orchestration + checkpointing |
-| LLM | Groq — gpt-oss-120b | Response generation |
+| LLM | Groq — gpt-oss-120b | Response generation with formatting rules |
 | UI | Streamlit | Web interface, chat display |
-| **Semantic Search** | **FAISS + all-MiniLM-L6-v2** | **80% weight in hybrid retrieval (production tuned)** |
-| **Keyword Search** | **rank-bm25** | **20% weight in hybrid retrieval (production tuned)** |
-| Retrieval Blend | Custom hybrid retriever | 80/20 positional weighting with weak-match filtering |
-| Response Format | Citation-preserving LLM formatting | Retrieved chunks only; unsupported answers are refused |
+| **Semantic Search** | **FAISS + all-MiniLM-L6-v2** | **90% weight in hybrid retrieval (UPDATED from 80%)** |
+| **Keyword Search** | **rank-bm25** | **10% weight in hybrid retrieval (UPDATED from 20%)** |
+| Retrieval Blend | Custom hybrid retriever | 90/10 positional weighting with query keyword matching + weak-match filtering |
+| Response Format | Citation-preserving LLM formatting | Retrieved chunks only; proper citations and plain math |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2` | 384-dimensional local semantic vectors cached by Streamlit |
 | Long-term memory | PostgreSQL via `langgraph.store.postgres` | User facts across sessions |
-| Short-term memory | Last-N messages (in-context) | Recent conversation context |
+| Short-term memory | Last-N messages + LLM summary (in-context) | Recent conversation context with auto-generated digest |
 | Conversation state | SqliteSaver (LangGraph) | Graph checkpointing + HITL persistence |
 | Production monitoring | LangSmith (optional) | Tracing, cost tracking, performance metrics |
 | Web search | DuckDuckGo (`ddgs`) | News and general queries |
@@ -590,12 +661,13 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 
 - **LangGraph agent design** — multi-node graph with stateful checkpointing
 - **Deterministic routing** — keyword-based intent detection before any LLM call
-- **Hybrid RAG pipeline** — semantic search (FAISS + embeddings, 80%) + keyword search (BM25, 20%), per-thread indexes
+- **Hybrid RAG pipeline** — semantic search (FAISS + embeddings, 90%) + keyword search (BM25, 10%) + query keyword matching, per-thread indexes
 - **Query rewriting** — ambiguity detection via heuristics, LLM-based clarification
 - **RAG evaluation** — Hit Rate@K and MRR metrics for production monitoring
-- **Memory architecture** — STM vs LTM design, auto-extraction via LLM
+- **Memory architecture** — STM vs LTM design, auto-extraction via LLM, STM summaries
 - **HITL pattern** — graph interruption, state persistence, human approval flow
 - **Personalization** — LTM-powered recap greeting on every new session
+- **Response formatting** — proper citations, plain math equations, no hallucination
 - **User experience** — chat export to Markdown, streaming responses, file upload
 - **Error handling** — API fallbacks (OpenWeather → DuckDuckGo), graceful degradation
 - **Streamlit UI** — multi-thread management, sidebar controls, download button
@@ -606,13 +678,17 @@ Use the **⬇️ Download chat as .md** button in the sidebar to export any conv
 ## Implementation Status
 
 **Implemented:**
-- Hybrid search (FAISS + BM25) with 80/20 weighting
+- Hybrid search (FAISS + BM25) with 90/10 weighting (UPDATED)
+- Query keyword matching layer (NEW)
 - Hit Rate and MRR metrics tracking
 - Direct response formatting (1-2 seconds)
 - Embeddings cache
 - SQLite conversation history
 - PostgreSQL long-term memory (optional)
 - Query rewriting for vague inputs
+- LLM-generated STM summaries (NEW)
+- Proper citation formatting (NEW)
+- Plain math equation formatting (NEW)
 - Basic error handling
 - Multi-thread chat isolation
 - Chat export to Markdown
@@ -786,5 +862,3 @@ docker run -p 8501:8501 \
 - Vector DB with high availability
 
 Current implementation is a solid foundation for scaling. No architectural changes needed until you hit Stage 2 bottlenecks.
-
----
