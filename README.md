@@ -705,10 +705,6 @@ LangGraph detects these env vars and sends traces automatically.
 - **Debugging:** Set to `true` to capture traces for investigation
 - **Production:** Set to `true` for continuous monitoring
 
-### Interview Talking Point
-
-> "I integrated LangSmith for production observability. It traces every LLM call, tool execution, and state transition — giving ops teams visibility into costs, latency, and errors. This is production-standard for AI agents. Setting it up was zero code changes because LangGraph handles it automatically through environment variables."
-
 ---
 
 ## Deployment
