@@ -93,47 +93,106 @@ Watch this demo to see the platform in action:
 
 ## What is HITL (Human-In-The-Loop)?
 
-**Current trigger:** after hybrid retrieval, the safety gate pauses when the available context is under 200 characters or its confidence score is below 0.60. Retrieval also filters weak hybrid matches before document chunks reach the LLM.
+**Current trigger:** after hybrid retrieval, the safety gate pauses when the available context is under 200 characters or its confidence score is below 0.60. Retrieval also filters weak hybrid matches (< 0.5 score) before document chunks reach the LLM.
 
-### Four-layer hallucination guardrail
+### Four-Layer Hallucination Prevention System
+
+SafeAI implements a **production-grade, multi-layered defense** against LLM hallucination:
 
 ```text
 Layer 1: RETRIEVAL FILTERING
-         ├─ Similarity Threshold (0.5)
-         └─ Blocks low-quality chunks at retrieval stage
+         ├─ Similarity Threshold: 0.5 (50%)
+         ├─ Hybrid scoring: 80% FAISS (semantic) + 20% BM25 (keyword)
+         ├─ Position-weighted: top=1.0x, 2nd=0.75x, 3rd=0.6x
+         └─ Blocks low-quality chunks BEFORE LLM sees them
                 ↓
 Layer 2: CONFIDENCE SCORING
-         ├─ Position-based scoring (top=0.95, 2nd=0.75, 3rd=0.60)
-         └─ Quantifies retrieval quality for decision-making
+         ├─ Position-based (not raw scores): 0.95, 0.75, 0.60
+         ├─ Model-agnostic: Works across all embedding models
+         ├─ Calculates: (top_score + 2nd_score + 3rd_score) / 3
+         └─ Quantifies retrieval quality (0-1 scale)
                 ↓
 Layer 3: HUMAN-IN-THE-LOOP (HITL)
          ├─ Triggers if: confidence < 0.6 OR context < 200 chars
-         └─ Asks user approval before answering borderline cases
+         ├─ Dual-condition safety gate (quality AND quantity)
+         ├─ Pauses: "Found limited context. Answer anyway or rephrase?"
+         └─ User approves/rejects BEFORE LLM generates response
                 ↓
 Layer 4: LLM PROMPTING
-         ├─ Strict REFUSE instructions
-         └─ Prevents inference, assumptions, and general-knowledge answers
+         ├─ Strict "citation-preserving formatter" role
+         ├─ Explicit REFUSE rules: "ONLY chunks, NO general knowledge"
+         ├─ If question NOT in chunks: "I don't have this information..."
+         └─ Prevents inference, assumptions, and knowledge synthesis
 ```
 
-Normally the bot answers automatically. But what if the uploaded document doesn't actually contain the answer? The bot could give a confidently wrong answer — that's called hallucination.
+**How it prevents hallucination:**
 
-**HITL prevents this by pausing the agent when it is not confident:**
+| Hallucination Type | Layer | Prevention |
+|---|---|---|
+| Low-quality matches | Layer 1 | 0.5 threshold filters semantic noise |
+| Sparse context | Layer 2 | Confidence score catches incomplete retrieval |
+| User uncertainty | Layer 3 | HITL pauses for borderline cases |
+| Out-of-doc answers | Layer 4 | LLM forbidden from using general knowledge |
 
-1. User asks a question about an uploaded document
-2. Bot searches the document with FAISS and finds very little context (under 200 characters)
-3. Instead of guessing, the bot **pauses** and shows a warning in the UI
-4. Human clicks **"Yes, try to answer"** or **"No, skip"**
-5. Bot resumes with the human's decision
+**Example scenario:**
 
-**How it works in the code:**
+User: "What is the capital of France?"
+Uploaded document: Python tutorial (no geography info)
+
+1. **Layer 1:** Query searches document → No chunks meet 0.5 threshold → Empty result ✅
+2. **Layer 2:** Confidence = 0.0 (no chunks) → Low confidence ✅
+3. **Layer 3:** confidence < 0.6 AND context < 200 chars → HITL triggers ✅
+4. **Layer 4:** LLM sees empty context → Refuses: "I don't have this information" ✅
+
+Result: **No hallucination.** User understands bot can only answer from uploaded documents.
+
+**HITL flow in code:**
 
 | Step | What happens |
 |---|---|
-| Low context detected | `chat_node` sets `awaiting_hitl = True` in `ChatState` |
-| State saved | `SqliteSaver` writes the full state (including the flag) to SQLite on disk |
-| UI detects the pause | `get_thread_hitl_state()` reads the state — frontend hides chat input, shows buttons |
-| Human decides | Clicking a button sends `hitl_decision = "approve"` or `"skip"` back to the graph |
-| Graph resumes | `chat_node` reads `hitl_decision` and acts accordingly |
+| Low context detected | `chat_node` detects: `confidence < 0.6 OR len(context) < 200` |
+| State paused | `ChatState.awaiting_hitl = True` + stores `hitl_question` |
+| State saved | `SqliteSaver` writes to SQLite (survives page refresh) |
+| UI shows buttons | `get_thread_hitl_state()` detects pause → frontend shows "Approve"/"Skip" |
+| Human decides | User clicks button → sends `hitl_decision = "approve"` or `"skip"` |
+| Graph resumes | `chat_node` resumes via `HITL_RESUME` logic |
+| LLM answers/refuses | If approved: answer with limited context; if skipped: refuse |
+
+### Chunking Strategy (Before Retrieval)
+
+Documents are split into **800-character chunks with 100-character overlap**:
+
+```
+Original PDF (2000 chars):
+┌────────────────────────────────┐
+│ [800 chars] [700 overlap] [800 chars] [700 overlap] [800 chars]
+└────────────────────────────────┘
+
+Chunk 1: chars 0-800
+Chunk 2: chars 700-1500  (100-char overlap with Chunk 1)
+Chunk 3: chars 1400-2000 (100-char overlap with Chunk 2)
+```
+
+**Why these settings:**
+- **800 chars:** Standard industry default (balances context vs token efficiency)
+- **100 overlap (12.5%):** Prevents sentence boundaries from being split
+- **RecursiveCharacterTextSplitter:** Splits on newlines first (semantic boundaries), then spaces, then characters
+
+**Benefits:**
+- Overlapping text appears in multiple chunks → retrieval catches concepts spanning boundaries
+- Small overlap cost: +12% more chunks, but retrieval quality improves significantly
+- Prevents mid-sentence splits that would confuse embeddings
+
+**Example impact:**
+```
+Without overlap:
+  Question: "How does LoRA reduce parameters?"
+  Retrieved: Chunk A ends mid-mechanism explanation ❌
+
+With overlap:
+  Question: "How does LoRA reduce parameters?"
+  Retrieved: Chunk A + Chunk B both have "reduces trainable parameters" → Full answer ✅
+```
 
 ---
 
@@ -158,32 +217,59 @@ Instead of the LLM making up an answer, the bot first searches your uploaded doc
 
 Each chat thread has its own `knowledge_base/<thread_id>/` folder. Documents are processed as follows:
 
+**Step 1: Document Processing**
+```
+Raw Documents
+    ↓
+Split into Chunks (800 chars + 100 overlap)
+    ↓
+Embed with all-MiniLM-L6-v2 (384 dimensions)
+    ↓
+Build FAISS index (per-thread, cached to disk)
+    ↓
+Build BM25 index (per-thread, cached to disk)
+```
+
+**Step 2: Query Execution**
 ```
 User Query
     ↓
-1. Semantic Search (FAISS + all-MiniLM-L6-v2 embeddings, 80% weight)
-   • Query embedded using the local sentence-transformers/all-MiniLM-L6-v2 model (384 dimensions)
-   • FAISS indexes compared, top-3 semantic matches returned
+1. Semantic Search (FAISS + all-MiniLM-L6-v2 embeddings)
+   • Query embedded using sentence-transformers/all-MiniLM-L6-v2 (384 dims)
+   • FAISS indexes compared, top-5 semantic matches returned
+   • Hybrid weight: 80%
    • Catches meaning-based queries: "What is the main concept?"
    
-2. Keyword Search (BM25 Ranking, 20% weight)
+2. Keyword Search (BM25 Ranking)
    • Query split into terms, exact matches ranked by frequency
+   • Top-5 keyword matches returned
+   • Hybrid weight: 20%
    • Catches exact term matches: "Find mentions of 'salary'"
    
-3. Positional Weighted Blending (custom hybrid retriever)
-   • Top results are combined with positional 80/20 semantic/keyword weighting
-   • Weak hybrid matches are filtered before document chunks reach the LLM
-   • Semantic priority: Most queries are concept-driven, not keyword-driven
+3. Score Combination (Hybrid Retriever)
+   • Combine scores: 80% FAISS + 20% BM25
+   • Position-weighted: top result (1.0x), 2nd (0.75x), 3rd (0.6x)
+   • Example: (0.95 × 0.8) + (0.92 × 0.2) = 0.944
    
-4. Top-3 Results
-   • Top-3 blended results formatted as citations (direct format, no LLM)
-   • [1] filename.pdf (page 1): ...
-   • [2] filename.pdf (page 2): ...
+4. Similarity Threshold Filter (Layer 1)
+   • Keep only chunks with combined score ≥ 0.5
+   • Reject scores < 0.5 (low-quality matches)
+   • Prevents semantic noise from reaching LLM
    
-5. Citation-Preserving Formatting
+5. Confidence Scoring (Layer 2)
+   • Position-based (not raw scores): 0.95, 0.75, 0.60
+   • Average = (0.95 + 0.75 + 0.60) / 3 = 0.767
+   • Returns: (context, confidence_score)
+   
+6. Top-3 Results
+   • Take only top-3 passing chunks
+   • Format with citations: [1] [2] [3]
+   • Example: [1] filename.pdf (Page 7): ...
+   
+7. Citation-Preserving Formatting
    • Retrieved chunks retain filename/page citations
-   • The LLM formatter is instructed to use only document chunks
-   • Unsupported answers are refused instead of completed with general knowledge
+   • Direct format (no LLM synthesis call)
+   • Latency: 230ms retrieval + 50ms formatting = ~1-2 seconds total
 ```
 
 ### Why Hybrid Retrieval?
@@ -207,14 +293,18 @@ User Query
 
 ### Architecture Details
 
-- Chunking: 1000 chars per chunk, 150 char overlap (prevents mid-sentence splits)
-- Embeddings: Hash embeddings (offline default, 384-dim) — zero API cost, works out of box
-- Indexing: FAISS vector store persisted to disk per thread
-- Weighting: 80/20 (semantic/keyword) tuned via testing on 21 questions
-- Response: Direct format (top-3 chunks) — 1-2 seconds total, NO LLM synthesis call
-- Embeddings cache: Global cache survives Streamlit reruns (8-15s savings per upload)
-- No API cost increase: BM25 is local computation
-- Latency: 230ms retrieval + 50ms formatting = 1-2 seconds total (vs old 30-35s with LLM synthesis)
+- **Chunking:** 800 chars per chunk, 100 char overlap (prevents mid-sentence splits, allows context flow)
+- **Embeddings:** all-MiniLM-L6-v2 (384 dimensions, 100MB model, local inference, zero API cost)
+- **Indexing:** FAISS vector store persisted to disk per thread
+- **Hybrid Weights:** 80/20 (semantic/keyword) tuned via testing on 21 professional questions
+- **Similarity Threshold:** 0.5 (Layer 1 defense) — blocks low-quality matches before LLM
+- **Confidence Scoring:** Position-based 0.95/0.75/0.60 (Layer 2 defense) — quantifies retrieval quality
+- **HITL Trigger:** confidence < 0.6 OR context < 200 chars (Layer 3 defense) — human safety gate
+- **LLM Prompting:** Citation-preserving formatter with explicit REFUSE rules (Layer 4 defense)
+- **Response:** Direct format (top-3 chunks) — 1-2 seconds total, NO LLM synthesis call
+- **Embeddings cache:** Global cache survives Streamlit reruns (8-15s savings per upload)
+- **No API cost increase:** BM25 is local computation, all inference local
+- **Latency:** 230ms retrieval + 50ms formatting = 1-2 seconds total end-to-end
 
 ---
 
@@ -413,21 +503,51 @@ flowchart TD
 
 ---
 
+## Recent Improvements (Latest Release)
+
+### 🛡️ Four-Layer Hallucination Prevention (NEW)
+- **Layer 1:** Similarity threshold (0.5) filters low-quality chunks at retrieval
+- **Layer 2:** Confidence scoring (position-based 0.95/0.75/0.60) quantifies retrieval quality
+- **Layer 3:** Human-In-The-Loop triggers on confidence < 0.6 OR context < 200 chars
+- **Layer 4:** LLM prompts with strict REFUSE rules prevent inference and general knowledge
+
+### 📊 Improved RAG Pipeline (NEW)
+- Chunking optimized: 800 chars + 100 overlap (balances context vs token efficiency)
+- Hybrid scoring refined: 80% FAISS + 20% BM25 with position-weighted blending
+- Similarity filtering added before LLM processing (blocks semantic noise early)
+- Confidence metrics integrated into HITL decision logic
+- Dead code removed (_score_relevance function that wasn't being used)
+
+### 🐙 GitHub Repository Analysis Tool (NEW)
+- Analyzes public GitHub repos via GitHub API
+- Retrieves: language stats, stars, forks, file structure, topics, LICENSE, README
+- Optional Groq integration: generates concise summaries of README content
+- Usage: "analyze https://github.com/username/repo-name"
+- Rate limits: 60 req/hour (public API), higher with GITHUB_TOKEN
+
+### 📚 Documentation & Interview Prep (NEW)
+- Created `prep/CHANGES.md` with detailed explanations of all improvements
+- Covers: Layer 1-4 calculations, chunking strategy, confidence scoring math
+- Interview talking points provided for each technical decision
+
+---
+
 ## Project structure
 
 ```
 Chatbot/
-├── chatbotBackend.py            # Agent graph, chat_node, HITL logic, thread utilities
+├── chatbotBackend.py            # Agent graph, chat_node, HITL logic (4-layer defense)
 ├── chatbotFrontend.py           # Streamlit UI — chat, sidebar, HITL buttons, export, recap
 ├── chatbot_memory.py            # STM + LTM memory — remember_node, recap greeting, Postgres store
-├── chatbot_rag.py               # FAISS index building, document loading, RAG retrieval
+├── chatbot_rag.py               # FAISS + BM25 hybrid retrieval, chunking (800+100), thresholds
 ├── chatbot_rag_metrics.py       # RAG evaluation metrics (Hit Rate@K, MRR)
-├── chatbot_query_rewriter.py    # Query ambiguity detection and LLM-based rewriting
+├── chatbot_query_rewriter.py    # Query ambiguity detection and LLM-based rewriting (rewrite disabled)
 ├── chatbot_tools.py             # Tool functions (weather, search, stock, time) + intent detectors
-├── chatbot_github.py            # GitHub repository analysis via the GitHub API and optional Groq summary
+├── chatbot_github.py            # GitHub repository analysis (NEW) — metadata, README summary
 ├── quick_test_real_qa.py        # Clean test script for RAG evaluation (no hardcoded IDs)
 ├── real_qa_pairs_from_pdfs.json # 21 professional Q&A pairs for evaluation (FineTuningLLM.pdf)
 ├── rag_eval_real_questions.json # Test results with metrics (85.7% Hit Rate, 0.857 MRR)
+├── prep/CHANGES.md              # Detailed documentation of all improvements (NEW)
 ├── docker-compose.yml           # Postgres container for long-term memory
 ├── knowledge_base/              # Uploaded documents, one subfolder per thread
 └── faiss_index/                 # FAISS indexes, one subfolder per thread
