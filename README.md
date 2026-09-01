@@ -93,106 +93,26 @@ Watch this demo to see the platform in action:
 
 ## What is HITL (Human-In-The-Loop)?
 
-**Current trigger:** after hybrid retrieval, the safety gate pauses when the available context is under 200 characters or its confidence score is below 0.60. Retrieval also filters weak hybrid matches (< 0.5 score) before document chunks reach the LLM.
+HITL pauses the chatbot when uncertain about having enough context to answer accurately.
 
-### Four-Layer Hallucination Prevention System
+**When HITL triggers:**
+- Retrieval confidence score < 0.6, OR
+- Retrieved context < 200 characters
 
-SafeAI implements a **production-grade, multi-layered defense** against LLM hallucination:
+When triggered, the user sees: "Found limited context. Do you want me to answer with this, or rephrase your question?"
 
-```text
-Layer 1: RETRIEVAL FILTERING
-         ├─ Similarity Threshold: 0.5 (50%)
-         ├─ Hybrid scoring: 80% FAISS (semantic) + 20% BM25 (keyword)
-         ├─ Position-weighted: top=1.0x, 2nd=0.75x, 3rd=0.6x
-         └─ Blocks low-quality chunks BEFORE LLM sees them
-                ↓
-Layer 2: CONFIDENCE SCORING
-         ├─ Position-based (not raw scores): 0.95, 0.75, 0.60
-         ├─ Model-agnostic: Works across all embedding models
-         ├─ Calculates: (top_score + 2nd_score + 3rd_score) / 3
-         └─ Quantifies retrieval quality (0-1 scale)
-                ↓
-Layer 3: HUMAN-IN-THE-LOOP (HITL)
-         ├─ Triggers if: confidence < 0.6 OR context < 200 chars
-         ├─ Dual-condition safety gate (quality AND quantity)
-         ├─ Pauses: "Found limited context. Answer anyway or rephrase?"
-         └─ User approves/rejects BEFORE LLM generates response
-                ↓
-Layer 4: LLM PROMPTING
-         ├─ Strict "citation-preserving formatter" role
-         ├─ Explicit REFUSE rules: "ONLY chunks, NO general knowledge"
-         ├─ If question NOT in chunks: "I don't have this information..."
-         └─ Prevents inference, assumptions, and knowledge synthesis
-```
+### Four-Layer Hallucination Prevention
 
-**How it prevents hallucination:**
+SafeAI uses four complementary layers to prevent hallucination:
 
-| Hallucination Type | Layer | Prevention |
-|---|---|---|
-| Low-quality matches | Layer 1 | 0.5 threshold filters semantic noise |
-| Sparse context | Layer 2 | Confidence score catches incomplete retrieval |
-| User uncertainty | Layer 3 | HITL pauses for borderline cases |
-| Out-of-doc answers | Layer 4 | LLM forbidden from using general knowledge |
+| Layer | Mechanism | Details |
+|-------|-----------|---------|
+| **1. Retrieval Filtering** | Similarity threshold (0.5) | Blocks low-quality chunks before LLM processing |
+| **2. Confidence Scoring** | Position-based (0.95/0.75/0.60) | Quantifies retrieval quality (0-1 scale) |
+| **3. Human-In-Loop Gate** | Pauses on low confidence/short context | User decides whether to answer or rephrase |
+| **4. LLM Prompting** | Strict REFUSE rules | LLM explicitly forbidden from using general knowledge |
 
-**Example scenario:**
-
-User: "What is the capital of France?"
-Uploaded document: Python tutorial (no geography info)
-
-1. **Layer 1:** Query searches document → No chunks meet 0.5 threshold → Empty result ✅
-2. **Layer 2:** Confidence = 0.0 (no chunks) → Low confidence ✅
-3. **Layer 3:** confidence < 0.6 AND context < 200 chars → HITL triggers ✅
-4. **Layer 4:** LLM sees empty context → Refuses: "I don't have this information" ✅
-
-Result: **No hallucination.** User understands bot can only answer from uploaded documents.
-
-**HITL flow in code:**
-
-| Step | What happens |
-|---|---|
-| Low context detected | `chat_node` detects: `confidence < 0.6 OR len(context) < 200` |
-| State paused | `ChatState.awaiting_hitl = True` + stores `hitl_question` |
-| State saved | `SqliteSaver` writes to SQLite (survives page refresh) |
-| UI shows buttons | `get_thread_hitl_state()` detects pause → frontend shows "Approve"/"Skip" |
-| Human decides | User clicks button → sends `hitl_decision = "approve"` or `"skip"` |
-| Graph resumes | `chat_node` resumes via `HITL_RESUME` logic |
-| LLM answers/refuses | If approved: answer with limited context; if skipped: refuse |
-
-### Chunking Strategy (Before Retrieval)
-
-Documents are split into **800-character chunks with 100-character overlap**:
-
-```
-Original PDF (2000 chars):
-┌────────────────────────────────┐
-│ [800 chars] [700 overlap] [800 chars] [700 overlap] [800 chars]
-└────────────────────────────────┘
-
-Chunk 1: chars 0-800
-Chunk 2: chars 700-1500  (100-char overlap with Chunk 1)
-Chunk 3: chars 1400-2000 (100-char overlap with Chunk 2)
-```
-
-**Why these settings:**
-- **800 chars:** Standard industry default (balances context vs token efficiency)
-- **100 overlap (12.5%):** Prevents sentence boundaries from being split
-- **RecursiveCharacterTextSplitter:** Splits on newlines first (semantic boundaries), then spaces, then characters
-
-**Benefits:**
-- Overlapping text appears in multiple chunks → retrieval catches concepts spanning boundaries
-- Small overlap cost: +12% more chunks, but retrieval quality improves significantly
-- Prevents mid-sentence splits that would confuse embeddings
-
-**Example impact:**
-```
-Without overlap:
-  Question: "How does LoRA reduce parameters?"
-  Retrieved: Chunk A ends mid-mechanism explanation ❌
-
-With overlap:
-  Question: "How does LoRA reduce parameters?"
-  Retrieved: Chunk A + Chunk B both have "reduces trainable parameters" → Full answer ✅
-```
+**Result:** Bot answers only from verified document chunks or transparently refuses unsupported questions.
 
 ---
 
@@ -500,35 +420,6 @@ flowchart TD
     S --> F
     F --> DB[("SqliteSaver<br/>Save state to SQLite")]
 ```
-
----
-
-## Recent Improvements (Latest Release)
-
-### 🛡️ Four-Layer Hallucination Prevention (NEW)
-- **Layer 1:** Similarity threshold (0.5) filters low-quality chunks at retrieval
-- **Layer 2:** Confidence scoring (position-based 0.95/0.75/0.60) quantifies retrieval quality
-- **Layer 3:** Human-In-The-Loop triggers on confidence < 0.6 OR context < 200 chars
-- **Layer 4:** LLM prompts with strict REFUSE rules prevent inference and general knowledge
-
-### 📊 Improved RAG Pipeline (NEW)
-- Chunking optimized: 800 chars + 100 overlap (balances context vs token efficiency)
-- Hybrid scoring refined: 80% FAISS + 20% BM25 with position-weighted blending
-- Similarity filtering added before LLM processing (blocks semantic noise early)
-- Confidence metrics integrated into HITL decision logic
-- Dead code removed (_score_relevance function that wasn't being used)
-
-### 🐙 GitHub Repository Analysis Tool (NEW)
-- Analyzes public GitHub repos via GitHub API
-- Retrieves: language stats, stars, forks, file structure, topics, LICENSE, README
-- Optional Groq integration: generates concise summaries of README content
-- Usage: "analyze https://github.com/username/repo-name"
-- Rate limits: 60 req/hour (public API), higher with GITHUB_TOKEN
-
-### 📚 Documentation & Interview Prep (NEW)
-- Created `prep/CHANGES.md` with detailed explanations of all improvements
-- Covers: Layer 1-4 calculations, chunking strategy, confidence scoring math
-- Interview talking points provided for each technical decision
 
 ---
 
