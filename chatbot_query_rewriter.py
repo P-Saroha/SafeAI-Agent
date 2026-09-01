@@ -43,7 +43,7 @@ def rewrite_query(query):
     return query
 
 
-def get_rag_context_with_rewriting(query, thread_id, filename_filter=""):
+def get_rag_context_with_rewriting(query, thread_id):
     """
     Smart retrieval strategy with confidence scoring and security guardrails.
     
@@ -68,7 +68,7 @@ def get_rag_context_with_rewriting(query, thread_id, filename_filter=""):
     # ── STEP 1: RETRIEVE WITH CONFIDENCE SCORING ─────────────────────
     # Get both context AND confidence score from RAG
     # Confidence is used by backend to decide: answer now or ask user?
-    context, confidence = get_rag_context_with_confidence(query, thread_id, filename_filter)
+    context, confidence = get_rag_context_with_confidence(query, thread_id)
     
     # ── STEP 2: CHECK IF RETRIEVAL WAS GOOD ──────────────────────────
     # If we got >= 100 chars of context, confident enough to answer

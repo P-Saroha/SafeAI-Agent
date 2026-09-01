@@ -53,6 +53,7 @@ from chatbot_rag import (
     has_documents,
     rebuild_rag_index,
 )
+from chatbot_rag_metrics import get_cached_metrics
 from chatbot_query_rewriter import get_rag_context_with_rewriting
 from chatbot_tools import (
     call_datetime,
@@ -93,6 +94,29 @@ class ChatState(TypedDict, total=False):
 # ══════════════════════════════════════════════════════════════════════════
 
 def chat_node(state: ChatState, config: RunnableConfig) -> dict:
+    """
+    Route user queries through 7 optimized sections (in order):
+    
+    1. GREETING - Fastest path ("hi", "hello", "hey")
+    2. TOOLS - Real-time data (weather, stock, time, news, github)
+    3. SELF-QUERY - Read from LTM ("Who am I?", "What do you know about me?")
+    4. PERSONAL STATEMENTS - Write to LTM ("My name is...", "I like...")
+    5. HITL RESUME - Process human decisions (awaiting_hitl + hitl_decision set)
+    6. RAG - Document search (only if has_documents=True)
+    7. DEFAULT REFUSE - No hallucination fallback (safe refuse)
+    
+    ORDERING RATIONALE:
+    - Greeting first: Fastest, certain match
+    - Tools before RAG: Real-time data priority over documents
+    - Self-Query before Personal: Read (fast) before Write (slower)
+    - Personal before HITL: Extract facts, then acknowledge
+    - HITL before RAG: Prevent infinite loops with pending decisions
+    - RAG before Default: Only if documents exist
+    - Default last: Never hallucinate, always refuse gracefully
+    
+    NO CONFLICTS: Each section checks its condition and returns immediately,
+    preventing overlap or cross-contamination between routing paths.
+    """
     """
     Decide how to respond to the user's latest message.
 
@@ -196,7 +220,114 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 content="Please provide a valid GitHub repository URL, e.g., `https://github.com/owner/repo`"
             )]}
 
-    # ── 3. HITL RESUME - human made a decision ─────────────────────────
+    # ── 3. STM SUMMARY - Current conversation summary ──────────────────────
+    # "summarize this chat", "give me summary", "what did we discuss?"
+    # Uses Short-Term Memory (conversation history)
+    if "summary" in query.lower() and any(x in query.lower() for x in ["chat", "conversation", "this", "we"]):
+        # Get conversation history from state
+        messages = state.get("messages", [])
+        
+        if len(messages) <= 2:
+            return {"messages": [AIMessage(content="Not much to summarize yet. We just started chatting!")]}
+        
+        # Format conversation for summary
+        conversation = "\n".join([
+            f"User: {msg.content}" if isinstance(msg, HumanMessage) else f"Bot: {msg.content}"
+            for msg in messages[-12:]  # Last 12 messages
+        ])
+        
+        # Ask Groq to summarize
+        summary_prompt = f"""Summarize this conversation in 3-5 bullet points. Be concise.
+
+Conversation:
+{conversation}
+
+Summary:"""
+        
+        content = ""
+        for chunk in llm.stream(summary_prompt):
+            if hasattr(chunk, 'content') and chunk.content:
+                content += chunk.content
+        
+        response = f"{content}\n\n{_cite('Short-Term Memory Summarization')}"
+        return {"messages": [AIMessage(content=response)]}
+
+    # ── 4. SELF-QUERY CHECK ─────────────────────────────────────────────────
+    # "Who am I?", "What do you know about me?", "Tell me about myself"
+    # Answer with stored facts from PostgreSQL (read operation - fast)
+    if is_self_query(query):
+        facts = get_memory_as_text(user_id)
+        if facts:
+            # Use Groq to format facts beautifully
+            format_prompt = f"""
+You are a personal profile formatter. Given user facts, create a clean, structured markdown profile.
+
+Format ONLY as:
+👤 **Profile Overview**
+- **Name:** [name]
+- **Education:** [education]
+- **University:** [university]
+- **Interests:** [interests in bullet list]
+
+That's it. No learning path. No resources. Just the profile.
+
+User Facts:
+{facts}
+
+Create the profile now:
+"""
+            
+            # Stream response token-by-token
+            content = ""
+            for chunk in llm.stream(format_prompt):
+                if hasattr(chunk, 'content') and chunk.content:
+                    content += chunk.content
+            
+            response = f"{content}\n\n{_cite('PostgreSQL Long-Term Memory + Groq Formatting')}"
+        else:
+            response = (
+                "I don't have any saved details about you yet. "
+                "Tell me your name, interests, or goals and I'll remember them!"
+            )
+        return {"messages": [AIMessage(content=response)]}
+
+    # ── 5. PERSONAL STATEMENT CHECK ──────────────────────────────────────
+    # Detect if user is making a statement (not asking a question)
+    # Examples: "my name is...", "I like...", "I'm interested in..."
+    # These are handled by remember_node (LTM extraction), so just acknowledge
+    def is_personal_statement(q: str) -> bool:
+        """Check if this is a personal fact statement, not a question."""
+        q_lower = q.lower().strip()
+        
+        # Question indicators (word boundaries matter - use word start patterns)
+        # These MUST be at word boundaries to avoid false positives like "doing", "being"
+        question_starts = {"what ", "how ", "why ", "when ", "where ", "can you", "could you", "tell me", "show me", "explain"}
+        question_markers = {"?"}  # Direct question markers
+        
+        # Split into words and check first few words
+        words = q_lower.split()
+        if words:
+            first_word = words[0]
+            # Check if starts with question word
+            for q_word in question_starts:
+                if q_lower.startswith(q_word):
+                    return False
+        
+        # Check for direct question marks
+        if any(marker in q_lower for marker in question_markers):
+            return False
+        
+        # Check for personal statement patterns
+        personal_patterns = {"my ", "i'm ", "i am ", "i like", "i love", "i ", "i study", "i work", "i did", "i have", "my name", "my interests"}
+        
+        return any(pattern in q_lower for pattern in personal_patterns)
+    
+    if is_personal_statement(query):
+        # LTM extraction already happened in remember_node
+        # Just acknowledge the user's statement
+        return {"messages": [AIMessage(content="Got it! I've noted that. 😊")]}
+
+    # ── 6. HITL RESUME - human made a decision ─────────────────────────
     # Check BEFORE processing the question again (avoids re-triggering HITL)
     if state.get("awaiting_hitl") and state.get("hitl_decision"):
         print(f"[HITL_RESUME] User decision: '{state.get('hitl_decision')}'")
@@ -256,7 +387,7 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
                 "hitl_decision": "",
             }
 
-    # ── 3. RAG (PRIORITIZE DOCUMENTS) ────────────────────────────────────
+    # ── 7. RAG (PRIORITIZE DOCUMENTS) ────────────────────────────────────
     if has_documents(thread_id):
         rewritten, rag_context, confidence_score = get_rag_context_with_rewriting(query, thread_id)
         
@@ -329,75 +460,41 @@ def chat_node(state: ChatState, config: RunnableConfig) -> dict:
             print(f"[RAG_DEBUG] RAG context sample:\n{rag_context[:500]}...\n")  # Debug: show what we're passing
             print(f"[RAG_DEBUG] Full RAG context length: {len(rag_context)} chars")  # Debug: show total size
             
+            # Build prompt that includes question + context
             prompt = (
-                "You are a citation-preserving formatter. Your ONLY job is to reformat content while preserving ALL citations exactly.\n\n"
-                "   ABSOLUTE RULES (NON-NEGOTIABLE):\n"
-                "1. Copy content WORD-FOR-WORD from chunks - do NOT paraphrase or rewrite\n"
-                "2. Preserve EVERY citation character-by-character: [1], [2], [3] with filename and page\n"
-                "3. If you see: **[1] Document.pdf (Page 7)** keep it EXACTLY like this\n"
-                "4. Do NOT convert [1] to 【1】, [one], or any other format\n"
-                "5. Do NOT move citations from start to end of line\n"
-                "6. Do NOT paraphrase chunks - preserve original text\n"
-                "7. Only add formatting: ### headers, **bold**, bullet points\n"
-                "8. If question is NOT in chunks, respond with: 'I don't have this information in the uploaded document.'\n\n"
-                "COPYING RULES:\n"
-                "- Citations with page numbers: **[1] FineTuningLLM.pdf (Page 7)**\n"
-                "- Copy the WHOLE thing, including [1], filename, AND (Page X)\n"
-                "- Do NOT abbreviate or modify\n"
-                "- Multiple citations: **[1] file1.pdf (Page 3)**\n**[2] file2.pdf (Page 5)**\n\n"
+                "Answer this question based ONLY on the provided document chunks.\n\n"
+                "FORMATTING RULES:\n"
+                "1. ONLY use information from chunks below\n"
+                "2. Format equations plainly: use *, ^, subscript notation (not LaTeX \\text or complex symbols)\n"
+                "3. Citations: Add [1], [2], [3] at END of sentences with page reference\n"
+                "4. Format: [1] FineTuningLLM.pdf (Page 3) - NOT 【1】\n"
+                "5. If chunks don't answer the question, say 'I don't have this information in the uploaded document'\n"
+                "6. NEVER use general knowledge or add information\n\n"
                 f"QUESTION: {query}\n\n"
-                f"DOCUMENT CHUNKS (copy everything exactly, including [1] [2] [3]):\n{rag_context}\n\n"
-                "NOW FORMAT THE RESPONSE (preserve ALL citations, do NOT rewrite):"
+                f"DOCUMENT CHUNKS:\n{rag_context}\n\n"
+                "ANSWER (use plain equations, add [X] citations with source):"
             )
             
-            # Blocking response (
-            response = llm.invoke(prompt)
-            content = response.content if hasattr(response, 'content') else str(response)
+            # Use streaming to get progressive response (show first token faster)
+            # and ensure complete answers
+            # Call LLM with RAG context
+            try:
+                response = llm.invoke(prompt)
+                content = response.content if hasattr(response, 'content') else str(response)
+            except Exception as e:
+                print(f"[RAG_ERROR] LLM call failed: {e}")
+                content = ""
             
-            print(f"[RAG_DEBUG] LLM response sample:\n{content[:500]}...\n")  # Debug: show what LLM returned
+            if not content:
+                print(f"[RAG_WARNING] LLM returned no content")
+            
+            print(f"[RAG_DEBUG] LLM response length: {len(content)} chars")
             
             content = f"{content}\n\n{_cite('Document Chunks + LLM Formatting')}"
             print(f"[RAG] RAG answer complete")
             return {"messages": [AIMessage(content=content)]}
 
-    # ── 4. Self-query ────────────────────────────────────────────────────
-    if is_self_query(query):
-        facts = get_memory_as_text(user_id)
-        if facts:
-            # Use Groq to format facts beautifully and structurally
-            format_prompt = f"""
-You are a personal profile formatter. Given user facts, create a clean, structured markdown profile.
-
-Format ONLY as:
-👤 **Profile Overview**
-- **Name:** [name]
-- **Education:** [education]
-- **University:** [university]
-- **Interests:** [interests in bullet list]
-
-That's it. No learning path. No resources. Just the profile.
-
-User Facts:
-{facts}
-
-Create the profile now:
-"""
-            
-            # Stream response token-by-token
-            content = ""
-            for chunk in llm.stream(format_prompt):
-                if hasattr(chunk, 'content') and chunk.content:
-                    content += chunk.content
-            
-            response = f"{content}\n\n{_cite('PostgreSQL Long-Term Memory + Groq Formatting')}"
-        else:
-            response = (
-                "I don't have any saved details about you yet. "
-                "Tell me your name, interests, or goals and I'll remember them!"
-            )
-        return {"messages": [AIMessage(content=response)]}
-
-    # ── 5. NO DEFAULT LLM ANSWER (Removed to prevent hallucination) ────────
+    # ── 8. NO DEFAULT LLM ANSWER (Removed to prevent hallucination) ────────
     #  CRITICAL: Generic LLM fallback DISABLED
     # Previously: Answered any question using general knowledge (Groq)
     # Problem: User asked about "capital of France", chatbot answered (hallucination)

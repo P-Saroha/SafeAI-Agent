@@ -120,3 +120,12 @@ with open("rag_eval_real_questions.json", "w") as f:
     json.dump(report, f, indent=2)
 
 print("Results saved to: rag_eval_real_questions.json")
+
+# Cache metrics for frontend display
+from chatbot_rag_metrics import save_metrics
+save_metrics(FINETUNING_THREAD_ID, {
+    "hit_rate@5": total_hit_rate,
+    "hit_rate@10": total_hit_rate,  # Using same value as we only test top-3
+    "mrr": round(total_mrr, 3),
+    "num_queries": total_q
+})

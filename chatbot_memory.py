@@ -61,6 +61,7 @@ _memory_llm = ChatOpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
     temperature=0,
+    max_tokens=1000,  # Memory extraction doesn't need as many tokens
 )
 
 # Track whether Postgres connected successfully

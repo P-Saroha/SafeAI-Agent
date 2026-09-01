@@ -1,4 +1,4 @@
-    
+
 """
 chatbot_rag.py
 --------------
@@ -21,6 +21,7 @@ Folder layout:
 
 import sys
 import os
+import shutil
 
 # CRITICAL: Set these BEFORE any other imports to prevent ZoeDepth/torchvision errors
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
@@ -309,20 +310,20 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     - Progress logging so you see what's happening
     - Cached embeddings model (global, not reloaded)
     """
+    
     if not RAG_AVAILABLE:
         print("[RAG] ERROR: RAG not available (missing dependencies)")
         return None
-
+    
     tid = _safe_id(thread_id)
     index_dir = get_index_dir(tid)
     files = _get_supported_files(tid)
-
     if not files:
         print(f"[RAG] No documents found for thread {tid}")
         return None  # No documents uploaded yet
-
+    
     embeddings = _get_embeddings()
-
+    
     # Load existing index from disk if it exists and we are not forcing a rebuild
     if index_dir.exists() and not force_rebuild:
         try:
@@ -331,7 +332,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 str(index_dir), embeddings, allow_dangerous_deserialization=True
             )
             semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-
+            
             # Rebuild BM25 from raw documents (not persisted, rebuilt on load)
             docs = _load_documents(files)
             if docs:
@@ -371,12 +372,12 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                         combined = {}
                         for i, doc in enumerate(sem_docs[:5]):
                             doc_id = hash(doc.page_content[:100])
-                            score = (1.0 - i/5) * 0.8
+                            score = (1.0 - i/5) * 0.9  # 90% weight for FAISS
                             combined[doc_id] = (score, doc)
                         
                         for i, doc in enumerate(kw_docs[:5]):
                             doc_id = hash(doc.page_content[:100])
-                            score = (1.0 - i/5) * 0.2
+                            score = (1.0 - i/5) * 0.1  # 10% weight for BM25
                             if doc_id in combined:
                                 old_score, old_doc = combined[doc_id]
                                 combined[doc_id] = (old_score + score, old_doc)
@@ -384,7 +385,26 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                                 combined[doc_id] = (score, doc)
                         
                         sorted_docs = sorted(combined.values(), key=lambda x: x[0], reverse=True)
-                        return [doc for _, doc in sorted_docs[:3]]
+                        
+                        # ── HALLUCINATION PREVENTION: SIMILARITY THRESHOLD ──────
+                        # Same 0.5 threshold as the fresh-build path. Without this,
+                        # a retriever loaded from disk (e.g. after an app restart)
+                        # would skip the quality filter entirely and let
+                        # low-confidence chunks reach the LLM unfiltered.
+                        SIMILARITY_THRESHOLD = 0.5
+                        
+                        high_confidence_docs = []
+                        for score, doc in sorted_docs:
+                            if score >= SIMILARITY_THRESHOLD:
+                                high_confidence_docs.append(doc)
+                            else:
+                                logger.debug(f"[RAG] Rejected low-quality chunk (cached path): score {score:.2f} < threshold {SIMILARITY_THRESHOLD}")
+                        
+                        if not high_confidence_docs:
+                            logger.warning(f"[RAG] Query failed threshold (cached path): No chunks >= {SIMILARITY_THRESHOLD} found")
+                            return []
+                        
+                        return high_confidence_docs[:3]
                     
                     def invoke(self, input_dict):
                         query = input_dict.get("query", input_dict) if isinstance(input_dict, dict) else input_dict
@@ -392,11 +412,11 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 
                 hybrid_retriever = OptimizedHybridRetriever(semantic_retriever, keyword_retriever, chunks)
                 return hybrid_retriever
-
+        
         except Exception as e:
             print(f"[RAG]   Could not load FAISS index from disk: {e}")
             print(f"[RAG]  Rebuilding fresh index instead...")
-
+    
     # Build a fresh index from the uploaded documents
     print(f"[RAG]  Building FRESH index from {len(files)} file(s)")
     docs = _load_documents(files)
@@ -404,7 +424,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     if not docs:
         print(f"[RAG]  ERROR: No documents were loaded!")
         return None
-
+    
     print(f"[RAG]  Loaded {len(docs)} documents, splitting into chunks...")
     # OPTIMIZED: 800 chars (not 1000) + 100 overlap = 20% fewer chunks = faster embedding
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
@@ -420,7 +440,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
     if not chunks:
         print(f"[RAG]  ERROR: No chunks created from documents!")
         return None
-
+    
     print(f"[RAG]   Created {len(chunks)} chunks, building FAISS index...")
     print(f"[RAG]  This may take 30-60 seconds on first run (embedding all chunks)...")
     try:
@@ -436,7 +456,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         print("[RAG] BM25 built successfully")
         
         # OPTIMIZED: Hybrid retriever with reranking
-        print("[RAG] Creating hybrid retriever (FAISS 80% + BM25 20%)")
+        print("[RAG] Creating hybrid retriever (FAISS 90% + BM25 10%)")
         
         class OptimizedHybridRetriever:
             def __init__(self, semantic, keyword, all_chunks):
@@ -464,16 +484,16 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 except Exception as e:
                     logger.debug(f"BM25 failed: {e}")
                 
-                # Combine: FAISS 80%, BM25 20% (prioritize semantic)
+                # Combine: FAISS 90%, BM25 10% (prioritize semantic heavily)
                 combined = {}
                 for i, doc in enumerate(sem_docs[:5]):  # Top 5 from FAISS
                     doc_id = hash(doc.page_content[:100])
-                    score = (1.0 - i/5) * 0.8  # 80% weight for FAISS
+                    score = (1.0 - i/5) * 0.9  # 90% weight for FAISS
                     combined[doc_id] = (score, doc)
                 
                 for i, doc in enumerate(kw_docs[:5]):  # Top 5 from BM25
                     doc_id = hash(doc.page_content[:100])
-                    score = (1.0 - i/5) * 0.2  # 20% weight for BM25
+                    score = (1.0 - i/5) * 0.1  # 10% weight for BM25
                     if doc_id in combined:
                         old_score, old_doc = combined[doc_id]
                         combined[doc_id] = (old_score + score, old_doc)
@@ -494,7 +514,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 # - Returns empty list if NO chunks meet the threshold
                 #
                 # Threshold = 0.5 because:
-                # - 80% weight from FAISS (semantic) + 20% from BM25 (keyword)
+                # - 90% weight from FAISS (semantic) + 10% from BM25 (keyword)
                 # - Position-weighted: top chunk weight 1.0, 3rd chunk 0.4
                 # - 0.5 threshold blocks obvious mismatches while allowing valid retrievals
                 #
@@ -532,11 +552,11 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 return self.get_relevant_documents(query)
         
         hybrid_retriever = OptimizedHybridRetriever(semantic_retriever, keyword_retriever, chunks)
-
+    
     except Exception as e:
         print(f"[RAG] Hybrid retriever build error: {e}")
         return None
-
+    
     # Save FAISS to disk so we can reload next time without rebuilding
     try:
         index_dir.mkdir(parents=True, exist_ok=True)
@@ -544,8 +564,9 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         print(f"[RAG]  Index saved to disk at {index_dir}")
     except Exception as e:
         print(f"[RAG]   Warning: Could not save index to disk: {e}")
-
-    print(f"[RAG] Hybrid retriever ready! (Chunks: {len(chunks)}, Search: FAISS 80% + BM25 20%)")
+    
+    print(f"[RAG] Hybrid retriever ready! (Chunks: {len(chunks)}, Search: FAISS 90% + BM25 10%)")
+    
     return hybrid_retriever
 
 def rebuild_rag_index(thread_id: str) -> str:
@@ -574,57 +595,40 @@ def rebuild_rag_index(thread_id: str) -> str:
         return f"RAG index rebuilt successfully with {len(files)} file(s)."
     return "RAG index rebuild failed — check console for errors above"
 
-def _extract_filename_from_query(query: str, thread_id: str) -> str:
-    """
-    Check if the user mentioned a specific filename in their query.
-    Returns the matching filename if found, empty string otherwise.
-    Examples:
-      "give me summary of A2_Solution.pdf"  -> "A2_Solution.pdf"
-      "what does notes.txt say"             -> "notes.txt"
-      "summarize everything"                -> ""
-    """
-    files = _get_supported_files(_safe_id(thread_id))
-    q_lower = query.lower()
-    for f in files:
-        # Match full filename (e.g. "a2_solution.pdf") or stem only (e.g. "a2_solution")
-        if f.name.lower() in q_lower or f.stem.lower() in q_lower:
-            return f.name
-    return ""
-
-def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> str:
+def get_rag_context(query: str, thread_id: str) -> str:
     """Fast RAG retrieval - return top 3 chunks with clean structured formatting.
     
     OPTIMIZED: Loads from disk cache first (skips re-embedding), then queries.
     """
     if not query.strip():
         return ""
-
+    
     tid = _safe_id(thread_id)
     
     # Get cached retriever or build it
     if tid not in _retriever_cache:
         print(f"[RAG]  Retriever not in memory — checking disk cache...")
         _retriever_cache[tid] = _build_retriever(tid)
-
+    
     retriever = _retriever_cache.get(tid)
     if retriever is None:
         print(f"[RAG]  No retriever found (no docs?)")
         return ""
-
+    
     print(f"[RAG] Retrieving top-3 chunks for query: {query[:50]}...")
-
+    
     # Retrieve documents
     try:
         all_docs = retriever.invoke(query)
     except Exception as e:
         print(f"[RAG] Error: {e}")
         return ""
-
+    
     if not all_docs:
         return ""
-
+    
     docs = all_docs[:3]  # Top 3 chunks
-
+    
     # Format chunks with clean structure and proper citations
     snippets = []
     source_citations = []  # Track unique sources
@@ -673,7 +677,7 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
         
         # Format with citation inline
         snippets.append(f"**[{i}] {citation}**\n{structured_text}")
-
+    
     context = "\n\n---\n\n".join(snippets)
     
     # NOTE: We already have inline citations above (e.g., "[1] FineTuningLLM.pdf (Page 7)")
@@ -681,8 +685,7 @@ def get_rag_context(query: str, thread_id: str, filename_filter: str = "") -> st
     
     return context
 
-
-def get_rag_context_with_confidence(query: str, thread_id: str, filename_filter: str = "") -> tuple:
+def get_rag_context_with_confidence(query: str, thread_id: str) -> tuple:
     """
     Get RAG context AND calculate a confidence score (0-1).
     
@@ -765,10 +768,9 @@ def get_rag_context_with_confidence(query: str, thread_id: str, filename_filter:
     
     # ── STEP 5: FORMAT AND RETURN CONTEXT ───────────────────────────
     # Get formatted chunks with citations using existing function
-    context = get_rag_context(query, thread_id, filename_filter)
+    context = get_rag_context(query, thread_id)
     
     return context, avg_confidence
-
 
 def has_documents(thread_id: str) -> bool:
     """Return True if this thread has any uploaded documents."""
