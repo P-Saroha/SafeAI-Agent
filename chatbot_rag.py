@@ -291,6 +291,122 @@ def _extract_section_from_text(text: str) -> str:
     return ""
 
 # ══════════════════════════════════════════════════════════════════════════
+# HYBRID RETRIEVER CLASS (Semantic + Keyword Search)
+# ══════════════════════════════════════════════════════════════════════════
+
+class OptimizedHybridRetriever:
+    """
+    Hybrid retriever combining FAISS (semantic) + BM25 (keyword) search.
+    
+    Why hybrid?
+    - FAISS catches semantic meaning ("What is machine learning?" finds "neural networks")
+    - BM25 catches exact terms ("NF4 quantization" finds chunks with "NF4")
+    - Together: 90% FAISS + 10% BM25 = semantic-first but with keyword safety net
+    
+    Safety layer 1 of 4: Filters chunks by 0.5 similarity threshold to prevent
+    hallucinations from low-quality retrievals reaching the LLM.
+    """
+    
+    def __init__(self, semantic, keyword, all_chunks):
+        self.semantic = semantic       # FAISS retriever
+        self.keyword = keyword         # BM25 retriever
+        self.all_chunks = all_chunks   # For debugging/reference
+    
+    def get_relevant_documents(self, query):
+        """Retrieve and combine results from FAISS and BM25."""
+        sem_docs = []
+        kw_docs = []
+        
+        # Ensure query is a string
+        if not isinstance(query, str):
+            query = str(query)
+        
+        # Try FAISS (semantic search)
+        try:
+            result = self.semantic.invoke(query)
+            sem_docs = result if isinstance(result, list) else [result]
+        except Exception as e:
+            logger.debug(f"FAISS failed: {e}")
+        
+        # Try BM25 (keyword search)
+        try:
+            result = self.keyword.invoke(query)
+            kw_docs = result if isinstance(result, list) else [result]
+        except Exception as e:
+            logger.debug(f"BM25 failed: {e}")
+        
+        # Combine: FAISS 90%, BM25 10% (prioritize semantic heavily)
+        combined = {}
+        
+        # Add FAISS results with 90% weight
+        for i, doc in enumerate(sem_docs[:5]):  # Top 5 from FAISS
+            doc_id = hash(doc.page_content[:100])
+            score = (1.0 - i/5) * 0.9  # 90% weight for FAISS
+            combined[doc_id] = (score, doc)
+        
+        # Add BM25 results with 10% weight
+        for i, doc in enumerate(kw_docs[:5]):  # Top 5 from BM25
+            doc_id = hash(doc.page_content[:100])
+            score = (1.0 - i/5) * 0.1  # 10% weight for BM25
+            if doc_id in combined:
+                # Chunk exists in both: add scores
+                old_score, old_doc = combined[doc_id]
+                combined[doc_id] = (old_score + score, old_doc)
+            else:
+                # New chunk: add to combined
+                combined[doc_id] = (score, doc)
+        
+        # Sort by combined score (highest first)
+        sorted_docs = sorted(combined.values(), key=lambda x: x[0], reverse=True)
+        
+        # ── HALLUCINATION PREVENTION: SIMILARITY THRESHOLD (Layer 1) ──────
+        # Only return chunks with confidence >= 0.5 (50%)
+        # This is the FIRST layer of defense against hallucinations
+        #
+        # What this does:
+        # - Filters out low-quality chunk matches before they reach LLM
+        # - Prevents LLM from misinterpreting weak semantic connections
+        # - Returns empty list if NO chunks meet the threshold
+        #
+        # Threshold = 0.5 because:
+        # - 90% weight from FAISS (semantic) + 10% from BM25 (keyword)
+        # - Position-weighted: top chunk weight 1.0, 3rd chunk 0.4
+        # - 0.5 threshold blocks obvious mismatches while allowing valid retrievals
+        #
+        # Example:
+        # - Asked "What is Python?" but got chunks about snakes → rejected (< 0.5)
+        # - Asked "Python functions" and got "Python basics" → accepted (>= 0.5)
+        
+        SIMILARITY_THRESHOLD = 0.5
+        
+        high_confidence_docs = []
+        for score, doc in sorted_docs:
+            if score >= SIMILARITY_THRESHOLD:
+                # Chunk passed threshold - include it
+                high_confidence_docs.append(doc)
+            else:
+                # Chunk failed threshold - reject and log for debugging
+                logger.debug(f"[RAG] Rejected low-quality chunk: score {score:.2f} < threshold {SIMILARITY_THRESHOLD}")
+        
+        # ── HANDLE NO CHUNKS CASE ────────────────────────────────
+        if not high_confidence_docs:
+            logger.warning(f"[RAG] Query failed threshold: No chunks >= {SIMILARITY_THRESHOLD} found")
+            return []  # Return empty list = backend will refuse or ask user
+        
+        # ── RETURN TOP 3 PASSING CHUNKS ──────────────────────────
+        # Take only top 3 for:
+        # 1. Efficiency: Reduces token count to LLM
+        # 2. Quality: Prevents dilution with less relevant chunks
+        # 3. Citations: We cite [1] [2] [3] anyway
+        return high_confidence_docs[:3]
+    
+    def invoke(self, input_dict):
+        """Support .invoke() method for compatibility with LangChain."""
+        query = input_dict.get("query", input_dict) if isinstance(input_dict, dict) else input_dict
+        return self.get_relevant_documents(query)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # INDEX BUILDING & RETRIEVAL
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -343,73 +459,7 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
                 print(f"[RAG]   Split into {len(chunks)} chunks (chunk_size=800, overlap=100)")
                 keyword_retriever = BM25Retriever.from_documents(chunks)
                 
-                # Create hybrid retriever (same as fresh build)
-                class OptimizedHybridRetriever:
-                    def __init__(self, semantic, keyword, all_chunks):
-                        self.semantic = semantic
-                        self.keyword = keyword
-                        self.all_chunks = all_chunks
-                    
-                    def get_relevant_documents(self, query):
-                        sem_docs = []
-                        kw_docs = []
-                        
-                        if not isinstance(query, str):
-                            query = str(query)
-                        
-                        try:
-                            result = self.semantic.invoke(query)
-                            sem_docs = result if isinstance(result, list) else [result]
-                        except Exception as e:
-                            logger.debug(f"FAISS failed: {e}")
-                        
-                        try:
-                            result = self.keyword.invoke(query)
-                            kw_docs = result if isinstance(result, list) else [result]
-                        except Exception as e:
-                            logger.debug(f"BM25 failed: {e}")
-                        
-                        combined = {}
-                        for i, doc in enumerate(sem_docs[:5]):
-                            doc_id = hash(doc.page_content[:100])
-                            score = (1.0 - i/5) * 0.9  # 90% weight for FAISS
-                            combined[doc_id] = (score, doc)
-                        
-                        for i, doc in enumerate(kw_docs[:5]):
-                            doc_id = hash(doc.page_content[:100])
-                            score = (1.0 - i/5) * 0.1  # 10% weight for BM25
-                            if doc_id in combined:
-                                old_score, old_doc = combined[doc_id]
-                                combined[doc_id] = (old_score + score, old_doc)
-                            else:
-                                combined[doc_id] = (score, doc)
-                        
-                        sorted_docs = sorted(combined.values(), key=lambda x: x[0], reverse=True)
-                        
-                        # ── HALLUCINATION PREVENTION: SIMILARITY THRESHOLD ──────
-                        # Same 0.5 threshold as the fresh-build path. Without this,
-                        # a retriever loaded from disk (e.g. after an app restart)
-                        # would skip the quality filter entirely and let
-                        # low-confidence chunks reach the LLM unfiltered.
-                        SIMILARITY_THRESHOLD = 0.5
-                        
-                        high_confidence_docs = []
-                        for score, doc in sorted_docs:
-                            if score >= SIMILARITY_THRESHOLD:
-                                high_confidence_docs.append(doc)
-                            else:
-                                logger.debug(f"[RAG] Rejected low-quality chunk (cached path): score {score:.2f} < threshold {SIMILARITY_THRESHOLD}")
-                        
-                        if not high_confidence_docs:
-                            logger.warning(f"[RAG] Query failed threshold (cached path): No chunks >= {SIMILARITY_THRESHOLD} found")
-                            return []
-                        
-                        return high_confidence_docs[:3]
-                    
-                    def invoke(self, input_dict):
-                        query = input_dict.get("query", input_dict) if isinstance(input_dict, dict) else input_dict
-                        return self.get_relevant_documents(query)
-                
+                # Use the shared OptimizedHybridRetriever class
                 hybrid_retriever = OptimizedHybridRetriever(semantic_retriever, keyword_retriever, chunks)
                 return hybrid_retriever
         
@@ -455,102 +505,8 @@ def _build_retriever(thread_id: str, force_rebuild: bool = False):
         keyword_retriever = BM25Retriever.from_documents(chunks)
         print("[RAG] BM25 built successfully")
         
-        # OPTIMIZED: Hybrid retriever with reranking
+        # Use the shared OptimizedHybridRetriever class
         print("[RAG] Creating hybrid retriever (FAISS 90% + BM25 10%)")
-        
-        class OptimizedHybridRetriever:
-            def __init__(self, semantic, keyword, all_chunks):
-                self.semantic = semantic
-                self.keyword = keyword
-                self.all_chunks = all_chunks
-            
-            def get_relevant_documents(self, query):
-                sem_docs = []
-                kw_docs = []
-                
-                if not isinstance(query, str):
-                    query = str(query)
-                
-                # Get both FAISS and BM25 results
-                try:
-                    result = self.semantic.invoke(query)
-                    sem_docs = result if isinstance(result, list) else [result]
-                except Exception as e:
-                    logger.debug(f"FAISS failed: {e}")
-                
-                try:
-                    result = self.keyword.invoke(query)
-                    kw_docs = result if isinstance(result, list) else [result]
-                except Exception as e:
-                    logger.debug(f"BM25 failed: {e}")
-                
-                # Combine: FAISS 90%, BM25 10% (prioritize semantic heavily)
-                combined = {}
-                for i, doc in enumerate(sem_docs[:5]):  # Top 5 from FAISS
-                    doc_id = hash(doc.page_content[:100])
-                    score = (1.0 - i/5) * 0.9  # 90% weight for FAISS
-                    combined[doc_id] = (score, doc)
-                
-                for i, doc in enumerate(kw_docs[:5]):  # Top 5 from BM25
-                    doc_id = hash(doc.page_content[:100])
-                    score = (1.0 - i/5) * 0.1  # 10% weight for BM25
-                    if doc_id in combined:
-                        old_score, old_doc = combined[doc_id]
-                        combined[doc_id] = (old_score + score, old_doc)
-                    else:
-                        combined[doc_id] = (score, doc)
-                
-                # Sort by combined score
-                sorted_docs = sorted(combined.values(), key=lambda x: x[0], reverse=True)
-                
-                #  CRITICAL: Filter by minimum similarity threshold
-                # ── HALLUCINATION PREVENTION: SIMILARITY THRESHOLD ──────
-                # Only return chunks with confidence >= 0.5 (50%)
-                # This is the FIRST layer of defense against hallucinations
-                #
-                # What this does:
-                # - Filters out low-quality chunk matches before they reach LLM
-                # - Prevents LLM from misinterpreting weak semantic connections
-                # - Returns empty list if NO chunks meet the threshold
-                #
-                # Threshold = 0.5 because:
-                # - 90% weight from FAISS (semantic) + 10% from BM25 (keyword)
-                # - Position-weighted: top chunk weight 1.0, 3rd chunk 0.4
-                # - 0.5 threshold blocks obvious mismatches while allowing valid retrievals
-                #
-                # Example:
-                # - Asked "What is Python?" but got chunks about snakes → rejected (< 0.5)
-                # - Asked "Python functions" and got "Python basics" → accepted (>= 0.5)
-                
-                SIMILARITY_THRESHOLD = 0.5
-                
-                high_confidence_docs = []
-                for score, doc in sorted_docs:
-                    if score >= SIMILARITY_THRESHOLD:
-                        # Chunk passed threshold - include it
-                        high_confidence_docs.append(doc)
-                    else:
-                        # Chunk failed threshold - reject and log for debugging
-                        logger.debug(f"[RAG] Rejected low-quality chunk: score {score:.2f} < threshold {SIMILARITY_THRESHOLD}")
-                
-                # ── HANDLE NO CHUNKS CASE ────────────────────────────────
-                if not high_confidence_docs:
-                    logger.warning(f"[RAG] Query failed threshold: No chunks >= {SIMILARITY_THRESHOLD} found")
-                    print(f"[RAG] Returning empty list - this will trigger HITL or fallback")
-                    return []  # Return empty list = backend will refuse or ask user
-                
-                # ── RETURN TOP 3 PASSING CHUNKS ──────────────────────────
-                # Take only top 3 for:
-                # 1. Efficiency: Reduces token count to LLM
-                # 2. Quality: Prevents dilution with less relevant chunks
-                # 3. Citations: We cite [1] [2] [3] anyway
-                return high_confidence_docs[:3]
-            
-            def invoke(self, input_dict):
-                """Support .invoke() method for compatibility"""
-                query = input_dict.get("query", input_dict) if isinstance(input_dict, dict) else input_dict
-                return self.get_relevant_documents(query)
-        
         hybrid_retriever = OptimizedHybridRetriever(semantic_retriever, keyword_retriever, chunks)
     
     except Exception as e:
